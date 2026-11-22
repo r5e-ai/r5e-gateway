@@ -116,7 +116,10 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   @default_limit 50
   @max_limit 200
-  @listing_params ~w(kind session actor since until limit cursor)
+  @filter_params ~w(kind session actor since until policyOutcome target q)
+  @listing_params @filter_params ++ ~w(limit cursor)
+  @default_buckets 60
+  @max_buckets 240
   @tail_params ~w(kind session actor)
 
   @doc "`GET /v1/evidence/records`"
@@ -145,6 +148,109 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       {:ok, %{"records" => Enum.map(page, &render/1), "cursor" => cursor}}
     end
   end
+
+  @doc """
+  `GET /v1/evidence/facets`
+
+  How many records match the filters, and how they divide by kind, by
+  how policy decided and by what was called. Takes the filters the list
+  route takes. The counts are of every matching record, so a reader's
+  totals do not change as they page through the list.
+  """
+  @spec facets(Plug.Conn.t()) :: Plug.Conn.t()
+  def facets(conn) do
+    %Plug.Conn{query_params: params} = conn = Plug.Conn.fetch_query_params(conn)
+
+    gated(conn, @read, "/v1/evidence/records", fn conn, ctx, index ->
+      with {:ok, asked} <- filters(params, @filter_params, ctx, index),
+           {:ok, found} <- counted(index, :facets, [asked]) do
+        json(conn, 200, %{
+          "total" => found.total,
+          "facets" =>
+            Map.new(found.facets, fn {name, values} ->
+              {name, for({value, count} <- values, do: %{"value" => value, "count" => count})}
+            end)
+        })
+      else
+        other -> unanswered(conn, other, %{"total" => 0, "facets" => %{}})
+      end
+    end)
+  end
+
+  @doc """
+  `GET /v1/evidence/histogram`
+
+  Matching records counted over time, between `since` and `until`, in
+  `buckets` equal spans (60 unless said, at most 240). Each span has its
+  count and how that divides by how policy decided. Takes the filters
+  the list route takes.
+  """
+  @spec histogram(Plug.Conn.t()) :: Plug.Conn.t()
+  def histogram(conn) do
+    %Plug.Conn{query_params: params} = conn = Plug.Conn.fetch_query_params(conn)
+
+    gated(conn, @read, "/v1/evidence/records", fn conn, ctx, index ->
+      with {:ok, buckets} <- buckets(params["buckets"]),
+           {:ok, asked} <- filters(Map.delete(params, "buckets"), @filter_params, ctx, index),
+           {:ok, %{since: since, until: until}} <- spanned(asked),
+           {:ok, found} <- counted(index, :histogram, [asked, buckets]) do
+        json(conn, 200, %{
+          "since" => DateTime.to_iso8601(since),
+          "until" => DateTime.to_iso8601(until),
+          "bucketSeconds" => found.bucket_seconds,
+          "buckets" =>
+            for span <- found.buckets do
+              %{
+                "start" => DateTime.to_iso8601(span.start),
+                "count" => span.count,
+                "byOutcome" => span.by_outcome
+              }
+            end
+        })
+      else
+        other -> unanswered(conn, other, %{"buckets" => []})
+      end
+    end)
+  end
+
+  defp filters(params, allowed, ctx, index) do
+    with [] <- Map.keys(params) -- allowed,
+         {:ok, asked} <- listing(params) do
+      of_session(asked, params["session"], ctx, index)
+    else
+      [unknown | _] -> {:bad, "unknown parameter #{unknown}"}
+      other -> other
+    end
+  end
+
+  defp buckets(nil), do: {:ok, @default_buckets}
+
+  defp buckets(stated) do
+    case Integer.parse(stated) do
+      {buckets, ""} when buckets in 1..@max_buckets -> {:ok, buckets}
+      _ -> {:bad, "buckets is a whole number from 1 to #{@max_buckets}"}
+    end
+  end
+
+  defp spanned(%{since: since, until: until} = asked) do
+    if DateTime.compare(since, until) == :lt,
+      do: {:ok, asked},
+      else: {:bad, "since is not before until"}
+  end
+
+  defp spanned(_asked), do: {:bad, "since and until are both needed"}
+
+  # A store that keeps no index of labels cannot count by them.
+  defp counted({module, handle}, what, args) do
+    if function_exported?(module, what, length(args) + 1),
+      do: apply(module, what, [handle | args]),
+      else: {:error, :not_supported}
+  end
+
+  defp unanswered(conn, :none, empty), do: json(conn, 200, empty)
+  defp unanswered(conn, {:many, sessions}, _empty), do: several(conn, sessions)
+  defp unanswered(conn, {:bad, message}, _empty), do: bad_request(conn, message)
+  defp unanswered(conn, _error, _empty), do: json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
 
   @doc "`GET /v1/evidence/tail`"
   @spec tail(Plug.Conn.t()) :: Plug.Conn.t()
@@ -197,6 +303,18 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   defp asked({"actor", actor}, {:ok, acc}) when actor != "",
     do: {:cont, {:ok, Map.put(acc, :actor, actor)}}
+
+  defp asked({"policyOutcome", outcome}, {:ok, acc}) when outcome != "",
+    do: {:cont, {:ok, Map.put(acc, :policy_outcome, outcome)}}
+
+  defp asked({"target", target}, {:ok, acc}) when target != "",
+    do: {:cont, {:ok, Map.put(acc, :target, target)}}
+
+  defp asked({"q", text}, {:ok, acc}) when text != "" and byte_size(text) <= 200,
+    do: {:cont, {:ok, Map.put(acc, :q, text)}}
+
+  defp asked({"q", text}, _acc) when text != "",
+    do: {:halt, {:bad, "q is at most 200 bytes"}}
 
   # Resolved against the caller's tenant afterwards: see `of_session/4`.
   defp asked({"session", session}, acc) when session != "", do: {:cont, acc}

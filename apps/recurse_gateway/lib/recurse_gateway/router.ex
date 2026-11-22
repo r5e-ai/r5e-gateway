@@ -298,6 +298,16 @@ defmodule Recurse.Gateway.Router do
   )
 
   dual_auth_get(
+    "/v1/evidence/facets",
+    &Recurse.Gateway.Evidence.ApiHandler.facets/1
+  )
+
+  dual_auth_get(
+    "/v1/evidence/histogram",
+    &Recurse.Gateway.Evidence.ApiHandler.histogram/1
+  )
+
+  dual_auth_get(
     "/v1/evidence/tail",
     &Recurse.Gateway.Evidence.ApiHandler.tail/1
   )

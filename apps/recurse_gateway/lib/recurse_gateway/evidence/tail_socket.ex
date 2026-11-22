@@ -144,8 +144,12 @@ defmodule Recurse.Gateway.Evidence.TailSocket do
   @doc "A record as the list route and the tail give it."
   @spec row(Recurse.Provenance.Store.entry()) :: map()
   def row(entry) do
+    labels = Recurse.Provenance.Evidence.labels(entry.evidence)
+
     %{
       "ref" => entry.ref,
+      "policyOutcome" => labels["policyOutcome"],
+      "target" => labels["target"],
       "stream" => entry.stream,
       "seq" => entry.seq,
       "kind" => entry.kind_path,

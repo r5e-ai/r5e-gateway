@@ -155,6 +155,38 @@ defmodule Recurse.Provenance.Evidence do
   defp nonempty(other), do: other
 
   @doc """
+  What a record can be searched and counted by, beyond its kind, actor
+  and session: how policy decided (`policyOutcome`) and what was called
+  (`target`: a tool, a named target, or a provider and model). Read from the body
+  wherever a record has them, whatever its kind, so a new kind that
+  carries a policy decision is found without anything being told about
+  it. Empty for a record with neither.
+  """
+  @spec labels(t()) :: %{optional(String.t()) => String.t()}
+  def labels(%{"body" => %{} = body}) do
+    for {name, value} <- [{"policyOutcome", outcome_of(body)}, {"target", target_of(body)}],
+        is_binary(value) and value != "",
+        into: %{},
+        do: {name, value}
+  end
+
+  def labels(_evidence), do: %{}
+
+  defp outcome_of(%{"policy" => %{"outcome" => outcome}}), do: outcome
+  defp outcome_of(%{"evaluation" => %{"outcome" => outcome}}), do: outcome
+  defp outcome_of(_body), do: nil
+
+  defp target_of(%{"tool" => tool}) when is_binary(tool), do: tool
+  defp target_of(%{"details" => %{"target" => target}}) when is_binary(target), do: target
+
+  defp target_of(%{"model" => model, "provider" => provider})
+       when is_binary(model) and is_binary(provider),
+       do: provider <> "/" <> model
+
+  defp target_of(%{"model" => model}), do: model
+  defp target_of(_body), do: nil
+
+  @doc """
   What a record's content is kept, read and disposed of together with:
   its session, or its stream when it has none. `nil` for a seal or a
   checkpoint, whose manifest is structure every reader needs, and for a

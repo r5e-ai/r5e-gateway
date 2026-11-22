@@ -208,6 +208,15 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
     do:
       ApiHandler.records(request(:get, "/v1/evidence/records?" <> URI.encode_query(query), opts))
 
+  defp facets(query, opts \\ []),
+    do: ApiHandler.facets(request(:get, "/v1/evidence/facets?" <> URI.encode_query(query), opts))
+
+  defp histogram(query, opts \\ []),
+    do:
+      ApiHandler.histogram(
+        request(:get, "/v1/evidence/histogram?" <> URI.encode_query(query), opts)
+      )
+
   defp tail(query, opts \\ []) do
     conn = request(:get, "/v1/evidence/tail?" <> URI.encode_query(query), opts)
 
@@ -357,8 +366,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
 
     test "a question it cannot answer as asked is refused, not answered loosely" do
       for query <- [
-            %{"policyOutcome" => "deny"},
-            %{"q" => "shell"},
+            %{"outcome" => "deny"},
             %{"limit" => "0"},
             %{"limit" => "201"},
             %{"limit" => "ten"},
@@ -578,6 +586,92 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
 
       assert both.status == 400
       assert dispose_owner("urn:r5e:principal:test:nobody").status == 409
+    end
+  end
+
+  describe "narrowing and counting records" do
+    @tool_call "provenance.r5e.io/v2/ToolCall"
+
+    defp count_of(facet, value),
+      do: Enum.find_value(facet, 0, &(&1["value"] == value && &1["count"]))
+
+    test "a list row says how policy decided and what was called, and both narrow the list" do
+      allowed = records(%{"policyOutcome" => "allow"})
+      assert allowed.status == 200
+      assert %{"records" => [_ | _] = rows} = body(allowed)
+      assert Enum.all?(rows, &match?(%{"policyOutcome" => "allow", "target" => "Bash"}, &1))
+
+      assert %{"records" => []} = body(records(%{"policyOutcome" => "deny"}))
+      assert %{"records" => ^rows} = body(records(%{"target" => "Bash"}))
+      assert %{"records" => []} = body(records(%{"target" => "bash"}))
+      # Free text finds it whatever the case, and is never read as a pattern.
+      assert %{"records" => ^rows} = body(records(%{"q" => "bAsH"}))
+      assert %{"records" => []} = body(records(%{"q" => "b%h"}))
+    end
+
+    test "the counts are of every matching record, not of a page" do
+      %{"records" => all} = body(records(%{"kind" => @tool_call, "limit" => "200"}))
+      %{"records" => [_one]} = body(records(%{"kind" => @tool_call, "limit" => "1"}))
+
+      counted = facets(%{"kind" => @tool_call})
+      assert counted.status == 200
+
+      assert %{
+               "total" => total,
+               "facets" => %{"kind" => kinds, "policyOutcome" => outcomes, "target" => targets}
+             } =
+               body(counted)
+
+      assert total == length(all)
+      assert count_of(outcomes, "allow") == total
+      assert count_of(targets, "Bash") == total
+      # Other kinds are still offered beside the one chosen.
+      assert count_of(kinds, @tool_call) == total
+      assert length(kinds) > 1
+    end
+
+    test "a division is counted without the reader's own choice in it" do
+      assert %{"total" => 0, "facets" => %{"policyOutcome" => outcomes, "target" => []}} =
+               body(facets(%{"policyOutcome" => "deny"}))
+
+      assert count_of(outcomes, "allow") > 0
+    end
+
+    test "records over time, with empty spans given" do
+      since = DateTime.add(DateTime.utc_now(), -3600, :second)
+      until = DateTime.add(DateTime.utc_now(), 3600, :second)
+      span = %{"since" => DateTime.to_iso8601(since), "until" => DateTime.to_iso8601(until)}
+
+      drawn = histogram(Map.merge(span, %{"buckets" => "4", "kind" => @tool_call}))
+      assert drawn.status == 200
+      assert %{"bucketSeconds" => seconds, "buckets" => [_, _, _, _] = buckets} = body(drawn)
+      assert_in_delta seconds, 1800, 1
+
+      %{"total" => total} = body(facets(Map.put(span, "kind", @tool_call)))
+      assert total > 0
+      assert total == buckets |> Enum.map(& &1["count"]) |> Enum.sum()
+      assert total == buckets |> Enum.map(&Map.get(&1["byOutcome"], "allow", 0)) |> Enum.sum()
+      assert Enum.any?(buckets, &(&1["count"] == 0 and &1["byOutcome"] == %{}))
+      assert {:ok, _, 0} = DateTime.from_iso8601(hd(buckets)["start"])
+    end
+
+    test "what is asked for is checked" do
+      assert histogram(%{}).status == 400
+
+      assert histogram(%{"since" => "2026-01-02T00:00:00Z", "until" => "2026-01-01T00:00:00Z"}).status ==
+               400
+
+      assert histogram(%{
+               "since" => "2026-01-01T00:00:00Z",
+               "until" => "2026-01-02T00:00:00Z",
+               "buckets" => "0"
+             }).status == 400
+
+      assert facets(%{"limit" => "5"}).status == 400
+      assert facets(%{"nope" => "x"}).status == 400
+      assert records(%{"q" => String.duplicate("a", 201)}).status == 400
+      assert facets(%{}, role: nil).status == 401
+      assert histogram(%{}, role: nil).status == 401
     end
   end
 
