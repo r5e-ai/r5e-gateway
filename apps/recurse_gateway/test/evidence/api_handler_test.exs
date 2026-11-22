@@ -246,6 +246,15 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
         )
       )
 
+  defp dispose_owner(owner),
+    do:
+      ApiHandler.dispose(
+        request(:post, "/v1/evidence/retention/disposals",
+          body: %{"owner" => owner, "reason" => "erasure request"},
+          role: "platform_operator"
+        )
+      )
+
   defp content(ref, bytes_ref, opts \\ []),
     do:
       ApiHandler.content(
@@ -494,6 +503,81 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert %{"error" => "ERR_CONTENT_DISPOSED"} = body(gone)
 
       assert dispose(recorded(ctx.session)).status == 409
+    end
+
+    @tag :encrypted
+    test "disposing of a person disposes of each session of theirs, by a record of its own",
+         ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      later = capture(recorded(ctx.session <> "-later"))
+      {:ok, _} = Runtime.seal()
+
+      answer = dispose_owner(@alice)
+      assert answer.status == 201
+
+      assert %{"owner" => @alice, "complete" => true, "refused" => [], "disposed" => disposed} =
+               body(answer)
+
+      # Alice's two sessions in this tenant, and not her session in another.
+      assert Enum.sort([recorded(ctx.session), recorded(ctx.session <> "-later")]) ==
+               disposed |> Enum.map(& &1["session"]) |> Enum.sort()
+
+      assert Enum.all?(
+               disposed,
+               &match?(%{"disposal" => "evidence:" <> _, "outcome" => "disposed"}, &1)
+             )
+
+      for gone <- [ref, later.ref] do
+        assert content(gone, Ref.bytes(@args)).status == 410
+      end
+
+      again = dispose_owner(@alice)
+      assert again.status == 409
+      assert %{"error" => "ERR_NOTHING_TO_DISPOSE"} = body(again)
+    end
+
+    @tag :encrypted
+    test "a session under a hold is refused and named, and the person's others still go", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      kept = recorded(ctx.session <> "-kept")
+      held = capture(kept)
+      {:ok, _} = Runtime.seal()
+
+      hold =
+        ApiHandler.hold(
+          request(:post, "/v1/evidence/retention/holds",
+            body: %{"scope" => kept, "reason" => "litigation"},
+            role: "platform_operator"
+          )
+        )
+
+      assert hold.status == 201
+
+      answer = dispose_owner(@alice)
+      assert answer.status == 201
+
+      assert %{
+               "complete" => false,
+               "disposed" => [%{"session" => session}],
+               "refused" => [%{"session" => ^kept, "error" => %{"reason" => "under_hold"}}]
+             } = body(answer)
+
+      assert session == recorded(ctx.session)
+      assert content(ref, Ref.bytes(@args)).status == 410
+      assert content(held.ref, Ref.bytes(@args)).resp_body == @args
+    end
+
+    test "a person is asked for by owner alone, and someone with no sessions has nothing", _ctx do
+      both =
+        ApiHandler.dispose(
+          request(:post, "/v1/evidence/retention/disposals",
+            body: %{"owner" => @alice, "scope" => "urn:r5e:session:x", "reason" => "r"},
+            role: "platform_operator"
+          )
+        )
+
+      assert both.status == 400
+      assert dispose_owner("urn:r5e:principal:test:nobody").status == 409
     end
   end
 

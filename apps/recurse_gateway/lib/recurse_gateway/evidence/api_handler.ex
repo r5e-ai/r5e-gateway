@@ -680,8 +680,20 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end)
   end
 
-  @doc "`POST /v1/evidence/retention/disposals`"
+  @doc """
+  `POST /v1/evidence/retention/disposals`
+
+  With `scope`, one session or stream. With `owner`, every session of
+  that person in the caller's tenant, each disposed of by a record of
+  its own; the answer lists them and any that were refused.
+  """
   @spec dispose(Plug.Conn.t()) :: Plug.Conn.t()
+  def dispose(%Plug.Conn{body_params: %{"owner" => _} = request} = conn) do
+    capturing(conn, @retention, fn conn, %IdentityContext{tenant_id: tenant} = ctx ->
+      retention_answer(conn, 201, Retention.dispose_owner(request, tenant, acts_for(ctx)))
+    end)
+  end
+
   def dispose(%Plug.Conn{body_params: request} = conn) do
     capturing(conn, @retention, fn conn, ctx ->
       retention_answer(conn, 201, Retention.dispose(request, acts_for(ctx)))
@@ -711,6 +723,9 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       })
 
   # Another request took the next position on the stream; ask again.
+  defp retention_answer(conn, _status, {:error, :store_unavailable}),
+    do: json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+
   defp retention_answer(conn, _status, {:error, reason})
        when reason in [:stream_fork_refused, :not_next_in_stream],
        do: json(conn, 409, %{"error" => "retention_stream_moved"})

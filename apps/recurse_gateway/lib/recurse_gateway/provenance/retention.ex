@@ -31,7 +31,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
 
   require Logger
 
-  alias Recurse.Gateway.Provenance.{Carried, Claim, Enrolment, Grants, Runtime}
+  alias Recurse.Gateway.Provenance.{Carried, Claim, Enrolment, Grants, Runtime, SessionName}
   alias Recurse.Provenance.{Definitions, Envelope, Evidence, Export, Key, Pipeline, Publication}
   alias Recurse.Provenance.Retention, as: Rules
   alias RecurseVerify.Canonical
@@ -51,6 +51,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
           | :hold_already_released
           | :releaser_has_no_standing
           | :nothing_to_dispose
+          | :store_unavailable
           | {:under_hold, String.t()}
           | {:never_disposed_of | :kept_until | :profile_not_held, String.t()}
           | atom()
@@ -417,6 +418,85 @@ defmodule Recurse.Gateway.Provenance.Retention do
   end
 
   def dispose(_request, _on_behalf_of), do: {:error, :malformed_request}
+
+  @doc """
+  Dispose of everything recorded in every session of one person.
+  `request` has `owner` (the person's identity, as records name them)
+  and `reason`, and may have `action` and `details`. `tenant` is the
+  tenant whose sessions are meant.
+
+  A session's recorded name carries its owner (see
+  `Recurse.Gateway.Provenance.SessionName`), so the person's sessions
+  are found by name, whatever their records say and whenever they were
+  made. Each one is disposed of as if it had been asked for by itself:
+  one disposal record per session, each judged by that session's holds
+  and its records' retention, each checkable by a reader on its own.
+
+  The answer lists what was disposed of and what was refused and why.
+  A session with nothing left to make unreadable is passed over.
+  `complete` is true when no session of theirs was refused. A session
+  the person begins afterwards is not covered: ask again.
+
+  `{:error, :nothing_to_dispose}` when no session of theirs had
+  anything to make unreadable, and `{:error, :store_unavailable}`, with
+  nothing recorded, when the sessions could not be looked up.
+  """
+  @spec dispose_owner(map(), String.t(), String.t() | nil) :: {:ok, map()} | {:error, error()}
+  def dispose_owner(%{"owner" => owner, "reason" => _} = request, tenant, on_behalf_of)
+      when is_binary(owner) and owner != "" and is_binary(tenant) and
+             not is_map_key(request, "scope") and not is_map_key(request, "targets") do
+    with {:ok, sessions} <- sessions_of(tenant, owner) do
+      asked = Map.delete(request, "owner")
+
+      outcomes =
+        for session <- sessions do
+          {session, dispose(Map.put(asked, "scope", session), on_behalf_of)}
+        end
+
+      summed(owner, outcomes)
+    end
+  end
+
+  def dispose_owner(_request, _tenant, _on_behalf_of), do: {:error, :malformed_request}
+
+  defp summed(owner, outcomes) do
+    disposed = for {session, {:ok, done}} <- outcomes, do: Map.put(done, "session", session)
+
+    refused =
+      for {session, {:error, reason}} <- outcomes, reason != :nothing_to_dispose do
+        %{"session" => session, "error" => refusal(reason)}
+      end
+
+    if disposed == [] and refused == [] do
+      {:error, :nothing_to_dispose}
+    else
+      {:ok,
+       %{
+         "owner" => owner,
+         "disposed" => disposed,
+         "refused" => refused,
+         "complete" => refused == []
+       }}
+    end
+  end
+
+  defp sessions_of(tenant, owner) do
+    %{store: {module, handle}} = Runtime.info()
+    # The owner's part of a session's name, up to the dot that ends it.
+    prefix = SessionName.for(tenant, owner, "")
+
+    if function_exported?(module, :sessions_owned, 2),
+      do: {:ok, module.sessions_owned(handle, prefix)},
+      else: {:error, :malformed_request}
+  rescue
+    _ -> {:error, :store_unavailable}
+  end
+
+  defp refusal({reason, about}) when is_atom(reason),
+    do: %{"reason" => Atom.to_string(reason), "about" => about}
+
+  defp refusal(reason) when is_atom(reason), do: %{"reason" => Atom.to_string(reason)}
+  defp refusal(_other), do: %{"reason" => "not_recorded"}
 
   # A disposal destroys a key. With none left there is nothing it can do.
   defp key_left(module, handle, scope) do

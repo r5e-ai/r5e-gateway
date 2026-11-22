@@ -606,6 +606,25 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   end
 
   @doc """
+  The recorded names of every session whose name begins with `prefix`:
+  with a tenant and an owner's fingerprint, every session of that
+  owner's. It raises when the store cannot be asked, because whoever
+  disposes of a person's sessions must never take a failure to look for
+  "there are none".
+  """
+  @spec sessions_owned(term(), String.t()) :: [String.t()]
+  def sessions_owned(handle, prefix) when is_binary(prefix) do
+    repo(handle).all(
+      from(r in "evidence_records",
+        where: fragment("starts_with(?, ?)", r.session, ^prefix),
+        distinct: true,
+        order_by: r.session,
+        select: r.session
+      )
+    )
+  end
+
+  @doc """
   Note that an authority record stands behind a signing key: its badge,
   or a revocation of that badge. Exports of the key's records carry them.
   """
