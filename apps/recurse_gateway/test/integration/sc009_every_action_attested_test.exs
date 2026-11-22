@@ -185,6 +185,7 @@ defmodule RecurseGateway.Integration.SC009EveryActionAttestedTest do
 
   defp build_meta(atom) do
     correlation_id = "corr-sc009-#{System.unique_integer()}"
+
     base = %{
       tenant_id: @tenant_id,
       principal_subject: "alice@corp",
@@ -197,6 +198,7 @@ defmodule RecurseGateway.Integration.SC009EveryActionAttestedTest do
   defp atom_specific_meta(:ui_login), do: %{event: "login_success"}
   defp atom_specific_meta(:ui_session), do: %{event: "live_tail_open"}
   defp atom_specific_meta(:ui_query), do: %{query_kind: "audit_log", row_count: 1}
+
   defp atom_specific_meta(:ui_policy_simulate),
     do: %{simulate_run_id: Ecto.UUID.generate(), decision: "allow"}
 

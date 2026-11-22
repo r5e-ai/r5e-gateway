@@ -26,11 +26,6 @@ defmodule RecurseGateway.Integration.SC011AvailabilityTest do
        `Application.ensure_all_started/1` for `:recurse_gateway` (already
        loaded; the call is a no-op in CI but proves the dependency
        graph is satisfiable).
-    3. **Live-tail backfill primitive**: the `LiveTailSocket` upgrade
-       handler accepts a `since_run_id` parameter (or equivalent
-       backfill cursor) so a reconnecting browser can rejoin without
-       data loss within the RPO window. Asserted by checking the
-       handler module exists + exposes the documented surface.
 
   ## Why this is `:sc011`-tagged not `:soak`-tagged
 
@@ -51,7 +46,6 @@ defmodule RecurseGateway.Integration.SC011AvailabilityTest do
 
     * `specs/004-audit-console/spec.md` SC-011
     * `specs/004-audit-console/tasks.md` T154
-    * `apps/recurse_gateway/lib/recurse_gateway/admin/live_tail_socket.ex`
   """
 
   use ExUnit.Case, async: false
@@ -190,13 +184,6 @@ defmodule RecurseGateway.Integration.SC011AvailabilityTest do
       Enum.each(handlers, fn mod ->
         assert Code.ensure_loaded?(mod), "handler module not loaded: #{inspect(mod)}"
       end)
-    end
-
-    test "live-tail socket module exposes the upgrade surface (RPO backfill)" do
-      assert Code.ensure_loaded?(Recurse.Gateway.Admin.LiveTailSocket)
-
-      assert function_exported?(Recurse.Gateway.Admin.LiveTailSocket, :upgrade, 1),
-             "LiveTailSocket.upgrade/1 is the documented entry for live-tail subscription"
     end
   end
 

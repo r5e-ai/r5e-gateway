@@ -76,7 +76,11 @@ defmodule Recurse.Gateway.Integration.Us4AuditAgentTest do
       # Canonical event sequence per audit_api_extensions.md §"SSE event sequence".
       assert match?(%{"conversation_id" => _}, find_event_data(events, "conversation_id"))
       assert match?(%{"delta" => _}, find_event_data(events, "agent_token"))
-      assert match?(%{"message_id" => _, "attested_run_id" => _}, find_event_data(events, "message_complete"))
+
+      assert match?(
+               %{"message_id" => _, "attested_run_id" => _},
+               find_event_data(events, "message_complete")
+             )
 
       assert_receive {:ui_receipt_emitted, %{event_kind: :ui_chat}}, 2_000
     end
@@ -143,12 +147,13 @@ defmodule Recurse.Gateway.Integration.Us4AuditAgentTest do
     test "lists the caller's conversations + emits :ui_query (chat_history)" do
       jwt = mint_jwt("tenant_auditor")
 
-      _ = ChatHistory.create_message(:new, %{
-        tenant_id: TestHelper.tenant_id(),
-        principal_subject: "user-0001",
-        role: :user,
-        content: "seed"
-      })
+      _ =
+        ChatHistory.create_message(:new, %{
+          tenant_id: TestHelper.tenant_id(),
+          principal_subject: "user-0001",
+          role: :user,
+          content: "seed"
+        })
 
       conn =
         :get
@@ -160,8 +165,7 @@ defmodule Recurse.Gateway.Integration.Us4AuditAgentTest do
       body = JSON.decode!(conn.resp_body)
       assert is_list(body["conversations"])
 
-      assert_receive {:ui_receipt_emitted,
-                      %{event_kind: :ui_query, query_kind: "chat_history"}},
+      assert_receive {:ui_receipt_emitted, %{event_kind: :ui_query, query_kind: "chat_history"}},
                      2_000
     end
 
@@ -199,6 +203,7 @@ defmodule Recurse.Gateway.Integration.Us4AuditAgentTest do
       body = JSON.decode!(conn.resp_body)
       [row | _] = body["conversations"]
       assert row["id"] == conv.id
+
       assert row["last_user_message_excerpt"] ==
                "Why was Alice's last bash_exec denied?"
     end
@@ -228,8 +233,7 @@ defmodule Recurse.Gateway.Integration.Us4AuditAgentTest do
       assert body["id"] == conv.id
       assert is_list(body["messages"])
 
-      assert_receive {:ui_receipt_emitted,
-                      %{event_kind: :ui_query, query_kind: "chat_history"}},
+      assert_receive {:ui_receipt_emitted, %{event_kind: :ui_query, query_kind: "chat_history"}},
                      2_000
     end
 
@@ -324,9 +328,7 @@ defmodule Recurse.Gateway.Integration.Us4AuditAgentTest do
     conn
     |> Plug.Conn.put_req_header("authorization", "Bearer " <> jwt)
     |> Plug.Conn.put_req_header("content-type", "application/json")
-    |> Plug.Parsers.call(
-      Plug.Parsers.init(parsers: [:json], pass: ["*/*"], json_decoder: JSON)
-    )
+    |> Plug.Parsers.call(Plug.Parsers.init(parsers: [:json], pass: ["*/*"], json_decoder: JSON))
   end
 
   defp with_path_params(conn, params) do

@@ -12,6 +12,10 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       read on. A parameter this route does not know is refused, so that
       a filter that was not applied is never mistaken for one that
       matched nothing.
+    * `GET  /v1/evidence/tail` — records as they arrive, over a
+      WebSocket (`Recurse.Gateway.Evidence.TailSocket`). Query: `kind`,
+      `session` and `actor`, as on the list. 426 for a request that is
+      not a WebSocket handshake, 503 when this node is not capturing.
     * `GET  /v1/evidence/records/:ref/content/:bytes_ref` — one piece
       of content a record names, as a download. 404 when the record does
       not name it or it is not held, 410 when the record's content was
@@ -92,10 +96,11 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   """
 
   alias Recurse.Gateway.AuditPlane.Authz
+  alias Recurse.Gateway.Evidence.TailSocket
   alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Gateway.Provenance.{Admission, Carried, Disclosing, Enrolment, Retention, Runtime}
   alias Recurse.Gateway.Provenance.SessionName
-  alias Recurse.Provenance.{Evidence, Export, Exporter, Key, Ref}
+  alias Recurse.Provenance.{Evidence, Export, Exporter, Key, Pipeline, Ref}
   alias Recurse.Shared.IdentityContext
 
   @read ~s(Recurse::Action::"ReadReceipts")
@@ -111,6 +116,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   @default_limit 50
   @max_limit 200
   @listing_params ~w(kind session actor since until limit cursor)
+  @tail_params ~w(kind session actor)
 
   @doc "`GET /v1/evidence/records`"
   @spec records(Plug.Conn.t()) :: Plug.Conn.t()
@@ -136,6 +142,42 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       {page, rest} = Enum.split(entries, asked.limit)
       cursor = if rest == [], do: nil, else: cursor(List.last(page))
       {:ok, %{"records" => Enum.map(page, &render/1), "cursor" => cursor}}
+    end
+  end
+
+  @doc "`GET /v1/evidence/tail`"
+  @spec tail(Plug.Conn.t()) :: Plug.Conn.t()
+  def tail(conn) do
+    %Plug.Conn{query_params: params} = conn = Plug.Conn.fetch_query_params(conn)
+
+    gated(conn, @read, "/v1/evidence/tail", fn conn, ctx, index ->
+      case watching(params, ctx, index) do
+        {:ok, opening} -> TailSocket.upgrade(conn, opening)
+        :none -> not_found(conn)
+        {:many, sessions} -> several(conn, sessions)
+        {:bad, message} -> bad_request(conn, message)
+        :not_capturing -> json(conn, 503, %{"error" => "ERR_NOT_CAPTURING"})
+        {:error, _} -> json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+      end
+    end)
+  end
+
+  # What a tail connection is opened with, or why it cannot be.
+  defp watching(params, ctx, index) do
+    with [] <- Map.keys(params) -- @tail_params,
+         true <- Runtime.running?() || :not_capturing,
+         {:ok, asked} <- Enum.reduce_while(params, {:ok, %{}}, &asked/2),
+         {:ok, filter} <- of_session(asked, params["session"], ctx, index) do
+      {:ok,
+       %{
+         store: index,
+         signals: Pipeline.signals(Runtime.pipeline()),
+         stream_prefix: "urn:r5e:stream:#{deployment()}:",
+         filter: filter
+       }}
+    else
+      [unknown | _] -> {:bad, "unknown parameter #{unknown}"}
+      other -> other
     end
   end
 
@@ -778,18 +820,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     }
   end
 
-  defp render(entry) do
-    %{
-      "ref" => entry.ref,
-      "stream" => entry.stream,
-      "seq" => entry.seq,
-      "kind" => entry.kind_path,
-      "capturedAt" => entry.evidence["capturedAt"],
-      "actor" => entry.evidence["actor"],
-      "session" => entry.evidence["session"],
-      "envelope" => entry.envelope
-    }
-  end
+  defp render(entry), do: TailSocket.row(entry)
 
   defp json(conn, status, body) do
     conn

@@ -13,10 +13,7 @@ defmodule Recurse.Gateway.Integration.Us1AuditLogTest do
        and asserts SC-009 (≤2-second receipt-visibility budget) by
        observing the `:ui_query` `query_kind: "session_timeline"`
        attestation arrives within the budget.
-    3. **Live-tail in-process** — drive the LiveTailSocket WebSock
-       callbacks against a fresh PubSub-broadcasted attestation and
-       assert the `attestation` frame ships within the SC-009 budget.
-    4. **FR-007 negative case** — a principal whose JWT has no
+    3. **FR-007 negative case** — a principal whose JWT has no
        `recurse_role` (NULL or omitted) sees a 403 from the role-allowlist
        Cedar bundle, the rejection is attested as a distinguishable
        `:ui_login` receipt with a discriminator (`outcome:
@@ -36,7 +33,6 @@ defmodule Recurse.Gateway.Integration.Us1AuditLogTest do
   @moduletag :integration
 
   alias Recurse.Gateway.Admin.BrowserAuth.UiReceipts
-  alias Recurse.Gateway.Admin.LiveTailSocket
   alias Recurse.Gateway.Admin.SessionTimelineHandler
   alias Recurse.Gateway.AuditPlane.ReceiptsHandler
   alias Recurse.Gateway.Policy.BundleLoader
@@ -194,51 +190,6 @@ defmodule Recurse.Gateway.Integration.Us1AuditLogTest do
     end
   end
 
-  describe "US1 — live-tail SC-009 budget" do
-    test "synthetic attestation broadcast → attestation frame within 2s" do
-      attestation = %{
-        run_id: Ecto.UUID.generate(),
-        tenant_id: @tenant_id,
-        session_id: Ecto.UUID.generate(),
-        event_kind: :ui_query,
-        policy_decision: :allow,
-        principal: %{"subject" => "alice@corp"},
-        timestamp: DateTime.utc_now(),
-        outcome: :success,
-        verification_level: :global_inclusion_verified
-      }
-
-      state = %{
-        principal_subject: "alice@corp",
-        tenant_id: @tenant_id,
-        browser_session_id: nil,
-        correlation_id: Ulid.generate(),
-        filter: %{},
-        filter_compiled: fn _ -> true end,
-        last_seen_run_id: nil,
-        last_seen_committed_at: nil,
-        last_client_frame_at: System.monotonic_time(:millisecond),
-        pending_frames: 0,
-        stalled_at: nil
-      }
-
-      t0 = System.monotonic_time(:millisecond)
-
-      assert {:push, [{:text, frame}], _} =
-               LiveTailSocket.handle_info(
-                 {:first_committed, attestation.run_id, %{attestation: attestation}},
-                 state
-               )
-
-      elapsed = System.monotonic_time(:millisecond) - t0
-      assert elapsed < @sc009_budget_ms
-
-      decoded = JSON.decode!(frame)
-      assert decoded["type"] == "attestation"
-      assert decoded["run_id"] == attestation.run_id
-    end
-  end
-
   describe "FR-007 — JWT with no recurse_role is rejected with attested receipt" do
     test "callback path: rejection emits :ui_login with outcome=rejected_no_role" do
       # Mint a JWT whose `principal.recurse_role` is nil (i.e., the
@@ -277,8 +228,7 @@ defmodule Recurse.Gateway.Integration.Us1AuditLogTest do
       conn = ReceiptsHandler.handle(conn)
       assert conn.status == 403
 
-      assert_receive {:ui_receipt_emitted,
-                      %{event_kind: :ui_login, outcome: "rejected_no_role"}},
+      assert_receive {:ui_receipt_emitted, %{event_kind: :ui_login, outcome: "rejected_no_role"}},
                      @sc009_budget_ms
 
       # No browser-session cookie set on the conn.

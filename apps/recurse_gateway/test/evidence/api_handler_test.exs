@@ -11,7 +11,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
   @moduletag :tmp_dir
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias Recurse.Gateway.Evidence.ApiHandler
+  alias Recurse.Gateway.Evidence.{ApiHandler, TailSocket}
   alias Recurse.Gateway.Policy.BundleLoader
   alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Gateway.Provenance.{Runtime, SessionName}
@@ -194,6 +194,35 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
     do:
       ApiHandler.records(request(:get, "/v1/evidence/records?" <> URI.encode_query(query), opts))
 
+  defp tail(query, opts \\ []) do
+    conn = request(:get, "/v1/evidence/tail?" <> URI.encode_query(query), opts)
+
+    handshake =
+      if opts[:handshake],
+        do: [
+          {"host", "gateway.test"},
+          {"connection", "Upgrade"},
+          {"upgrade", "websocket"},
+          {"sec-websocket-key", Base.encode64(:crypto.strong_rand_bytes(16))},
+          {"sec-websocket-version", "13"}
+        ],
+        else: []
+
+    # Set directly: Plug refuses a host header through its own setters.
+    ApiHandler.tail(%{conn | req_headers: conn.req_headers ++ handshake})
+  end
+
+  defp opening(filter) do
+    info = Runtime.info()
+
+    %{
+      store: Runtime.store(info.deployment),
+      signals: Pipeline.signals(Runtime.pipeline()),
+      stream_prefix: "urn:r5e:stream:#{info.deployment}:",
+      filter: filter
+    }
+  end
+
   defp content(ref, bytes_ref, opts \\ []),
     do:
       ApiHandler.content(
@@ -309,6 +338,79 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
         assert conn.status == 400, "expected 400 for #{inspect(query)}, got #{conn.status}"
         assert %{"error" => "ERR_BAD_REQUEST"} = body(conn)
       end
+    end
+  end
+
+  describe "GET /v1/evidence/tail" do
+    test "needs credentials and the right to read records" do
+      assert tail(%{}, role: nil).status == 401
+      assert tail(%{}, role: "tenant_app").status == 403
+    end
+
+    test "opens a connection for a reader, and refuses a filter it does not have" do
+      assert %Plug.Conn{state: :upgraded} = tail(%{}, handshake: true)
+      assert tail(%{}).status == 426
+      assert tail(%{"policyOutcome" => "deny"}).status == 400
+      assert tail(%{"session" => "nobody-opened-this"}).status == 404
+    end
+
+    test "is refused where nothing is being captured" do
+      info = Runtime.info()
+      :persistent_term.erase({Runtime, :info})
+      on_exit(fn -> :persistent_term.put({Runtime, :info}, info) end)
+
+      assert %{status: 503, resp_body: body} = tail(%{})
+      assert JSON.decode!(body) == %{"error" => "ERR_NOT_CAPTURING"}
+    end
+
+    test "a record that arrives is sent once, as a list row", ctx do
+      {:ok, state} = TailSocket.init(opening(%{}))
+
+      receipt = capture(recorded(ctx.session))
+      :ok = Runtime.flush()
+      assert_receive {:provenance, :shipped, stream, seq} = signal when seq == receipt.seq
+
+      assert {:push, frames, state} = TailSocket.handle_info(signal, state)
+      rows = for {:text, frame} <- frames, do: JSON.decode!(frame)
+      assert %{"type" => "record", "record" => row} = List.last(rows)
+
+      assert %{"records" => [^row | _]} = body(records(%{}))
+      assert row["ref"] == receipt.ref
+
+      assert {:ok, _} = TailSocket.handle_info({:provenance, :shipped, stream, seq}, state)
+    end
+
+    test "only what the reader asked for is sent", ctx do
+      {:ok, mine} = TailSocket.init(opening(%{session: recorded(ctx.session)}))
+      {:ok, other} = TailSocket.init(opening(%{actor: "urn:r5e:principal:test:bob"}))
+
+      receipt = capture(recorded(ctx.session))
+      :ok = Runtime.flush()
+      assert_receive {:provenance, :shipped, _, seq} = signal when seq == receipt.seq
+
+      assert {:push, [_ | _], _} = TailSocket.handle_info(signal, mine)
+      assert {:ok, _} = TailSocket.handle_info(signal, other)
+    end
+
+    test "another deployment's streams are not read", ctx do
+      {:ok, state} = TailSocket.init(opening(%{}))
+
+      assert {:ok, ^state} =
+               TailSocket.handle_info({:provenance, :shipped, "urn:r5e:stream:else:1", 1}, state)
+
+      assert ctx.session
+    end
+
+    test "a ping is answered and a tick sends one" do
+      {:ok, state} = TailSocket.init(opening(%{}))
+
+      assert {:push, [{:text, ~s({"type":"pong"})}], ^state} =
+               TailSocket.handle_in({~s({"type":"ping"}), opcode: :text}, state)
+
+      assert {:ok, ^state} = TailSocket.handle_in({"not json", opcode: :text}, state)
+
+      assert {:push, [{:text, ~s({"type":"ping"})}], ^state} =
+               TailSocket.handle_info(:ping, state)
     end
   end
 

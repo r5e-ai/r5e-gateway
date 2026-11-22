@@ -126,8 +126,8 @@ if Code.ensure_loaded?(Credo.Check) do
       "Plug",
       "Bandit",
       # WebSocket adapter — bridges Plug.Conn upgrade requests to the
-      # `WebSock` behaviour for Bandit (or Cowboy). Used by F004 T063's
-      # LiveTailSocket. Vendor-neutral BEAM-ecosystem WebSocket plumbing,
+      # `WebSock` behaviour for Bandit (or Cowboy). Used by the evidence
+      # tail. Vendor-neutral BEAM-ecosystem WebSocket plumbing,
       # not a vendor SDK — same trust class as Bandit/Plug.
       "WebSockAdapter",
       # Intra-node messaging (FR-034)
