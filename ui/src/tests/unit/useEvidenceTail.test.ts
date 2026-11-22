@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { mergeEvidenceRows } from "~/hooks/useEvidenceTail";
+import {
+  classifyTailProbeResponse,
+  mergeEvidenceRows,
+  nextBackoffDelayMs,
+} from "~/hooks/useEvidenceTail";
 import { apiPaths } from "~/lib/apiPaths";
 import type { EvidenceRecordEntry } from "~/lib/evidenceTypes";
 
@@ -21,7 +25,7 @@ function stubRow(ref: string, seq: number): EvidenceRecordEntry {
   };
 }
 
-describe("apiPaths.liveTail & mergeEvidenceRows", () => {
+describe("apiPaths.liveTail, backoff, probe classification & mergeEvidenceRows", () => {
   it("builds /v1/evidence/tail with optional kind, session, and actor filters", () => {
     expect(apiPaths.liveTail()).toBe("/v1/evidence/tail");
     expect(
@@ -33,6 +37,33 @@ describe("apiPaths.liveTail & mergeEvidenceRows", () => {
     ).toBe(
       "/v1/evidence/tail?kind=provenance.r5e.io%2Fv2%2FToolCall&session=urn%3Ar5e%3Asession%3Ar5e-dev%3Aabc.1&actor=urn%3Ar5e%3Auser%3Aalice",
     );
+  });
+
+  it("treats HTTP 426 probe as transient Connection lost with reconnect enabled", () => {
+    const res = classifyTailProbeResponse(426);
+    expect(res.detail).toContain("Connection lost");
+    expect(res.detail).not.toContain("WebSocket upgrade required");
+    expect(res.shouldReconnect).toBe(true);
+  });
+
+  it("stops reconnecting on terminal 401/403/404/503/400 responses", () => {
+    expect(classifyTailProbeResponse(401).shouldReconnect).toBe(false);
+    expect(classifyTailProbeResponse(403).shouldReconnect).toBe(false);
+    expect(classifyTailProbeResponse(404).shouldReconnect).toBe(false);
+    expect(classifyTailProbeResponse(503, { error: "ERR_NOT_CAPTURING" })).toMatchObject({
+      status: "not_capturing",
+      shouldReconnect: false,
+    });
+    expect(classifyTailProbeResponse(400).shouldReconnect).toBe(false);
+  });
+
+  it("computes bounded exponential backoff 1s -> 2s -> 4s -> 8s capped", () => {
+    expect(nextBackoffDelayMs(0)).toBe(1_000);
+    expect(nextBackoffDelayMs(1)).toBe(2_000);
+    expect(nextBackoffDelayMs(2)).toBe(4_000);
+    expect(nextBackoffDelayMs(3)).toBe(8_000);
+    expect(nextBackoffDelayMs(4)).toBe(8_000);
+    expect(nextBackoffDelayMs(10)).toBe(8_000);
   });
 
   it("deduplicates live-tail records against fetched list rows by ref", () => {

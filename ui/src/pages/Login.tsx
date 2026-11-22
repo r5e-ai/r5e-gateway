@@ -92,6 +92,7 @@ function readQueryParam(search: string, name: string): string | null {
 
 export default function Login(): JSX.Element {
   const [isRedirecting, setIsRedirecting] = useState(false);
+  const [runtimeErrorCode, setRuntimeErrorCode] = useState<string | null>(null);
 
   // We're rendered inside <BrowserRouter> (App.tsx) but Login itself does no
   // routing — it only needs to OBSERVE the current location's search string
@@ -122,8 +123,10 @@ export default function Login(): JSX.Element {
   // Error banner state. Mirrors the IdP-error redirect-back contract from
   // browser_oidc_flow.md: a failed auth round-trip lands back at
   // /admin/login?error=<code>&error_description=<human readable>.
-  const errorCode = readQueryParam(search, "error");
+  const queryErrorCode = readQueryParam(search, "error");
+  const errorCode = runtimeErrorCode ?? queryErrorCode;
   const errorDescription = readQueryParam(search, "error_description");
+  const isNotConfigured = errorCode === "login_not_configured";
 
   // Reset the loading state if the page becomes visible again (browser
   // back/forward) — without this, hitting Back after a failed redirect
@@ -156,9 +159,30 @@ export default function Login(): JSX.Element {
     ) {
       return;
     }
+    event.preventDefault();
+    setRuntimeErrorCode(null);
     setIsRedirecting(true);
-    // Don't preventDefault — we WANT the anchor's full-page navigation to
-    // happen so the OIDC round-trip starts immediately.
+
+    // Probe /admin/login/start with manual redirect handling so a 503
+    // `{"error":"login_not_configured"}` renders a clear in-page notice
+    // instead of a raw JSON response, while a normal 302 proceeds cleanly.
+    void fetch(ssoUrl, { credentials: "include", redirect: "manual" })
+      .then(async (resp) => {
+        if (resp.status === 503) {
+          const body = (await resp.json().catch(() => null)) as {
+            error?: string;
+          } | null;
+          if (body?.error === "login_not_configured") {
+            setIsRedirecting(false);
+            setRuntimeErrorCode("login_not_configured");
+            return;
+          }
+        }
+        window.location.assign(ssoUrl);
+      })
+      .catch(() => {
+        window.location.assign(ssoUrl);
+      });
   }
 
   return (
@@ -203,15 +227,19 @@ export default function Login(): JSX.Element {
               <ErrorState
                 compact
                 testId="login-error"
-                title="Sign-in failed"
+                title={isNotConfigured ? "Sign-in unavailable" : "Sign-in failed"}
                 body={
-                  <>
-                    The identity provider returned an error
-                    {errorDescription
-                      ? `: ${errorDescription}.`
-                      : ` (${errorCode}).`}{" "}
-                    Try again, or contact your admin if the problem persists.
-                  </>
+                  isNotConfigured ? (
+                    "Sign-in is not configured on this node."
+                  ) : (
+                    <>
+                      The identity provider returned an error
+                      {errorDescription
+                        ? `: ${errorDescription}.`
+                        : ` (${errorCode}).`}{" "}
+                      Try again, or contact your admin if the problem persists.
+                    </>
+                  )
                 }
               />
             </div>
