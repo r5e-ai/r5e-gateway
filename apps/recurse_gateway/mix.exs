@@ -47,11 +47,8 @@ defmodule RecurseGateway.MixProject do
       # HTTP server (Data Plane hot path; HTTP/1.1 + HTTP/2 + SSE).
       {:bandit, "~> 1.7"},
       {:plug, "~> 1.19"},
-      # F004 T063 — WebSocket upgrade adapter (live-tail). Bridges
-      # `Plug.Conn.upgrade_adapter/3` to the `WebSock` behaviour callbacks
-      # so the LiveTailSocket handler can receive frames from Bandit's
-      # WebSocket dispatcher. `:websock` (transitive via `:bandit`) defines
-      # the behaviour; `:websock_adapter` provides `WebSockAdapter.upgrade/4`.
+      # Hands a `Plug.Conn` over to a `WebSock` handler under Bandit, for
+      # the evidence tail (`Recurse.Gateway.Evidence.TailSocket`).
       {:websock_adapter, "~> 0.5"},
       # 009 T001 — outbound WebSocket client for the LLM API proxy
       # (Sub-3.3). Used by `Recurse.Gateway.LlmProxy.WebSocketBridge` to

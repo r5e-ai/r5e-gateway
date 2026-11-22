@@ -298,6 +298,11 @@ defmodule Recurse.Gateway.Router do
   )
 
   dual_auth_get(
+    "/v1/evidence/tail",
+    &Recurse.Gateway.Evidence.ApiHandler.tail/1
+  )
+
+  dual_auth_get(
     "/v1/evidence/records/:ref",
     &Recurse.Gateway.Evidence.ApiHandler.record/1
   )
@@ -597,15 +602,6 @@ defmodule Recurse.Gateway.Router do
   cookie_only_post(
     "/v1/audit/receipts/:run_id/verify",
     &Recurse.Gateway.Admin.LocalVerifyHandler.handle/1
-  )
-
-  # F004 T063 — live-tail WebSocket upgrade. Cookie-required. Cedar action
-  # `DashboardQuery`; emits `:ui_session` with `event: "live_tail_open"`
-  # at upgrade and `"live_tail_close"` at disconnect. Browser-only — no
-  # bearer-auth path per live_tail_transport.md §"Authentication".
-  cookie_only_get(
-    "/admin/live-tail",
-    &Recurse.Gateway.Admin.LiveTailSocket.upgrade/1
   )
 
   cookie_only_post(

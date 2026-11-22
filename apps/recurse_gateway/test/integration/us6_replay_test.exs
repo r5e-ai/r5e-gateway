@@ -301,9 +301,7 @@ defmodule RecurseGateway.Integration.US6ReplayTest do
     conn
     |> Plug.Conn.put_req_header("authorization", "Bearer " <> jwt)
     |> Plug.Conn.put_req_header("content-type", "application/json")
-    |> Plug.Parsers.call(
-      Plug.Parsers.init(parsers: [:json], pass: ["*/*"], json_decoder: JSON)
-    )
+    |> Plug.Parsers.call(Plug.Parsers.init(parsers: [:json], pass: ["*/*"], json_decoder: JSON))
   end
 
   defp with_path_params(conn, params),
