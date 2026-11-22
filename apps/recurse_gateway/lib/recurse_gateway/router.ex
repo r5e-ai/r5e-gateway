@@ -293,6 +293,11 @@ defmodule Recurse.Gateway.Router do
   # Provenance v2 evidence. Cookie or bearer; the handler applies the
   # policy bundle and the tenant rule. See Recurse.Gateway.Evidence.ApiHandler.
   dual_auth_get(
+    "/v1/evidence/records",
+    &Recurse.Gateway.Evidence.ApiHandler.records/1
+  )
+
+  dual_auth_get(
     "/v1/evidence/records/:ref",
     &Recurse.Gateway.Evidence.ApiHandler.record/1
   )
