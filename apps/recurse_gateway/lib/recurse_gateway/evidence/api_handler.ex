@@ -270,6 +270,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     |> Plug.Conn.put_resp_content_type("application/octet-stream", nil)
     |> Plug.Conn.put_resp_header("content-disposition", "attachment")
     |> Plug.Conn.put_resp_header("x-content-type-options", "nosniff")
+    |> Plug.Conn.put_resp_header("cache-control", "no-store, private")
     |> Plug.Conn.put_resp_header("x-r5e-content-ref", bytes_ref)
     |> Plug.Conn.send_resp(200, bytes)
   end

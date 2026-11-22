@@ -323,6 +323,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert Plug.Conn.get_resp_header(conn, "content-type") == ["application/octet-stream"]
       assert Plug.Conn.get_resp_header(conn, "content-disposition") == ["attachment"]
       assert Plug.Conn.get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+      assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store, private"]
       assert Plug.Conn.get_resp_header(conn, "x-r5e-content-ref") == [args_ref]
     end
 
