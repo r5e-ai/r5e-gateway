@@ -56,7 +56,7 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
 
         result =
           case repo.insert_all("evidence_records", [row], on_conflict: :nothing) do
-            {1, _} -> :ok
+            {1, _} -> label(repo, [entry])
             {0, _} -> existing(repo, stream, seq, ref)
           end
 
@@ -82,9 +82,23 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     |> Enum.chunk_every(1_000)
     |> Enum.each(&repo(handle).insert_all("evidence_records", &1, on_conflict: :nothing))
 
-    :ok
+    label(repo(handle), entries)
   rescue
     error -> {:error, error}
+  end
+
+  # What each record can be searched and counted by, kept beside the
+  # records. Derived from them, so a replayed batch changes nothing.
+  defp label(repo, entries) do
+    for %{evidence: evidence} = entry <- entries,
+        {:ok, captured_at, 0} <- [DateTime.from_iso8601(evidence["capturedAt"])],
+        {name, value} <- Recurse.Provenance.Evidence.labels(evidence) do
+      %{ref: entry.ref, name: name, value: value, stream: entry.stream, captured_at: captured_at}
+    end
+    |> Enum.chunk_every(1_000)
+    |> Enum.each(&repo.insert_all("evidence_record_labels", &1, on_conflict: :nothing))
+
+    :ok
   end
 
   defp row(%{evidence: evidence} = entry) do
@@ -212,20 +226,148 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   end
 
   @impl true
-  def list(handle, %{stream_prefix: prefix, limit: limit} = asked) do
+  def list(handle, %{stream_prefix: _, limit: limit} = asked) do
     rows =
-      from(r in "evidence_records",
-        where: fragment("starts_with(?, ?)", r.stream, ^prefix),
+      from(r in matching(asked),
         order_by: [desc: r.captured_at, desc: r.ref],
         limit: ^limit,
         select: ^fields()
       )
-      |> narrowed(asked)
       |> repo(handle).all()
 
     {:ok, Enum.map(rows, &elem(entry(&1), 1))}
   rescue
     error -> {:error, error}
+  end
+
+  @doc """
+  How many records match, and how they divide by kind, by how policy
+  decided, and by what was called (the twenty most frequent). `asked`
+  narrows as it does for `list/2`; its limit and position are ignored.
+  The counts are of every matching record, not of a page of them.
+
+  Each division is counted without the reader's own choice within it:
+  having chosen "deny", a reader still sees how many were allowed, and
+  can compare or switch. The total is of what every choice together
+  leaves.
+  """
+  @spec facets(term(), map()) ::
+          {:ok,
+           %{total: non_neg_integer(), facets: %{String.t() => [{String.t(), pos_integer()}]}}}
+          | {:error, term()}
+  def facets(handle, %{stream_prefix: _} = asked) do
+    asked = Map.drop(asked, [:before, :limit])
+    found = matching(asked)
+    repo = repo(handle)
+
+    kinds =
+      repo.all(
+        from(r in matching(Map.delete(asked, :kind_path)),
+          group_by: r.kind_path,
+          order_by: [desc: count(r.ref), asc: r.kind_path],
+          select: {r.kind_path, count(r.ref)}
+        )
+      )
+
+    labelled = fn name, own, limit ->
+      repo.all(
+        from(r in matching(Map.delete(asked, own)),
+          join: l in "evidence_record_labels",
+          on: l.ref == r.ref and l.name == ^name,
+          group_by: l.value,
+          order_by: [desc: count(r.ref), asc: l.value],
+          limit: ^limit,
+          select: {l.value, count(r.ref)}
+        )
+      )
+    end
+
+    {:ok,
+     %{
+       total: repo.aggregate(found, :count),
+       facets: %{
+         "kind" => kinds,
+         "policyOutcome" => labelled.("policyOutcome", :policy_outcome, 50),
+         "target" => labelled.("target", :target, 20)
+       }
+     }}
+  rescue
+    error -> {:error, error}
+  end
+
+  @doc """
+  Matching records counted over time: `buckets` equal spans from `since`
+  to `until`, each with its count and how those divide by how policy
+  decided. Spans with nothing in them are given, with a count of zero.
+  """
+  @spec histogram(term(), map(), pos_integer()) ::
+          {:ok, %{bucket_seconds: number(), buckets: [map()]}} | {:error, term()}
+  def histogram(
+        handle,
+        %{since: %DateTime{} = since, until: %DateTime{} = until} = asked,
+        buckets
+      )
+      when is_integer(buckets) and buckets > 0 do
+    width = max(DateTime.diff(until, since, :microsecond) / buckets / 1_000_000, 0.000001)
+    found = matching(Map.drop(asked, [:before, :limit]))
+
+    counted =
+      repo(handle).all(
+        from(r in found,
+          left_join: l in "evidence_record_labels",
+          on: l.ref == r.ref and l.name == "policyOutcome",
+          group_by: [1, l.value],
+          select: {
+            fragment(
+              "floor(extract(epoch from (? - ?)) / ?)::bigint",
+              r.captured_at,
+              type(^since, :utc_datetime_usec),
+              ^width
+            ),
+            l.value,
+            count(r.ref)
+          }
+        )
+      )
+
+    by_bucket = Enum.group_by(counted, &elem(&1, 0), fn {_, outcome, n} -> {outcome, n} end)
+
+    spans =
+      for index <- 0..(buckets - 1) do
+        within = Map.get(by_bucket, index, [])
+
+        %{
+          start: DateTime.add(since, round(index * width * 1_000_000), :microsecond),
+          count: within |> Enum.map(&elem(&1, 1)) |> Enum.sum(),
+          by_outcome: for({outcome, n} <- within, is_binary(outcome), into: %{}, do: {outcome, n})
+        }
+      end
+
+    {:ok, %{bucket_seconds: width, buckets: spans}}
+  rescue
+    error -> {:error, error}
+  end
+
+  # The records of a deployment's streams that `asked` narrows to.
+  defp matching(%{stream_prefix: prefix} = asked) do
+    from(r in "evidence_records",
+      as: :record,
+      where: fragment("starts_with(?, ?)", r.stream, ^prefix)
+    )
+    |> narrowed(asked)
+  end
+
+  defp labelled(query, name, value) do
+    where(
+      query,
+      [],
+      exists(
+        from(l in "evidence_record_labels",
+          where: l.ref == parent_as(:record).ref and l.name == ^name and l.value == ^value,
+          select: 1
+        )
+      )
+    )
   end
 
   defp narrowed(query, asked) do
@@ -238,6 +380,30 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
 
       {:actor, actor}, query ->
         where(query, [r], r.actor == ^actor)
+
+      {:policy_outcome, outcome}, query ->
+        labelled(query, "policyOutcome", outcome)
+
+      {:target, target}, query ->
+        labelled(query, "target", target)
+
+      # Anywhere in who acted, the session, the kind or what was called.
+      # The reader's text is matched as it is, never as a pattern.
+      {:q, text}, query ->
+        like = "%" <> String.replace(text, ["\\", "%", "_"], &("\\" <> &1)) <> "%"
+
+        where(
+          query,
+          [r],
+          ilike(r.actor, ^like) or ilike(r.session, ^like) or ilike(r.kind_path, ^like) or
+            exists(
+              from(l in "evidence_record_labels",
+                where:
+                  l.ref == parent_as(:record).ref and l.name == "target" and ilike(l.value, ^like),
+                select: 1
+              )
+            )
+        )
 
       {:since, since}, query ->
         where(query, [r], r.captured_at >= type(^since, :utc_datetime_usec))
