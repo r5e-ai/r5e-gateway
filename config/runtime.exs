@@ -456,6 +456,9 @@ if config_env() == :prod do
     pool_size: String.to_integer(System.get_env("POSTGRES_POOL_SIZE", "10")),
     ssl: database_ssl?,
     ssl_opts: if(database_ssl?, do: [verify: :verify_none], else: []),
+    # Some hosts publish their Postgres on an IPv6-only private network.
+    # `ECTO_IPV6=true` has the database connection resolve and dial IPv6.
+    socket_options: if(env_bool.("ECTO_IPV6", false), do: [:inet6], else: []),
     log: if(log_level == :debug, do: :debug, else: false)
 
   # Gateway HTTP listener — start Bandit on :PORT for the audit_console

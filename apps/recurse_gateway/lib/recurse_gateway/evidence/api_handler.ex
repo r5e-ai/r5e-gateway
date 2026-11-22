@@ -4,6 +4,14 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
     * `GET  /v1/evidence/records/:ref` — one signed record by its
       `evidence:sha256:…` reference.
+    * `GET  /v1/evidence/records` — records newest first, a page at a
+      time. Query: `kind` (a kind's full path), `session`, `actor`,
+      `since` and `until` (RFC 3339; `since` is included, `until` is
+      not), `limit` (1 to 200, 50 when absent) and `cursor`. Answers
+      `{"records": […], "cursor": "…" | null}`; pass the cursor back to
+      read on. A parameter this route does not know is refused, so that
+      a filter that was not applied is never mistaken for one that
+      matched nothing.
     * `GET  /v1/evidence/sessions/:session_id` — a session's records in
       stream order. `:session_id` is the session's recorded name, or
       the part after the tenant, or the client's id alone; an id that
@@ -74,7 +82,9 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   ## What is not here
 
   Reading and exporting are not yet recorded as evidence themselves, and
-  a session's records are returned whole, without paging.
+  a session's records are returned whole, without paging. A listing
+  cannot be narrowed by anything inside a record's body, such as a
+  policy outcome or a tool's name.
   """
 
   alias Recurse.Gateway.AuditPlane.Authz
@@ -93,6 +103,106 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   @submit ~s(Recurse::Action::"SubmitEvidence")
   @revoke_badge ~s(Recurse::Action::"RevokeBadge")
   @payload_type "application/vnd.r5e.provenance-evidence+json;v=2"
+
+  @default_limit 50
+  @max_limit 200
+  @listing_params ~w(kind session actor since until limit cursor)
+
+  @doc "`GET /v1/evidence/records`"
+  @spec records(Plug.Conn.t()) :: Plug.Conn.t()
+  def records(conn) do
+    %Plug.Conn{query_params: params} = conn = Plug.Conn.fetch_query_params(conn)
+
+    gated(conn, @read, "/v1/evidence/records", fn conn, ctx, index ->
+      case page(params, ctx, index) do
+        {:ok, page} -> json(conn, 200, page)
+        :none -> json(conn, 200, %{"records" => [], "cursor" => nil})
+        {:many, sessions} -> several(conn, sessions)
+        {:bad, message} -> bad_request(conn, message)
+        {:error, _} -> json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+      end
+    end)
+  end
+
+  defp page(params, ctx, {module, handle} = index) do
+    with {:ok, asked} <- listing(params),
+         {:ok, asked} <- of_session(asked, params["session"], ctx, index),
+         # One more than asked for says whether there is more to read.
+         {:ok, entries} <- module.list(handle, %{asked | limit: asked.limit + 1}) do
+      {page, rest} = Enum.split(entries, asked.limit)
+      cursor = if rest == [], do: nil, else: cursor(List.last(page))
+      {:ok, %{"records" => Enum.map(page, &render/1), "cursor" => cursor}}
+    end
+  end
+
+  # What the query asks for, or why it cannot be answered as asked.
+  defp listing(params) do
+    start = %{stream_prefix: "urn:r5e:stream:#{deployment()}:", limit: @default_limit}
+
+    case Map.keys(params) -- @listing_params do
+      [] -> Enum.reduce_while(params, {:ok, start}, &asked/2)
+      [unknown | _] -> {:bad, "unknown parameter #{unknown}"}
+    end
+  end
+
+  defp asked({"kind", kind}, {:ok, acc}) when kind != "",
+    do: {:cont, {:ok, Map.put(acc, :kind_path, kind)}}
+
+  defp asked({"actor", actor}, {:ok, acc}) when actor != "",
+    do: {:cont, {:ok, Map.put(acc, :actor, actor)}}
+
+  # Resolved against the caller's tenant afterwards: see `of_session/4`.
+  defp asked({"session", session}, acc) when session != "", do: {:cont, acc}
+
+  defp asked({name, stated}, {:ok, acc}) when name in ["since", "until"] do
+    case DateTime.from_iso8601(stated) do
+      {:ok, at, _offset} -> {:cont, {:ok, Map.put(acc, String.to_existing_atom(name), at)}}
+      _ -> {:halt, {:bad, "#{name} is not an RFC 3339 time"}}
+    end
+  end
+
+  defp asked({"limit", stated}, {:ok, acc}) do
+    case Integer.parse(stated) do
+      {limit, ""} when limit in 1..@max_limit -> {:cont, {:ok, %{acc | limit: limit}}}
+      _ -> {:halt, {:bad, "limit is a whole number from 1 to #{@max_limit}"}}
+    end
+  end
+
+  defp asked({"cursor", cursor}, {:ok, acc}) do
+    with {:ok, plain} <- Base.url_decode64(cursor, padding: false),
+         [stated, ref] <- String.split(plain, " ", parts: 2),
+         {:ok, at, 0} <- DateTime.from_iso8601(stated),
+         true <- Ref.valid?(ref, :evidence) do
+      {:cont, {:ok, Map.put(acc, :before, {at, ref})}}
+    else
+      _ -> {:halt, {:bad, "cursor is not one this route gave"}}
+    end
+  end
+
+  defp asked({name, _}, _acc), do: {:halt, {:bad, "#{name} is empty"}}
+
+  # The deployment whose records these are: the one this node captures
+  # for, or the configured one when it only reads.
+  defp deployment do
+    case Runtime.info() do
+      %{deployment: deployment} -> deployment
+      _ -> Application.get_env(:recurse_gateway, :evidence_deployment, "default")
+    end
+  end
+
+  # A session is only ever looked for among the caller's tenant's own.
+  defp of_session(asked, nil, _ctx, _index), do: {:ok, asked}
+
+  defp of_session(asked, id, ctx, index) do
+    case named(ctx, id, index) do
+      {:ok, session} -> {:ok, Map.put(asked, :session, session)}
+      other -> other
+    end
+  end
+
+  # Where a listing left off: the last record's place in the order.
+  defp cursor(entry),
+    do: Base.url_encode64(entry.evidence["capturedAt"] <> " " <> entry.ref, padding: false)
 
   @doc "`GET /v1/evidence/records/:ref`"
   @spec record(Plug.Conn.t()) :: Plug.Conn.t()
@@ -604,6 +714,8 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       "seq" => entry.seq,
       "kind" => entry.kind_path,
       "capturedAt" => entry.evidence["capturedAt"],
+      "actor" => entry.evidence["actor"],
+      "session" => entry.evidence["session"],
       "envelope" => entry.envelope
     }
   end

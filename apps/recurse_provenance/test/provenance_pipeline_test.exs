@@ -109,6 +109,79 @@ defmodule Recurse.Provenance.PipelineTest do
     )
   end
 
+  test "records are listed newest first, a page at a time, and narrowed by what is asked", ctx do
+    {store, handle} = {Memory, ctx.store}
+    pipeline = ctx.pipeline
+    other_actor = "spiffe://example.test/workload/other"
+
+    for overrides <- [
+          %{session: "urn:r5e:session:test:list-a"},
+          %{session: "urn:r5e:session:test:list-a", actor: other_actor},
+          %{session: "urn:r5e:session:test:list-b"},
+          %{session: "urn:r5e:session:test:list-b", actor: other_actor},
+          %{session: "urn:r5e:session:test:list-b"}
+        ] do
+      {:ok, _} = Pipeline.capture(pipeline, tool_call(overrides))
+    end
+
+    :ok = Pipeline.flush(pipeline)
+
+    asked = %{stream_prefix: "urn:r5e:stream:test:", limit: 100}
+    assert {:ok, [_, _, _, _, _] = all} = store.list(handle, asked)
+
+    position = fn entry ->
+      {:ok, at, 0} = DateTime.from_iso8601(entry.evidence["capturedAt"])
+      {at, entry.ref}
+    end
+
+    newest_first =
+      Enum.sort(all, fn a, b ->
+        {at, ref} = position.(a)
+        {other_at, other_ref} = position.(b)
+        DateTime.compare(at, other_at) == :gt or (at == other_at and ref >= other_ref)
+      end)
+
+    refs = Enum.map(newest_first, & &1.ref)
+    assert Enum.map(all, & &1.ref) == refs
+
+    # Three pages of two: nothing repeated, nothing missed.
+    assert {:ok, [first, second]} = store.list(handle, %{asked | limit: 2})
+
+    assert {:ok, [third, fourth]} =
+             store.list(handle, Map.merge(asked, %{limit: 2, before: position.(second)}))
+
+    assert {:ok, [fifth]} =
+             store.list(handle, Map.merge(asked, %{limit: 2, before: position.(fourth)}))
+
+    assert Enum.map([first, second, third, fourth, fifth], & &1.ref) == refs
+    assert {:ok, []} = store.list(handle, Map.put(asked, :before, position.(fifth)))
+
+    assert {:ok, [_, _, _] = of_session} =
+             store.list(handle, Map.put(asked, :session, "urn:r5e:session:test:list-b"))
+
+    assert Enum.all?(of_session, &(&1.evidence["session"] == "urn:r5e:session:test:list-b"))
+
+    assert {:ok,
+            [%{evidence: %{"actor" => ^other_actor}}, %{evidence: %{"actor" => ^other_actor}}]} =
+             store.list(handle, Map.put(asked, :actor, other_actor))
+
+    assert {:ok, [_, _, _, _, _]} =
+             store.list(handle, Map.put(asked, :kind_path, @base <> "/ToolCall"))
+
+    assert {:ok, []} = store.list(handle, Map.put(asked, :kind_path, @base <> "/ToolResult"))
+
+    # `since` includes its moment and `until` excludes its own.
+    {middle, _} = position.(third)
+    assert {:ok, since} = store.list(handle, Map.put(asked, :since, middle))
+    assert {:ok, until} = store.list(handle, Map.put(asked, :until, middle))
+    assert third.ref in Enum.map(since, & &1.ref)
+    refute third.ref in Enum.map(until, & &1.ref)
+    assert Enum.sort(Enum.map(since ++ until, & &1.ref)) == Enum.sort(refs)
+
+    assert {:ok, []} =
+             store.list(handle, %{asked | stream_prefix: "urn:r5e:stream:test:" <> "elsewhere:"})
+  end
+
   @tag flush_interval_ms: 60_000
   test "capture answers when the record is signed, before anything reaches disk or the index",
        ctx do
@@ -302,7 +375,10 @@ defmodule Recurse.Provenance.PipelineTest do
       def unsealed_firsts({mem, _state}, prefix), do: Memory.unsealed_firsts(mem, prefix)
       @impl true
       def by_session({mem, _state}, session), do: Memory.by_session(mem, session)
+      @impl true
       def by_kind({mem, _state}, kind, prefix), do: Memory.by_kind(mem, kind, prefix)
+      @impl true
+      def list({mem, _state}, asked), do: Memory.list(mem, asked)
       @impl true
       def seal_covering({mem, _state}, stream, seq), do: Memory.seal_covering(mem, stream, seq)
       @impl true

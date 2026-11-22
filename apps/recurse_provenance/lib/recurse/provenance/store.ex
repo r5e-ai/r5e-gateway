@@ -83,6 +83,35 @@ defmodule Recurse.Provenance.Store do
   """
   @callback by_session(handle(), session :: String.t()) :: {:ok, [entry()]} | {:error, term()}
 
+  @typedoc """
+  What a listing asks for. `stream_prefix` and `limit` are always given:
+  a deployment's streams share a prefix, and a listing is never
+  unbounded. The rest narrow it: one kind (its full path), one session,
+  one actor, records captured at or after `since`, records captured
+  before `until`. `before` continues an earlier listing from the
+  capture time and reference of the last record it returned.
+  """
+  @type listing :: %{
+          required(:stream_prefix) => String.t(),
+          required(:limit) => pos_integer(),
+          optional(:kind_path) => String.t(),
+          optional(:session) => String.t(),
+          optional(:actor) => String.t(),
+          optional(:since) => DateTime.t(),
+          optional(:until) => DateTime.t(),
+          optional(:before) => {DateTime.t(), Ref.t()}
+        }
+
+  @doc """
+  Records newest first: by the time each says it was captured, then by
+  reference so that records sharing a time keep one order. At most
+  `limit` are returned. To read on, pass the last record's capture time
+  and reference as `before`; a record arriving meanwhile is never
+  repeated or skipped past, because the position is a record and not a
+  count.
+  """
+  @callback list(handle(), listing()) :: {:ok, [entry()]} | {:error, term()}
+
   @doc """
   Every record of one kind on streams beginning with `stream_prefix`,
   ordered by stream and position. A deployment's streams share a prefix,

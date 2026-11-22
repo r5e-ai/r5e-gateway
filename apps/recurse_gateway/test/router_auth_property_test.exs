@@ -124,6 +124,7 @@ defmodule Recurse.Gateway.RouterAuthPropertyTest do
     {:get, "/v1/audit/receipts"},
     {:post, "/v1/audit/export"},
     {:get, "/v1/audit/payload"},
+    {:get, "/v1/evidence/records"},
     {:get, "/v1/evidence/records/evidence:sha256:#{String.duplicate("0", 64)}"},
     {:get, "/v1/evidence/sessions/some-session"},
     {:post, "/v1/evidence/export"},

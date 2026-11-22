@@ -189,6 +189,10 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
         request(:get, "/v1/evidence/records/x", [params: %{"ref" => ref}] ++ opts)
       )
 
+  defp records(query, opts \\ []),
+    do:
+      ApiHandler.records(request(:get, "/v1/evidence/records?" <> URI.encode_query(query), opts))
+
   defp session(id, opts \\ []),
     do:
       ApiHandler.session(
@@ -217,6 +221,83 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert record(ref, role: "caller").status == 403
       assert session(ctx.session, role: "caller").status == 403
       assert export(%{"session" => ctx.session}, role: "caller").status == 403
+    end
+  end
+
+  describe "listing records" do
+    @tool_call "provenance.r5e.io/v2/ToolCall"
+
+    test "needs the same right as reading one record" do
+      assert records(%{}, role: nil).status == 401
+      assert records(%{}, role: "caller").status == 403
+    end
+
+    test "newest first, a page at a time, each row with its actor and session", ctx do
+      first = records(%{"kind" => @tool_call, "limit" => "2"})
+      assert first.status == 200
+
+      assert %{
+               "records" => [
+                 %{"ref" => newest, "kind" => @tool_call, "actor" => @alice, "envelope" => %{}},
+                 %{"ref" => next, "session" => "urn:r5e:session:" <> _}
+               ],
+               "cursor" => cursor
+             } = body(first)
+
+      assert is_binary(cursor)
+
+      assert %{"records" => [%{"ref" => oldest}], "cursor" => nil} =
+               body(records(%{"kind" => @tool_call, "limit" => "2", "cursor" => cursor}))
+
+      # The setup captured two of the session's calls, then one elsewhere.
+      assert [oldest, next, newest] == Enum.map(ctx.receipts, & &1.ref) ++ [ctx.foreign.ref]
+
+      assert %{"records" => [_, _, _, _ | _], "cursor" => nil} = body(records(%{}))
+    end
+
+    test "narrowed by session, actor, kind and time", ctx do
+      refs = ctx.receipts |> Enum.map(& &1.ref) |> Enum.reverse()
+
+      listed = fn query ->
+        conn = records(query)
+        assert conn.status == 200
+        Enum.map(body(conn)["records"], & &1["ref"])
+      end
+
+      assert listed.(%{"session" => ctx.session}) == refs
+      assert listed.(%{"session" => recorded(ctx.session)}) == refs
+      assert listed.(%{"session" => "no-such-session"}) == []
+
+      assert listed.(%{"actor" => @alice, "kind" => @tool_call}) == [ctx.foreign.ref | refs]
+      assert listed.(%{"actor" => "urn:r5e:principal:test:nobody"}) == []
+      assert listed.(%{"kind" => "example.test/v1/Unheard"}) == []
+
+      assert listed.(%{"kind" => @tool_call, "until" => "2000-01-01T00:00:00Z"}) == []
+
+      assert listed.(%{"kind" => @tool_call, "since" => "2000-01-01T00:00:00Z"}) ==
+               [ctx.foreign.ref | refs]
+    end
+
+    test "a session id from another tenant matches nothing", ctx do
+      other = SessionName.for("01OTHER000000000000000000", @alice, ctx.session <> "-x")
+      assert %{"records" => [], "cursor" => nil} = body(records(%{"session" => other}))
+    end
+
+    test "a question it cannot answer as asked is refused, not answered loosely" do
+      for query <- [
+            %{"policyOutcome" => "deny"},
+            %{"q" => "shell"},
+            %{"limit" => "0"},
+            %{"limit" => "201"},
+            %{"limit" => "ten"},
+            %{"since" => "yesterday"},
+            %{"cursor" => "not-a-cursor"},
+            %{"kind" => ""}
+          ] do
+        conn = records(query)
+        assert conn.status == 400, "expected 400 for #{inspect(query)}, got #{conn.status}"
+        assert %{"error" => "ERR_BAD_REQUEST"} = body(conn)
+      end
     end
   end
 
