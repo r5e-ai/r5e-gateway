@@ -118,6 +118,15 @@ defmodule Recurse.Gateway.Admin.BrowserAuth.OidcLoginFlowContractTest do
   # ---------------------------------------------------------------------------
 
   describe "GET /admin/login/start" do
+    test "answers 503 where no identity provider is set, and keeps nothing" do
+      conn = build_conn("GET", "/admin/login/start", "return_to=/admin/dashboard")
+      out = LoginHandler.call(conn, [])
+
+      assert out.status == 503
+      assert %{"error" => "login_not_configured"} = JSON.decode!(out.resp_body)
+      assert [] == filter_headers(out.resp_headers, "location")
+    end
+
     test "INSERTs nonce row + 302s to IdP authorize URL with PKCE state", %{base_opts: opts} do
       conn = build_conn("GET", "/admin/login/start", "return_to=/admin/dashboard")
       out = LoginHandler.call(conn, opts)
@@ -187,7 +196,8 @@ defmodule Recurse.Gateway.Admin.BrowserAuth.OidcLoginFlowContractTest do
       refute is_nil(consumed.used_at)
 
       # Cookie attributes per Step 5.
-      assert {_name, %{http_only: true, secure: true, same_site: "Lax", path: "/", max_age: 28_800}} =
+      assert {_name,
+              %{http_only: true, secure: true, same_site: "Lax", path: "/", max_age: 28_800}} =
                Enum.find(out.resp_cookies, fn {name, _} -> name == "r5e_session" end)
     end
 
@@ -232,7 +242,8 @@ defmodule Recurse.Gateway.Admin.BrowserAuth.OidcLoginFlowContractTest do
       out = LoginHandler.call(conn, opts)
       assert out.status == 502
 
-      assert_received {:ui_receipt, _, %{event_kind: :ui_login, outcome: "idp_code_exchange_failed"}}
+      assert_received {:ui_receipt, _,
+                       %{event_kind: :ui_login, outcome: "idp_code_exchange_failed"}}
     end
 
     test "id_token validation failure → 401 + id_token_invalid",
