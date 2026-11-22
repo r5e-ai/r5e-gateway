@@ -1,0 +1,9 @@
+{
+  "query": {
+    "selection": "known interactions at the supplied frontier"
+  },
+  "streams": [
+    "urn:r5e:stream:example:gateway:incarnation-01",
+    "urn:r5e:stream:example:worker:incarnation-01"
+  ]
+}

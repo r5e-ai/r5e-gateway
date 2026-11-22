@@ -1,0 +1,16 @@
+{
+  "submissionId": "example-sdk-retained-extension-submission-01",
+  "kind": "ExampleExtension",
+  "body": {
+    "contentRefs": [
+      "attachment:observation"
+    ]
+  },
+  "attachments": [
+    {
+      "name": "observation",
+      "mediaType": "text/plain",
+      "text": "Illustrative extension content."
+    }
+  ]
+}

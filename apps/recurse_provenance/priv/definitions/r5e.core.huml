@@ -1,0 +1,196 @@
+%HUML v0.2.0
+# Core foundation package (core.r5e.io/v1), as small as Provenance needs.
+#
+# It holds the meta-kind every definition is checked against, the Artifact
+# base that content-carrying kinds extend, and the shared scalar types.
+# Identity and delegation kinds are Provenance definitions, not Core's:
+# Core is the wire.
+
+format: "r5e.contract-package/v2"
+package: "r5e.core"
+group: "core.r5e.io"
+version: "v1"
+foundation: true
+imports:: {}
+
+types::
+  Digest::
+    type: "string"
+    pattern: "^sha256:[0-9a-f]{64}$"
+
+  BytesAddress::
+    type: "string"
+    pattern: "^bytes:sha256:[0-9a-f]{64}$"
+
+  EvidenceRef::
+    type: "string"
+    description: "The identity of one signed evidence record."
+    pattern: "^evidence:sha256:[0-9a-f]{64}$"
+
+  ExactRef::
+    type: "string"
+    description: "An exact reference to content, a record or a Core event."
+    pattern: "^(evidence|bytes|event):sha256:[0-9a-f]{64}$"
+
+  DefinitionRef::
+    type: "string"
+    description: "One kind within a package: the content reference of the package manifest, then the kind path."
+    pattern: "^bytes:sha256:[0-9a-f]{64}#[a-z0-9.-]+/v[0-9a-z]+/[A-Za-z0-9]+$"
+
+  KeyId::
+    type: "string"
+    pattern: "^key:[a-z0-9-]+:sha256:[0-9a-f]{64}$"
+
+  PublicKey::
+    type: "object"
+    description: "A public key: a registered algorithm and the key's bytes in strict padded base64."
+    keyBytes: true
+    additionalProperties: false
+    required:: "algorithm", "bytes"
+    properties::
+      algorithm::
+        type: "string"
+        pattern: "^[a-z0-9-]+$"
+      bytes::
+        type: "string"
+
+  Timestamp::
+    type: "string"
+    description: "RFC 3339 calendar-valid instant with up to nanosecond precision; leap seconds and unknown -00:00 offsets are outside this profile. ordered compares UTC instants, not text."
+    pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"
+
+  IdentityUri::
+    type: "string"
+    description: "A stable identity written as a URI. Syntax is not authentication."
+    pattern: "^[A-Za-z][A-Za-z0-9+.-]*:[^\\s]+$"
+
+  KindPath::
+    type: "string"
+    pattern: "^[a-z0-9.-]+/v[0-9a-z]+/[A-Za-z0-9]+$"
+
+  BytesRef::
+    type: "ref"
+    ref::
+      bytes: true
+
+  OverrideSpec::
+    type: "object"
+    description: "Explicit changes declared against an `extends` parent. Protected foundation fields may never be dropped or weakened."
+    additionalProperties: false
+    required::
+      - "reason"
+    properties::
+      reason::
+        type: "string"
+      drop::
+        type: "array"
+        items::
+          type: "string"
+      optional::
+        type: "array"
+        items::
+          type: "string"
+      replace::
+        type: "object"
+      dropConstraints::
+        type: "array"
+        items::
+          type: "string"
+          enum:: "ordered", "requires", "exactlyOne", "atMostOne", "predicates", "terminal"
+
+  DefinitionPins::
+    type: "object"
+    description: "Resolved member-view pins computed from the package manifest. This view is derived, never authored or signed."
+    additionalProperties: false
+    required::
+      - "manifestRef"
+    properties::
+      manifestRef::
+        use: "BytesAddress"
+      definedByRef::
+        use: "DefinitionRef"
+      extendsRef::
+        use: "DefinitionRef"
+      dependencyRefs::
+        type: "object"
+        values::
+          use: "DefinitionRef"
+
+kinds::
+
+  KindDefinition::
+    substrate: "resource"
+    naming::
+      mode: "path"
+      admitBy: "authority"
+      readmitBy: "authority"
+    requiresAuthority: true
+    protected:: "group", "version", "kind", "substrate", "description", "schema", "pins"
+    description: "The contract of one named kind within a package. Supports unhydrated extends, explicit overrides and meta-kind extensions."
+    schema::
+      additionalProperties: false
+      required:: "group", "version", "kind", "substrate", "description", "schema", "pins"
+      properties::
+        group::
+          type: "string"
+        version::
+          type: "string"
+        kind::
+          type: "string"
+        substrate::
+          type: "string"
+          enum:: "resource", "event", "artifact"
+        definedBy::
+          use: "KindPath"
+        extends::
+          use: "KindPath"
+        protected::
+          type: "array"
+          items::
+            type: "string"
+        overrides::
+          use: "OverrideSpec"
+        pins::
+          use: "DefinitionPins"
+        naming::
+          type: "object"
+        description::
+          type: "string"
+        schema::
+          type: "object"
+        predicates::
+          type: "array"
+        signatures::
+          type: "integer"
+          minimum: 1
+        requiresAuthority::
+          type: "boolean"
+        terminal::
+          type: "object"
+
+  Artifact::
+    substrate: "artifact"
+    naming::
+      mode: "content"
+    protected:: "contentRef", "mediaType", "size"
+    description: "The base of every kind that is its content: exact bytes, their media type and their size, and what they were derived from."
+    schema::
+      additionalProperties: false
+      required:: "contentRef", "mediaType", "size"
+      properties::
+        contentRef::
+          use: "BytesRef"
+        mediaType::
+          type: "string"
+        size::
+          type: "integer"
+          minimum: 0
+        summary::
+          type: "string"
+        classification::
+          type: "string"
+        derivedFrom::
+          type: "array"
+          unique: true
+          items::
+            use: "ExactRef"

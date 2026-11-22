@@ -1,0 +1,20 @@
+{
+  "apiVersion": "provenance.r5e.io/v2",
+  "kind": "ToolResult",
+  "schemaRef": "bytes:sha256:e088d06b28150c8cff09e9c9ccc88ccd36f087ce3e63970af87e76f3b1649483",
+  "profileRef": "bytes:sha256:4fed26c471f3b37dea948f8c1957a4a746b258c38d0938c5826024b72997380c",
+  "issuer": "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd",
+  "actor": "spiffe://example.test/workload/worker",
+  "stream": "urn:r5e:stream:example:worker:incarnation-01",
+  "seq": 2,
+  "previous": "evidence:sha256:dcfa3628c622e3cd6e430860f4e5486ed4627f3a442a9fe49fe4ee4ab03fad50",
+  "capturedAt": "2026-10-30T12:00:00Z",
+  "body": {
+    "outcome": "completed",
+    "outputRefs": [
+      "bytes:sha256:f6448506c00b767e2f30288533cb14f36b791e0adcb1bfe3b70a28b78c8d0e96"
+    ],
+    "call": "evidence:sha256:dcfa3628c622e3cd6e430860f4e5486ed4627f3a442a9fe49fe4ee4ab03fad50"
+  },
+  "session": "urn:r5e:session:example:interactive-01"
+}

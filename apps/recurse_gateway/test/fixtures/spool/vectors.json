@@ -1,0 +1,24 @@
+{
+  "epoch": {
+    "ephemeral_pub": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823",
+    "identity_pub": "392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c",
+    "kek": "f0f7f4bfe8e87b7c87f7495dd187afc8d3f0b8467f180aec6abb0aa3a0d4cbf8",
+    "sealed": "e9ab5622e3308d0fc5d3fbceaf2cf56c4042e23837a61566b2e8c13e0f5b8d0a779ce5d122c1f43f780b074cabf64c76"
+  },
+  "files": {
+    "chunk_plus_5": "70a0f9aabf40d18a57a701821ba62c033d29e5f746855b80bf683ae1683c5cd1",
+    "empty": "910285be01247fa2eb5ef248e4cd9ac9de5da310f0f2d4bc518049418b776b0c",
+    "exact_chunk": "7ad6ecec3c96b016a8f6b3e8973ade8813efac4c53bd67ff39ae8078158571f7",
+    "short": "44cdcc183abea73b4b4bfdf16764e5f71d201e33c87219d2f812cbb15179a16a",
+    "two_full_chunks": "bd73650b35f561387acf8ea206f169cefc9806087f0b67ca5a33a9986f1bd330"
+  },
+  "inputs": {
+    "dek": "20..3f",
+    "deployment": "dep-vector",
+    "ephemeral_priv": "70..8f",
+    "epoch_id": "00..0f",
+    "file_id": "40..4f",
+    "identity_priv": "50..6f",
+    "pattern": "byte i = (i*k) mod 251"
+  }
+}

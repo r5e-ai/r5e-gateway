@@ -1,0 +1,155 @@
+{
+  "notice": "All examples are synthetic shape fixtures. Digests derive from illustrative labels, not referenced payloads. No signature, Merkle root, policy decision, durable capture or runtime result is claimed.",
+  "examples": [
+    {
+      "file": "model-call-denied.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Standalone governed completed-call receipt: request, policy and denied result together; no Run, session or second response record required."
+    },
+    {
+      "file": "model-response-denied.json",
+      "schema": "evidence.schema.json",
+      "purpose": "The returned denial is separately capturable response evidence with known call correlation."
+    },
+    {
+      "file": "tool-call.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Allowed tool request with session grouping; session membership does not require opening evidence."
+    },
+    {
+      "file": "tool-result.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Tool output retains the exact call relationship."
+    },
+    {
+      "file": "session-opened.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Session opening is a captured fact and has no required Run or process binding."
+    },
+    {
+      "file": "epoch-manifest-gateway.json",
+      "schema": "epoch-manifest.schema.json",
+      "purpose": "Nonempty ordered manifest with synthetic addresses; hashes/signatures are not verified."
+    },
+    {
+      "file": "epoch-seal-gateway.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Control-stream seal covering only preceding source evidence; synthetic root is not a Merkle computation."
+    },
+    {
+      "file": "epoch-manifest-worker.json",
+      "schema": "epoch-manifest.schema.json",
+      "purpose": "Nonempty ordered manifest with synthetic addresses; hashes/signatures are not verified."
+    },
+    {
+      "file": "epoch-seal-worker.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Control-stream seal covering only preceding source evidence; synthetic root is not a Merkle computation."
+    },
+    {
+      "file": "checkpoint.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Multi-stream checkpoint; snapshot frontier names terminal covered heads, separate from control stream position."
+    },
+    {
+      "file": "view.json",
+      "schema": "view.schema.json",
+      "purpose": "Unsigned typed return value with an explicit missing payload and bounded frontier."
+    },
+    {
+      "file": "policy-decision.json",
+      "schema": "evidence.schema.json",
+      "purpose": "An independently recorded decision, when one is intended."
+    },
+    {
+      "file": "session-closed.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Closing fact states the observed frontier; not a prerequisite for earlier evidence."
+    },
+    {
+      "file": "observation.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Identity can be observed directly by stable URI without fabricating preceding admission evidence."
+    },
+    {
+      "file": "published-view.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Intentional publication attributes a retained View; ordinary reads remain unsigned."
+    },
+    {
+      "file": "retention-hold.json",
+      "schema": "evidence.schema.json",
+      "purpose": "A hold records its exact retained target."
+    },
+    {
+      "file": "retention-hold-release.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Release refers to one exact hold; it does not release other holds."
+    },
+    {
+      "file": "payload-disposition.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Actual payload disposition; prior identity and evidence are unchanged."
+    },
+    {
+      "file": "disclosure.json",
+      "schema": "evidence.schema.json",
+      "purpose": "A partial disclosure explicitly distinguishes requested and provided references."
+    },
+    {
+      "file": "verification.json",
+      "schema": "evidence.schema.json",
+      "purpose": "An intentionally published verification assertion; not a claim that these fixtures were verified."
+    },
+    {
+      "file": "capture-request.json",
+      "schema": "capture-request.schema.json",
+      "purpose": "SDK-retained submission identity and caller content; host resolves policy, identity, schema, stream and bytes address before signing."
+    },
+    {
+      "file": "capture-receipt.json",
+      "schema": "capture-receipt.schema.json",
+      "purpose": "Local durability boundary only; no publication or view completion implied."
+    },
+    {
+      "file": "signed-evidence-structure-only.json",
+      "schema": "signed-evidence.schema.json",
+      "purpose": "STRUCTURAL ONLY: signature decodes to NOT-A-SIGNATURE. JSON payload serialization is illustrative, not certified Core canonical bytes."
+    },
+    {
+      "file": "extension-envelope-only.json",
+      "schema": "evidence-envelope.schema.json",
+      "purpose": "Preserve unknown-kind envelope; body semantics are unsupported by the base known-kinds schema."
+    },
+    {
+      "file": "model-call-request-first.json",
+      "schema": "evidence.schema.json",
+      "purpose": "Request-first alternative to the standalone completed-call receipt; subsequent ModelResponse is captured separately."
+    },
+    {
+      "file": "capture-request-extension.json",
+      "schema": "capture-request.schema.json",
+      "purpose": "An installed extension kind can cross the generic capture transport; its normalized body still requires that exact installed schema and profile, and is unsupported by the base 16-kind schema."
+    },
+    {
+      "file": "capture-profile.json",
+      "schema": "capture-profile.schema.json",
+      "purpose": "Synthetic finite schema map, attribution/sealing/checkpoint grants and local durability terms; trust, activation and actual persistence remain unverified."
+    },
+    {
+      "file": "capture-request-caused-result.json",
+      "schema": "capture-request.schema.json",
+      "purpose": "Tool result identifies its call through body.call and a distinct additional operator instruction to release the result through causes; the latter is an explicit causal hint, not a duplicate call relationship."
+    },
+    {
+      "file": "export.json",
+      "schema": "export.schema.json",
+      "purpose": "Structurally complete export with explicit omissions, synthetic refs, NOT-A-SIGNATURE and NOT-A-PUBLIC-KEY markers; it is not an independently verifiable real capture."
+    },
+    {
+      "file": "snapshot-selection.json",
+      "schema": "snapshot-selection.schema.json",
+      "purpose": "Finite selected stream membership for the checkpoint snapshot queryRef; both selected streams have nonempty heads in that checkpoint. Unlisted streams are outside this selection."
+    }
+  ]
+}

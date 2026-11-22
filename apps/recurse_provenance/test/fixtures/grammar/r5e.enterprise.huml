@@ -1,0 +1,334 @@
+%HUML v0.2.0
+# R5E Enterprise Governance Package (enterprise.r5e.io/v1)
+#
+# Organizational hierarchy & membership (`Enterprise -> BU -> Team`),
+# immutable Cedar PolicyBundle Artifacts vs. scoped PolicyBindings,
+# PolicyShape input projections, gateway Prompt/Completion Artifacts,
+# virtual CAS WorkspaceTrees, managed sandbox/chamber containment,
+# and Shamir k-of-n break-glass recovery.
+
+format: "r5e.contract-package/v2"
+package: "r5e.enterprise"
+group: "enterprise.r5e.io"
+version: "v1"
+imports::
+  core: "r5e.core"
+
+kinds::
+
+  # =========================================================================
+  # 1. Deployment Posture, Organizational Hierarchy & Membership
+  # =========================================================================
+
+  Deployment::
+    substrate: "resource"
+    naming::
+      mode: "literal"
+      value: "deployment"
+      admitBy: "nodeKey"
+      readmitBy: "actorOfRecordOrAuthority"
+    description: "Deployment posture declaration (house vs. commons) and root organizational anchor."
+    schema::
+      additionalProperties: false
+      required:: "commons", "declaredBy"
+      properties::
+        commons::
+          type: "boolean"
+        declaredBy::
+          use: "core.KeyId"
+        rootOrgRef::
+          type: "ref"
+          ref::
+            kind: "enterprise.r5e.io/v1/OrgUnit"
+        statement::
+          type: "string"
+
+  OrgUnit::
+    substrate: "resource"
+    naming::
+      mode: "caller"
+      readmitBy: "authority"
+    requiresAuthority: true
+    description: "Organizational hierarchy node (`enterprise`, `business_unit`, `team`, `project`, etc.). Materialized into in-memory policy state (e.g. Cedar `parents` DAG + `capabilities`) so policy evaluates directly without walking chains per call."
+    schema::
+      additionalProperties: false
+      required:: "unitKind", "displayName"
+      properties::
+        unitKind::
+          type: "string"
+        displayName::
+          type: "string"
+        parentRef::
+          type: "ref"
+          ref::
+            kind: "enterprise.r5e.io/v1/OrgUnit"
+        capabilities::
+          use: "core.MetadataMap"
+
+  Membership::
+    substrate: "resource"
+    naming::
+      mode: "derived"
+      derive: "{unit}/{principal}"
+      readmitBy: "authority"
+    requiresAuthority: true
+    description: "Explicit membership of a Principal in an OrgUnit. unit must equal the referenced OrgUnit resource name and principal must equal the referenced Principal key; mismatches are invalid. Membership is distinct from Endorsement/Badge grants: team membership never automatically grants spawned agents all team permissions."
+    schema::
+      additionalProperties: false
+      required:: "unit", "unitRef", "principal", "principalRef", "role", "status"
+      properties::
+        unit::
+          type: "string"
+        unitRef::
+          type: "ref"
+          ref::
+            kind: "enterprise.r5e.io/v1/OrgUnit"
+        principal::
+          use: "core.KeyId"
+        principalRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Principal"
+        role::
+          type: "string"
+        status::
+          type: "string"
+          enum:: "active", "suspended", "removed"
+
+  # =========================================================================
+  # 2. Policy Artifacts, Scoped Activation & Cedar Presentation
+  # =========================================================================
+
+  PolicyBundle::
+    extends: "core.r5e.io/v1/Artifact"
+    requiresAuthority: true
+    description: "Immutable policy bundle stored in CAS/S3 (`contentRef`). Separate from activation: fetched once by `sha256`, compiled into memory (`ResourceArc` in `:persistent_term`), and cited by digest."
+    schema::
+      required:: "engine", "governs", "bundleVersion"
+      nonEmpty::
+        - "governs"
+      properties::
+        engine::
+          type: "string"
+        bundleVersion::
+          type: "string"
+        governs::
+          type: "array"
+          items::
+            use: "core.KindPattern"
+
+  PolicyBinding::
+    substrate: "resource"
+    naming::
+      mode: "derived"
+      derive: "{scope}/{slot}"
+      readmitBy: "authority"
+    requiresAuthority: true
+    description: "Activates an immutable `PolicyBundle` at a `Deployment` or `OrgUnit` scope. Updating a binding atomically swaps prepared policy state in memory and triggers epoch boundaries on affected active sessions."
+    schema::
+      additionalProperties: false
+      required:: "scope", "slot", "bundleRef", "mode"
+      properties::
+        scope::
+          type: "string"
+        orgUnitRef::
+          type: "ref"
+          ref::
+            kind: "enterprise.r5e.io/v1/OrgUnit"
+        slot::
+          type: "string"
+        bundleRef::
+          type: "ref"
+          ref::
+            event: "enterprise.r5e.io/v1/PolicyBundle"
+        mode::
+          type: "string"
+          enum:: "enforce", "shadow-observe", "disabled"
+        minApprovers::
+          type: "integer"
+          minimum: 1
+        approvalRefs::
+          type: "array"
+          items::
+            use: "core.AnyInputRef"
+
+  PolicyShape::
+    substrate: "resource"
+    naming::
+      mode: "derived"
+      derive: "{engine}.{targetKind}"
+      readmitBy: "authority"
+    requiresAuthority: true
+    description: "Declarative projection from an admitted Kind or Action into a policy engine's `(action, resourceType, resourceId, context)` inputs."
+    schema::
+      additionalProperties: false
+      required:: "engine", "targetKind", "action", "resourceType", "resourceId"
+      properties::
+        engine::
+          type: "string"
+        targetKind::
+          use: "core.KindPattern"
+        action::
+          type: "string"
+        resourceType::
+          type: "string"
+        resourceId::
+          type: "string"
+        context::
+          type: "object"
+
+  # =========================================================================
+  # 3. Gateway Model Payloads (Unhydrated Artifact Extensions)
+  # =========================================================================
+
+  Prompt::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Detached model request payload in CAS/S3, cited in `Action.inputs`."
+    schema::
+      required:: "provider", "model"
+      properties::
+        provider::
+          type: "string"
+        model::
+          type: "string"
+        messageCount::
+          type: "integer"
+          minimum: 0
+        systemDigest::
+          use: "core.Digest"
+
+  Completion::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Detached model response payload in CAS/S3, cited in `Action.outputs`."
+    schema::
+      required:: "provider", "model", "finishReason"
+      properties::
+        provider::
+          type: "string"
+        model::
+          type: "string"
+        finishReason::
+          type: "string"
+        inputTokens::
+          type: "integer"
+          minimum: 0
+        outputTokens::
+          type: "integer"
+          minimum: 0
+        cachedInputTokens::
+          type: "integer"
+          minimum: 0
+
+  # =========================================================================
+  # 4. Virtual Filesystems, Containment Leases, Attestations & Break-Glass
+  # =========================================================================
+
+  WorkspaceTree::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Immutable virtual-filesystem directory tree manifest (`contentRef` maps relative paths to `bytes:sha256:...` and mode bits). Makes server CAS the live truth and Git an import/export projection."
+    schema::
+      required::
+        - "entryCount"
+      properties::
+        entryCount::
+          type: "integer"
+          minimum: 0
+        parentTreeRef::
+          type: "ref"
+          ref::
+            event: "enterprise.r5e.io/v1/WorkspaceTree"
+        gitCommitProjection::
+          type: "string"
+
+  AttestationReport::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Measured binary, container rootfs, Firecracker microVM kernel, or TEE quote stored in CAS/S3."
+    schema::
+      required:: "subjectKind", "measurementDigest"
+      properties::
+        subjectKind::
+          type: "string"
+        measurementDigest::
+          use: "core.Digest"
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+
+  SandboxLease::
+    substrate: "resource"
+    naming::
+      mode: "caller"
+      readmitBy: "authority"
+    requiresAuthority: true
+    description: "Execution attempt lease and generation fence across cloud microVM/container chambers (`firecracker`, `cloud-hypervisor`, `container`) and local working-copy/sandbox runs (`local-worktree`, `local-seatbelt`). Keeps `core.r5e.io/v1/Run` free of runtime lease machinery. `state: \"fenced\"` means R5E admissions and the Enterprise gateway refuse writes and proxied calls from that `generation`; on local process profiles it does not imply a surviving OS child tree has exited or prevent unproxied local/external side effects."
+    schema::
+      additionalProperties: false
+      required:: "sessionRef", "isolation", "generation", "state", "expiresAt"
+      properties::
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        runRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Run"
+        workspaceTreeRef::
+          type: "ref"
+          ref::
+            event: "enterprise.r5e.io/v1/WorkspaceTree"
+        attestationRef::
+          type: "ref"
+          ref::
+            event: "enterprise.r5e.io/v1/AttestationReport"
+        isolation::
+          type: "string"
+          description: "Truthful execution isolation profile (e.g. `firecracker`, `container`, `local-seatbelt`, `local-worktree`); must never overclaim confinement the host did not enforce."
+        egressProfile::
+          type: "string"
+        generation::
+          type: "integer"
+          minimum: 1
+        state::
+          type: "string"
+          enum:: "leased", "released", "fenced", "expired"
+        expiresAt::
+          use: "core.Timestamp"
+
+  BreakGlassRecovery::
+    substrate: "event"
+    naming::
+      mode: "content"
+    requiresAuthority: true
+    description: "Explicit on-chain provenance record for Shamir `k-of-n` key reconstruction or threshold custodian break-glass recovery. Cites `priorHeadDigest` and off-site `witnessReceipts` so compromised shares cannot silently rewrite witnessed history."
+    schema::
+      additionalProperties: false
+      required:: "recoveryKind", "thresholdK", "totalSharesN", "priorHeadDigest", "reason"
+      ordered::
+        - ::
+          - "thresholdK"
+          - "totalSharesN"
+      properties::
+        recoveryKind::
+          type: "string"
+        thresholdK::
+          type: "integer"
+          minimum: 1
+        totalSharesN::
+          type: "integer"
+          minimum: 1
+        priorHeadDigest::
+          use: "core.Digest"
+        repairedTargetRef::
+          use: "core.AnyInputRef"
+        witnessReceipts::
+          type: "array"
+          items::
+            use: "core.BytesRef"
+        approvalRefs::
+          type: "array"
+          items::
+            use: "core.AnyInputRef"
+        reason::
+          type: "string"

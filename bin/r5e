@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# r5e — helper for the local Docker Compose quickstart (spec 012).
+#
+#   bin/r5e init                copy .env.example -> .env, generate secrets
+#   bin/r5e status              GET /healthz and /readyz
+#   bin/r5e login [subject]     mint a dev-login cookie, print dashboard URL
+#   bin/r5e claude-code setup   (S2) point Claude Code at the gateway
+#   bin/r5e evidence export [--latest | --run-id ID] [--out FILE]
+#                               (S6) POST /v1/audit/export for one receipt -> zip
+#   bin/r5e evidence verify [FILE]
+#                               (S6) run docs/auditor/recurse-verify on the zip
+#
+# Only stock tools: bash, curl, openssl (+ jq and unzip for `evidence`).
+# Cookie jar and default export path live in .r5e/ (git-ignored).
+set -euo pipefail
+# Everything this script creates holds secrets (.env and its temp file, the
+# cookie jar): owner-only from the moment the file exists.
+umask 077
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Read one KEY=value from .env without sourcing it (values are not shell-quoted).
+env_file_get() {
+  [ -f "${REPO_ROOT}/.env" ] || return 0
+  awk -v k="$1" -F= '$1==k {sub(/^[^=]*=/, ""); print; exit}' "${REPO_ROOT}/.env"
+}
+
+GATEWAY_PORT="${R5E_GATEWAY_PORT:-$(env_file_get R5E_GATEWAY_PORT)}"
+GATEWAY_URL="${R5E_GATEWAY_URL:-http://localhost:${GATEWAY_PORT:-4000}}"
+# The proxy port `claude-code setup` prints: the shell wins, then .env.
+PROXY_PORT="${R5E_PROXY_PORT:-$(env_file_get R5E_PROXY_PORT)}"
+STATE_DIR="${REPO_ROOT}/.r5e"
+COOKIE_JAR="${STATE_DIR}/cookies.txt"
+
+usage() {
+  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || { echo "r5e: '$1' is required but not in PATH" >&2; exit 3; }
+}
+
+# Is something already listening on host port $1? lsof where present, else nc;
+# with neither the check is skipped (compose will report the clash itself).
+port_in_use() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# The two host ports compose publishes must be free before `docker compose
+# up -d`; name the variable to set in .env when one is not.
+check_ports() {
+  local gp pp clash=0
+  gp="${R5E_GATEWAY_PORT:-$(env_file_get R5E_GATEWAY_PORT)}"
+  pp="${R5E_PROXY_PORT:-$(env_file_get R5E_PROXY_PORT)}"
+  if port_in_use "${gp:-4000}"; then
+    echo "r5e init: port ${gp:-4000} (dashboard) is already in use; set R5E_GATEWAY_PORT=<free port> in .env"
+    clash=1
+  fi
+  if port_in_use "${pp:-4443}"; then
+    echo "r5e init: port ${pp:-4443} (LLM proxy) is already in use; set R5E_PROXY_PORT=<free port> in .env"
+    clash=1
+  fi
+  return $clash
+}
+
+# Replace `KEY=...` in .env with a freshly generated value (in place, portable sed).
+fill_secret() {
+  local key="$1" value
+  value="$(openssl rand -hex 32)"
+  local tmp="${REPO_ROOT}/.env.tmp.$$"
+  awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $1==k {print k "=" v; next} {print}' \
+    "${REPO_ROOT}/.env" > "$tmp" && mv "$tmp" "${REPO_ROOT}/.env"
+}
+
+cmd_init() {
+  need openssl
+  if [ -f "${REPO_ROOT}/.env" ] && [ "${1:-}" != "--force" ]; then
+    echo "r5e init: .env already exists; not overwriting (use --force to regenerate)"
+    exit 0
+  fi
+  cp "${REPO_ROOT}/.env.example" "${REPO_ROOT}/.env"
+  # fill_secret rewrites .env via a fresh temp file + mv, so the final file is
+  # created under umask 077 (mode 0600) even when --force replaced an old one.
+  fill_secret SECRET_KEY_BASE
+  fill_secret GATEWAY_ADMIN_SESSION_SECRET_KEY_BASE
+  echo "r5e init: wrote .env with generated SECRET_KEY_BASE + GATEWAY_ADMIN_SESSION_SECRET_KEY_BASE"
+  check_ports || true
+  echo "next: docker compose up -d"
+}
+
+# Exit 0 when /healthz is ok and /readyz is either ready or pending only on
+# jwks_warm (the JWKS cache fills at the first login, so right after `up`
+# that one check is expected to be pending). Anything else exits 1 with
+# the body printed.
+cmd_status() {
+  need curl
+  local rc=0
+  for path in /healthz /readyz; do
+    printf '%-8s ' "$path"
+    if body="$(curl -fsS --max-time 5 "${GATEWAY_URL}${path}" 2>/dev/null)"; then
+      echo "$body"
+    else
+      body="$(curl -sS --max-time 5 "${GATEWAY_URL}${path}" 2>/dev/null || true)"
+      if [ "$path" = /readyz ] && printf '%s' "$body" | grep -q '"jwks_warm":"pending' \
+         && [ "$(printf '%s' "$body" | grep -o '"pending' | wc -l | tr -d ' ')" = 1 ]; then
+        echo "not ready: jwks_warm pending until the first login (bin/r5e login)"
+      else
+        echo "UNREACHABLE or non-2xx (${GATEWAY_URL}${path})"
+        [ -n "$body" ] && printf '%s\n' "$body" | sed 's/^/         /'
+        rc=1
+      fi
+    fi
+  done
+  return $rc
+}
+
+cmd_login() {
+  need curl
+  local subject="${1:-local-dev@r5e}"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  : > "$COOKIE_JAR"
+  local body
+  body="$(printf '{"principal_subject":"%s","recurse_role":"platform_operator"}' "$subject")"
+  local resp
+  if ! resp="$(curl -fsS --max-time 10 -c "$COOKIE_JAR" \
+        -H 'Content-Type: application/json' \
+        -X POST "${GATEWAY_URL}/admin/test/login" -d "$body")"; then
+    echo "r5e login: POST ${GATEWAY_URL}/admin/test/login failed." >&2
+    echo "  Is the stack up (bin/r5e status)? Is R5E_DEV_LOGIN_ENABLED=true in .env?" >&2
+    exit 1
+  fi
+  echo "r5e login: $resp"
+  if grep -q r5e_session "$COOKIE_JAR"; then
+    local me
+    me="$(curl -fsS --max-time 5 -b "$COOKIE_JAR" "${GATEWAY_URL}/v1/auth/me" 2>/dev/null || true)"
+    [ -n "$me" ] && echo "r5e login: /v1/auth/me -> $me"
+    # A JWT-validated call: proves the cookie works for the audit API and
+    # warms the gateway's JWKS cache (what /readyz's jwks_warm waits for).
+    receipts_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -b "$COOKIE_JAR" \
+      "${GATEWAY_URL}/v1/audit/receipts?limit=1" 2>/dev/null || echo 000)"
+    echo "r5e login: GET /v1/audit/receipts?limit=1 -> HTTP ${receipts_status}"
+    echo
+    echo "cookie jar: ${COOKIE_JAR} (curl -b ${COOKIE_JAR} ${GATEWAY_URL}/v1/audit/receipts)"
+    echo "dashboard:  ${GATEWAY_URL}/admin/dashboard"
+    echo "  The cookie above is in curl's jar, not in your browser. To sign the browser in:"
+    echo "  open ${GATEWAY_URL}/healthz, open the devtools console, paste the line below,"
+    echo "  then open ${GATEWAY_URL}/admin/dashboard."
+    echo "  fetch('/admin/test/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{\"principal_subject\":\"${subject}\",\"recurse_role\":\"platform_operator\"}'}).then(r=>r.status)"
+  else
+    echo "r5e login: no r5e_session cookie in the response" >&2
+    exit 1
+  fi
+}
+
+cmd_claude_code() {
+  case "${1:-}" in
+    setup)
+      shift
+      . "${REPO_ROOT}/bin/lib/claude-code-setup.sh"
+      R5E_PROXY_PORT="${PROXY_PORT:-4443}" claude_code_setup "$@" ;;
+    *) usage; exit 3 ;;
+  esac
+}
+
+# --- evidence (spec 012 S6) ------------------------------------------------
+# The zip is the F002 Export Evidence layout (attestation.json, payload.json,
+# inclusion proofs, policy_bundle.cedar, signing_key.pem, manifest.json);
+# docs/auditor/recurse-verify checks it offline. `export` needs the cookie
+# jar from `bin/r5e login`.
+EVIDENCE_ZIP="${STATE_DIR}/evidence.zip"
+VERIFIER="${REPO_ROOT}/docs/auditor/recurse-verify"
+
+need_cookie() {
+  if [ ! -s "$COOKIE_JAR" ] || ! grep -q r5e_session "$COOKIE_JAR"; then
+    echo "r5e evidence: no session cookie in ${COOKIE_JAR}; run: bin/r5e login" >&2
+    exit 1
+  fi
+}
+
+# Print "run_id<TAB>event_kind" of the newest receipt, optionally of one kind.
+latest_receipt() {
+  local kind="${1:-}" url="${GATEWAY_URL}/v1/audit/receipts?limit=1"
+  [ -n "$kind" ] && url="${url}&event_kind=${kind}"
+  curl -fsS --max-time 10 -b "$COOKIE_JAR" "$url" \
+    | jq -r '.receipts[0] | select(. != null) | [.run_id, .signed_predicate.event_kind] | @tsv'
+}
+
+cmd_evidence_export() {
+  need curl; need jq
+  local mode=denied run_id="" out="$EVIDENCE_ZIP"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --latest)  mode=latest; shift ;;
+      --run-id)  mode=run_id; run_id="${2:-}"; [ -n "$run_id" ] || { echo "r5e evidence export: --run-id needs a value" >&2; exit 3; }; shift 2 ;;
+      --out)     out="${2:-}"; [ -n "$out" ] || { echo "r5e evidence export: --out needs a value" >&2; exit 3; }; shift 2 ;;
+      -h|--help) echo "usage: r5e evidence export [--latest | --run-id ID] [--out FILE]"
+                 echo "  default: the newest tool_use_denied receipt; --latest: the newest receipt of any kind"
+                 echo "  writes FILE (default ${EVIDENCE_ZIP})"; return 0 ;;
+      *) echo "r5e evidence export: unknown option '$1'" >&2; exit 3 ;;
+    esac
+  done
+  need_cookie
+  local kind=""
+  case "$mode" in
+    denied)
+      IFS=$'\t' read -r run_id kind < <(latest_receipt tool_use_denied) || true
+      [ -n "$run_id" ] || { echo "r5e evidence export: no tool_use_denied receipt yet (ask Claude Code to run a forbidden command first, or use --latest)" >&2; exit 1; } ;;
+    latest)
+      IFS=$'\t' read -r run_id kind < <(latest_receipt) || true
+      [ -n "$run_id" ] || { echo "r5e evidence export: the ledger has no receipts yet" >&2; exit 1; } ;;
+  esac
+  mkdir -p "$(dirname "$out")"
+  local tmp="${out}.tmp.$$" status
+  status="$(curl -sS --max-time 60 -b "$COOKIE_JAR" -o "$tmp" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -X POST "${GATEWAY_URL}/v1/audit/export" -d "{\"run_ids\":[\"${run_id}\"]}")" || status=000
+  if [ "$status" != "200" ]; then
+    echo "r5e evidence export: POST /v1/audit/export -> HTTP ${status}" >&2
+    [ -s "$tmp" ] && head -c 400 "$tmp" >&2 && echo >&2
+    rm -f "$tmp"; exit 1
+  fi
+  mv "$tmp" "$out"
+  echo "r5e evidence export: run_id=${run_id}${kind:+ event_kind=${kind}}"
+  echo "r5e evidence export: wrote ${out} ($(wc -c < "$out" | tr -d ' ') bytes)"
+  echo "next: bin/r5e evidence verify${out:+ ${out}}"
+}
+
+# Step 4 of the verifier (policy hash) needs `cedar-canonical-hash`, a
+# small Rust binary built from native/recurse_cedar, next to the verifier
+# script. It is not shipped in the repo or the image, so it is built here
+# on first use (cargo, about a minute) into .r5e/verifier/ together with a
+# copy of the two scripts from docs/auditor/, because the verifier looks
+# for its helpers in its own directory. Without cargo the verifier still
+# runs; step 4 then reports NOT CHECKED and the verdict is FAIL.
+VERIFIER_DIR="${STATE_DIR}/verifier"
+prepare_verifier() {
+  mkdir -p "$VERIFIER_DIR"
+  cp -p "$VERIFIER" "${REPO_ROOT}/docs/auditor/verify-bundled-merkle" "$VERIFIER_DIR/"
+  if [ -x "${REPO_ROOT}/docs/auditor/cedar-canonical-hash" ]; then
+    cp -p "${REPO_ROOT}/docs/auditor/cedar-canonical-hash" "$VERIFIER_DIR/"
+  elif [ ! -x "$VERIFIER_DIR/cedar-canonical-hash" ]; then
+    if command -v cargo >/dev/null 2>&1; then
+      echo "r5e evidence verify: building cedar-canonical-hash once with cargo (native/recurse_cedar) ..."
+      if (cd "${REPO_ROOT}/native/recurse_cedar" && cargo build --release --quiet \
+            --bin cedar-canonical-hash --target-dir "${STATE_DIR}/cargo-target"); then
+        cp -p "${STATE_DIR}/cargo-target/release/cedar-canonical-hash" "$VERIFIER_DIR/"
+      else
+        echo "r5e evidence verify: cargo build failed; continuing without step 4's canonical hash" >&2
+      fi
+    else
+      echo "r5e evidence verify: cargo not found; step 4 (policy hash) will be NOT CHECKED and the verdict FAIL. Install Rust (rustup.rs) and rerun." >&2
+    fi
+  fi
+}
+
+cmd_evidence_verify() {
+  need unzip; need jq; need openssl; need xxd
+  local zip="${1:-$EVIDENCE_ZIP}"
+  case "$zip" in -h|--help) echo "usage: r5e evidence verify [FILE]   (default ${EVIDENCE_ZIP})"; return 0 ;; esac
+  [ -f "$zip" ] || { echo "r5e evidence verify: ${zip} not found; run: bin/r5e evidence export" >&2; exit 3; }
+  [ -x "$VERIFIER" ] || { echo "r5e evidence verify: ${VERIFIER} missing or not executable" >&2; exit 3; }
+  prepare_verifier
+  # The trust anchor is the signer's public key. The zip carries a copy;
+  # on a real engagement the auditor brings it independently
+  # (docs/auditor/verification_walkthrough.md). Here it is unzipped to a
+  # temp dir so the verifier runs in its strict, anchored mode (exit 0).
+  local anchor_dir
+  anchor_dir="$(mktemp -d "${TMPDIR:-/tmp}/r5e-anchor.XXXXXX")"
+  if ! unzip -q -o -d "$anchor_dir" "$zip" signing_key.pem 2>/dev/null; then
+    rm -rf "$anchor_dir"
+    echo "r5e evidence verify: ${zip} has no signing_key.pem at its root (a multi-receipt export is a zip of zips; unzip it once and verify each inner zip)" >&2
+    exit 3
+  fi
+  local rc=0
+  "${VERIFIER_DIR}/recurse-verify" --zip "$zip" --trust-anchor "${anchor_dir}/signing_key.pem" || rc=$?
+  rm -rf "$anchor_dir"
+  exit "$rc"
+}
+
+cmd_evidence() {
+  case "${1:-}" in
+    export) shift; cmd_evidence_export "$@" ;;
+    verify) shift; cmd_evidence_verify "$@" ;;
+    *) echo "usage: r5e evidence export [--latest | --run-id ID] [--out FILE] | r5e evidence verify [FILE]" >&2; exit 3 ;;
+  esac
+}
+
+case "${1:-}" in
+  init)        shift; cmd_init "$@" ;;
+  status)      shift; cmd_status "$@" ;;
+  login)       shift; cmd_login "$@" ;;
+  claude-code) shift; cmd_claude_code "$@" ;;
+  evidence)    shift; cmd_evidence "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "r5e: unknown command '$1'" >&2; usage >&2; exit 3 ;;
+esac

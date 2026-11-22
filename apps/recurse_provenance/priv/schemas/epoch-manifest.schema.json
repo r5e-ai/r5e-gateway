@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://r5e.io/proposals/provenance-v2/schemas/epoch-manifest.schema.json",
+  "title": "Provenance v2 EpochManifest",
+  "$comment": "Order, position contiguity, signatures, predecessor links, manifest identity and exact RFC6962-shaped root require semantic verification against evidence.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "const": "r5e.provenance-epoch/v2"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/EvidenceRef"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "format",
+    "events"
+  ],
+  "additionalProperties": false
+}

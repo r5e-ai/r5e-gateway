@@ -1,0 +1,7 @@
+{
+  "status": "durable",
+  "record": "evidence:sha256:dcfa3628c622e3cd6e430860f4e5486ed4627f3a442a9fe49fe4ee4ab03fad50",
+  "stream": "urn:r5e:stream:example:worker:incarnation-01",
+  "seq": 1,
+  "profileRef": "bytes:sha256:4fed26c471f3b37dea948f8c1957a4a746b258c38d0938c5826024b72997380c"
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://r5e.io/proposals/provenance-v2/schemas/signed-evidence.schema.json",
+  "title": "Provenance v2 SignedEvidence DSSE envelope",
+  "$comment": "The payload decodes to exact Core canonical Evidence bytes. One to sixteen signatures over the same message. The first keyid must equal payload.issuer, no keyid may repeat, and every signature must verify. How many a kind needs is stated by its definition. Neither decoding nor cryptographic checks are performed by JSON Schema.",
+  "type": "object",
+  "properties": {
+    "payloadType": {
+      "const": "application/vnd.r5e.provenance-evidence+json;v=2"
+    },
+    "payload": {
+      "$ref": "common.schema.json#/$defs/Base64",
+      "minLength": 1
+    },
+    "signatures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "keyid": {
+            "$ref": "common.schema.json#/$defs/KeyID"
+          },
+          "sig": {
+            "$ref": "common.schema.json#/$defs/Base64",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "keyid",
+          "sig"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "maxItems": 16
+    }
+  },
+  "required": [
+    "payloadType",
+    "payload",
+    "signatures"
+  ],
+  "additionalProperties": false
+}

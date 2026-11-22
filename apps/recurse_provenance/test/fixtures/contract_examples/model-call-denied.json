@@ -1,0 +1,36 @@
+{
+  "apiVersion": "provenance.r5e.io/v2",
+  "kind": "ModelCall",
+  "schemaRef": "bytes:sha256:96e144b6295f6cbe0f967837dbba1ebd1928cae4d941c6ddffa5503a8ec31bd0",
+  "profileRef": "bytes:sha256:4fed26c471f3b37dea948f8c1957a4a746b258c38d0938c5826024b72997380c",
+  "issuer": "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd",
+  "actor": "spiffe://example.test/workload/gateway",
+  "stream": "urn:r5e:stream:example:standalone-completed-call:incarnation-01",
+  "seq": 1,
+  "previous": null,
+  "capturedAt": "2026-10-30T12:00:00Z",
+  "body": {
+    "provider": "example-provider",
+    "model": "example-model",
+    "inputRefs": [
+      "bytes:sha256:1bb4f1144df42b3cea3ea9745a572452509eb27b07769836021c426dad24740f"
+    ],
+    "policy": {
+      "policyRef": "bytes:sha256:0e840690bfd780a1981dcb840579313cdb2d4d0ba4ab33a4158c566e279864fd",
+      "outcome": "deny",
+      "inputRefs": [
+        "bytes:sha256:1bb4f1144df42b3cea3ea9745a572452509eb27b07769836021c426dad24740f"
+      ],
+      "evaluatorRef": "bytes:sha256:c108a72d1466bb2156295822dc6ff855e6e0e1ad00a3db861fa22f82ed8d9670",
+      "activationRef": "event:sha256:2769dbaad1fa66215464ff78a8644a3930fb86235d97690fe4e8a3f71a90a6d1",
+      "reason": "The selected policy forbids this requested model."
+    },
+    "result": {
+      "outcome": "denied",
+      "outputRefs": [],
+      "reason": "Policy denied this request before provider dispatch.",
+      "completedAt": "2026-10-30T12:00:00Z"
+    }
+  },
+  "identityRef": "event:sha256:ef45ebf1c29b26452d5edb171341963f6cc5824b8115d97d1d8d60d9478206ee"
+}

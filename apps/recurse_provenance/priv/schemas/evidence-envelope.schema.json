@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://r5e.io/proposals/provenance-v2/schemas/evidence-envelope.schema.json",
+  "title": "Provenance v2 common Evidence envelope",
+  "$comment": "Common Evidence envelope with Amendment A1 applied: apiVersion is the kind's API group and version, kind is a bare name within it. Passing this schema does not validate body semantics, installed definitions or profiles.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/v[0-9]+(?:(?:alpha|beta)[0-9]+)?$"
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]*$"
+    },
+    "schemaRef": {
+      "$ref": "common.schema.json#/$defs/BytesRef"
+    },
+    "profileRef": {
+      "$ref": "common.schema.json#/$defs/BytesRef"
+    },
+    "issuer": {
+      "$ref": "common.schema.json#/$defs/KeyID"
+    },
+    "actor": {
+      "$ref": "common.schema.json#/$defs/IdentityURI"
+    },
+    "stream": {
+      "$ref": "common.schema.json#/$defs/IdentityURI"
+    },
+    "seq": {
+      "$ref": "common.schema.json#/$defs/Position"
+    },
+    "previous": {
+      "anyOf": [
+        {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "capturedAt": {
+      "$ref": "common.schema.json#/$defs/UTCTimestamp"
+    },
+    "body": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "common.schema.json#/$defs/JSONValue"
+      }
+    },
+    "occurredAt": {
+      "$ref": "common.schema.json#/$defs/Timestamp"
+    },
+    "session": {
+      "$ref": "common.schema.json#/$defs/IdentityURI"
+    },
+    "subject": {
+      "$ref": "common.schema.json#/$defs/ExactRef"
+    },
+    "identityRef": {
+      "$ref": "common.schema.json#/$defs/ExactRef"
+    },
+    "onBehalfOf": {
+      "$ref": "common.schema.json#/$defs/IdentityURI"
+    },
+    "contextRefs": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/ExactRef"
+      }
+    },
+    "causes": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/EvidenceRef"
+      },
+      "uniqueItems": true,
+      "$comment": "Additional explicit causal evidence from authenticated host context and caller hints, sorted by reference and unique. Typed body links retain their own relationship meaning; arbitrary EvidenceRefs do not imply causality."
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "schemaRef",
+    "profileRef",
+    "issuer",
+    "actor",
+    "stream",
+    "seq",
+    "previous",
+    "capturedAt",
+    "body"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "seq": {
+            "const": 1
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "previous": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "previous": {
+            "$ref": "common.schema.json#/$defs/EvidenceRef"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,466 @@
+%HUML v0.2.0
+# R5E Harmony Orchestration, Context & Evaluation Package (harmony.r5e.io/v1)
+#
+# Multi-agent orchestration, context bundles, semantic-to-code work products,
+# reviews, reusable `MetricDefinition` meta-kind contracts, assertions (Jev and
+# deterministic verifiers), and referenceable chat evidence.
+#
+# Views and projections (`TaskView`, `Basis`, lineage graphs) are UNSIGNED read
+# queries served from Postgres/ETS — never signed Kinds on the chain.
+
+format: "r5e.contract-package/v2"
+package: "r5e.harmony"
+group: "harmony.r5e.io"
+version: "v1"
+imports::
+  core: "r5e.core"
+
+types::
+  MetricContract::
+    type: "object"
+    description: "Definition-level measurement contract required by `MetricDefinition` so experiment runners and evaluators can recognize and compare compatible metric Kinds without hardcoding names."
+    additionalProperties: false
+    required:: "valueField", "unit", "direction", "evaluationMethod"
+    requires::
+      - ::
+        when::
+          field: "direction"
+          equals: "target"
+        then::
+          - "targetValue"
+    properties::
+      valueField::
+        type: "string"
+      unit::
+        type: "string"
+      direction::
+        type: "string"
+        enum:: "higher-is-better", "lower-is-better", "target"
+      targetValue::
+        type: "integer"
+      subjectField::
+        type: "string"
+      evaluationMethod::
+        type: "string"
+
+  WorkflowStage::
+    type: "object"
+    description: "Single inspectable stage in a `Workflow` plan. Stage identity, dependencies, completion, and independence follow Part III section 2.2; deterministic step advancers schedule work while Cedar authorizes actions."
+    additionalProperties: false
+    required:: "id", "workKind"
+    properties::
+      id::
+        type: "string"
+        description: "Nonempty identifier unique within the containing Workflow; selected by Task.workflowStageId."
+      workKind::
+        type: "string"
+      afterStages::
+        type: "array"
+        items::
+          type: "string"
+      producesKind::
+        use: "core.KindPattern"
+      minCount::
+        type: "integer"
+        minimum: 1
+        description: "Required distinct task contributions for this stage within one workflow root; defaults to 1."
+      requiresDistinctPrincipal::
+        type: "boolean"
+        description: "Contributors differ from selected prerequisite producers and from each other within this stage; defaults to false."
+      requiresDistinctProvider::
+        type: "boolean"
+        description: "Observed contributor provider sets do not overlap selected prerequisite producer sets; no implicit provider diversity across sibling stages. Defaults to false."
+      requiresDecision::
+        type: "boolean"
+        description: "A workflow-authorized approve Decision must cite the contribution's exact submission Action before it counts; defaults to false."
+
+kinds::
+
+  # =========================================================================
+  # 1. Meta-Kind Contract (Ordinary Extension of Core `KindDefinition`)
+  # =========================================================================
+
+  MetricDefinition::
+    extends: "core.r5e.io/v1/KindDefinition"
+    description: "Meta-kind contract for comparable metric definitions. Implemented as an ordinary extension of `KindDefinition` — requires no separate meta-kind runtime. Any Kind published with `definedBy: harmony.r5e.io/v1/MetricDefinition` must declare `metric` and expose a required integer property at `schema.properties[metric.valueField]`."
+    schema::
+      required::
+        - "metric"
+      properties::
+        metric::
+          use: "MetricContract"
+    predicates::
+      - ::
+        id: "metric-value-field-is-required-integer"
+        check: "schemaPropertyType"
+        fieldFrom: "metric.valueField"
+        expectedType: "integer"
+        mustBeRequired: true
+      - ::
+        id: "metric-subject-field-exists-when-set"
+        check: "schemaPropertyExists"
+        fieldFrom: "metric.subjectField"
+        allowUnset: true
+
+  # =========================================================================
+  # 2. Context, Work-Product & Evaluation Artifacts (Unhydrated Extensions)
+  # =========================================================================
+
+  ContextBundle::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Curated context base, repo tree, doc pack, or compiled agent context bundle in CAS/S3."
+    schema::
+      required::
+        - "bundleKind"
+      properties::
+        bundleKind::
+          type: "string"
+        sourceRepo::
+          type: "string"
+        sourceRevision::
+          type: "string"
+        mountPaths::
+          type: "array"
+          items::
+            type: "string"
+
+  Spec::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Clarified semantic specification Markdown/JSON in CAS/S3. Serves as the `derivedFrom` source of intent for downstream `KindDefinition`s, `Plan`s, policies, and code."
+    schema::
+      required::
+        - "title"
+      properties::
+        title::
+          type: "string"
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        sectionIds::
+          type: "array"
+          items::
+            type: "string"
+
+  Plan::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Implementation plan citing the governing `Spec` and expected touch surface."
+    schema::
+      required::
+        - "specRef"
+      properties::
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        specRef::
+          type: "ref"
+          ref::
+            event: "harmony.r5e.io/v1/Spec"
+        touchPaths::
+          type: "array"
+          items::
+            type: "string"
+
+  Workflow::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Compact, inspectable workflow plan declaring stages, expected output Kinds, and independence requirements (such as distinct-principal / cross-provider review before synthesis and decision). Step advancers read `Workflow` to schedule tasks while Cedar enforces authorization; this is an inspectable coordination artifact, not a general-purpose workflow engine."
+    schema::
+      required:: "title", "stages"
+      nonEmpty::
+        - "stages"
+      properties::
+        title::
+          type: "string"
+        stages::
+          type: "array"
+          items::
+            use: "WorkflowStage"
+
+  WorkProduct::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Concrete builder deliverable (code change, patch bundle, infrastructure plan, or drafted document) produced for a commissioned `Task`. Kept distinct from `Synthesis` and `ReviewSynthesis`, which integrate sources or independent reviews rather than authoring the deliverable itself."
+    schema::
+      required::
+        - "taskRef"
+      properties::
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        specRef::
+          type: "ref"
+          ref::
+            event: "harmony.r5e.io/v1/Spec"
+        planRef::
+          type: "ref"
+          ref::
+            event: "harmony.r5e.io/v1/Plan"
+        workspaceRef::
+          type: "ref"
+          description: "Optional immutable workspace snapshot Artifact (such as `enterprise.r5e.io/v1/WorkspaceTree` or `ContextBundle`) capturing the resulting tree."
+          ref::
+            event: "core.r5e.io/v1/Artifact"
+        gitCommit::
+          type: "string"
+        prUrl::
+          type: "string"
+
+  Synthesis::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Authored integration of multiple sources, findings, or perspectives around a `subjectRef`, surfacing what holds, open `disagreements`, and an optional `outcome` while preserving links to underlying evidence."
+    schema::
+      required::
+        - "subjectRef"
+      properties::
+        subjectRef::
+          use: "core.AnyInputRef"
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        specRef::
+          type: "ref"
+          ref::
+            event: "harmony.r5e.io/v1/Spec"
+        sourceRefs::
+          type: "array"
+          items::
+            use: "core.AnyInputRef"
+        disagreements::
+          type: "array"
+          items::
+            type: "string"
+        outcome::
+          type: "string"
+
+  ReviewSynthesis::
+    extends: "harmony.r5e.io/v1/Synthesis"
+    description: "Synthesis of independent `Review`s (and optional programmatic `Assertion`s) over a deliverable `subjectRef` against its governing `Spec`. Preserves `Synthesis` and `Artifact` conformance while requiring at least one `Review`-conforming input and a canonical review `outcome`; reviewed-delivery policy forbids the deliverable's builder from authoring its `ReviewSynthesis`."
+    overrides::
+      reason: "Narrow outcome to canonical reviewed-delivery verdicts while preserving open string floor on Synthesis."
+      replace::
+        outcome::
+          type: "string"
+          enum:: "meets-spec", "needs-changes", "blocked", "inconclusive"
+    schema::
+      required:: "reviewRefs", "outcome"
+      nonEmpty::
+        - "reviewRefs"
+      properties::
+        reviewRefs::
+          type: "array"
+          items::
+            type: "ref"
+            ref::
+              event: "harmony.r5e.io/v1/Review"
+        assertionRefs::
+          type: "array"
+          items::
+            type: "ref"
+            ref::
+              event: "harmony.r5e.io/v1/Assertion"
+
+  Review::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Human or cognitively isolated peer-agent review over a subject record, requiring an acceptance `verdict`."
+    schema::
+      required:: "subjectRef", "verdict"
+      properties::
+        subjectRef::
+          use: "core.AnyInputRef"
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        verdict::
+          type: "string"
+          enum:: "approve", "request-changes", "block", "comment"
+        findingCount::
+          type: "integer"
+          minimum: 0
+
+  Assertion::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Typed programmatic verification or Jev judgment (`jev-latest`, test suite, static analyzer, bundle verifier) over a subject record. Uses integer basis points (`0..10000`) instead of floats."
+    schema::
+      required:: "subjectRef", "evaluator", "assertionKind"
+      properties::
+        subjectRef::
+          use: "core.AnyInputRef"
+        evaluator::
+          type: "string"
+        assertionKind::
+          type: "string"
+        passed::
+          type: "boolean"
+        scoreBps::
+          type: "integer"
+          minimum: 0
+          maximum: 10000
+
+  ConversationTurn::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Referenceable conversational turn Artifact retained for every human send and completed agent reply in an R5E-backed `agent-native` thread (including requests, elicitations, answers, commissions, steers, and replies). Captured as signed session WAL records rolled up via `SessionSegment` and `SessionCheckpoint` without requiring a synchronous global-chain append per turn, independent of gateway LLM call capture."
+    schema::
+      required:: "threadId", "turnId", "role"
+      properties::
+        threadId::
+          type: "string"
+        turnId::
+          type: "string"
+        role::
+          type: "string"
+        turnKind::
+          type: "string"
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+
+  Reflection::
+    extends: "core.r5e.io/v1/Artifact"
+    description: "Structured post-session or post-task agent reflection recording what failed or succeeded (problem decomposition, task specification, missing ecosystem context, missing tools/skills/MCP capabilities, or stated limits) as queryable ledger evidence for improving R5E."
+    schema::
+      required:: "sessionRef", "factors"
+      properties::
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        taskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        factors::
+          type: "array"
+          items::
+            type: "string"
+        missingCapabilities::
+          type: "array"
+          items::
+            type: "string"
+        limitsStated::
+          type: "boolean"
+
+  # =========================================================================
+  # 3. Agent Roster & Coordination Graph (Profiles, Tasks, Decisions & Steers)
+  # =========================================================================
+
+  AgentProfile::
+    substrate: "resource"
+    naming::
+      mode: "derived"
+      derive: "{principal}"
+      readmitBy: "actorOfRecordOrAuthority"
+    description: "Roster and dispatch metadata keyed to an agent Principal; principal must equal the referenced Principal's key. Renaming supersedes the resource under actorOfRecordOrAuthority. Defaults inform dispatch, never prove the provider/model executed. Actual evidence comes from gateway records or explicitly attributed native-harness observations (Part III sections 1.1 and 2.2). Live work/liveness remain unsigned projections."
+    schema::
+      additionalProperties: false
+      required:: "principal", "principalRef", "displayName", "role"
+      properties::
+        principal::
+          use: "core.KeyId"
+        principalRef::
+          type: "ref"
+          description: "The referenced Principal must have key equal to principal; a mismatched profile is invalid."
+          ref::
+            kind: "core.r5e.io/v1/Principal"
+        displayName::
+          type: "string"
+        role::
+          type: "string"
+        specialty::
+          type: "string"
+        defaultProvider::
+          type: "string"
+        defaultModel::
+          type: "string"
+        harness::
+          type: "string"
+
+  Task::
+    substrate: "resource"
+    naming::
+      mode: "caller"
+      readmitBy: "actorOfRecordOrAuthority"
+    description: "Unit of commissioned work across humans and agents (a root `Task` may stand for the top-level need, with child `Task`s for decompose, build, review, and synthesis steps). Optional — never required to produce Core `Artifact`s or `Action`s."
+    schema::
+      additionalProperties: false
+      required:: "title", "state"
+      properties::
+        title::
+          type: "string"
+        state::
+          type: "string"
+          enum:: "commissioned", "claimed", "submitted", "accepted", "needs-changes", "blocked", "cancelled"
+        workKind::
+          type: "string"
+          description: "Open domain label identifying the kind of step (e.g. `need`, `decompose`, `build`, `review`, `synthesize`, `decide`)."
+        parentTaskRef::
+          type: "ref"
+          ref::
+            kind: "harmony.r5e.io/v1/Task"
+        workflowRef::
+          type: "ref"
+          description: "Exact Workflow revision; a workflow root may cite this without choosing a stage."
+          ref::
+            event: "harmony.r5e.io/v1/Workflow"
+        workflowStageId::
+          type: "string"
+          description: "Stage scheduled for this task. Requires workflowRef and a matching stage id under its enclosing workflow root; Part III section 2.2 defines the binding."
+        scopeRef::
+          use: "core.AnyInputRef"
+        assigneeRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Principal"
+        specRef::
+          type: "ref"
+          ref::
+            event: "harmony.r5e.io/v1/Spec"
+        contextRefs::
+          type: "array"
+          items::
+            type: "ref"
+            ref::
+              event: "harmony.r5e.io/v1/ContextBundle"
+        sourceTurnRef::
+          type: "ref"
+          ref::
+            event: "harmony.r5e.io/v1/ConversationTurn"
+
+  Decision::
+    substrate: "event"
+    naming::
+      mode: "content"
+    description: "Explicit acceptance, rejection, escalation sign-off, or waiver recorded against a Task, Review, or Action (including an exact work-submission Action)."
+    schema::
+      additionalProperties: false
+      required:: "subjectRef", "outcome"
+      properties::
+        subjectRef::
+          use: "core.AnyInputRef"
+        outcome::
+          type: "string"
+        rationaleRef::
+          use: "core.AnyInputRef"
+
+  Steer::
+    substrate: "event"
+    naming::
+      mode: "content"
+    description: "Mid-execution guidance or constraint update injected into a `Task` or `Session`."
+    schema::
+      additionalProperties: false
+      required:: "targetRef", "instructionRef"
+      properties::
+        targetRef::
+          type: "ref"
+          ref::
+            kind:: "harmony.r5e.io/v1/Task", "core.r5e.io/v1/Session"
+        instructionRef::
+          use: "core.AnyInputRef"

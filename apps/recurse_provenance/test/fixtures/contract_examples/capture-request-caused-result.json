@@ -1,0 +1,22 @@
+{
+  "submissionId": "example-sdk-retained-result-submission-01",
+  "kind": "ToolResult",
+  "body": {
+    "outcome": "completed",
+    "outputRefs": [
+      "attachment:result"
+    ],
+    "call": "evidence:sha256:dcfa3628c622e3cd6e430860f4e5486ed4627f3a442a9fe49fe4ee4ab03fad50"
+  },
+  "attachments": [
+    {
+      "name": "result",
+      "mediaType": "text/plain",
+      "text": "Illustrative tool output."
+    }
+  ],
+  "session": "urn:r5e:session:example:interactive-01",
+  "causes": [
+    "evidence:sha256:ae2cf16e8fbfc5a0174650006f71f2c3e7e4b3541ed2182739539a335905f024"
+  ]
+}

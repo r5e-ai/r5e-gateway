@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://r5e.io/proposals/provenance-v2/schemas/capture-profile.schema.json",
+  "title": "Provenance v2 CaptureProfile",
+  "$comment": "Finite schema and authority declarations. Prefix matching, grant union, trusted active profile selection, policy narrowing and persistence guarantees require semantic checks; profile trust is external.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "const": "r5e.capture-profile/v2"
+    },
+    "schemas": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "common.schema.json#/$defs/BytesRef"
+      },
+      "minProperties": 1
+    },
+    "authority": {
+      "type": "object",
+      "properties": {
+        "bindings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "streamPrefix": {
+                "$ref": "common.schema.json#/$defs/IdentityURI"
+              },
+              "actorPrefixes": {
+                "type": "array",
+                "items": {
+                  "$ref": "common.schema.json#/$defs/IdentityURI"
+                },
+                "minItems": 1
+              },
+              "issuerKeys": {
+                "type": "array",
+                "items": {
+                  "$ref": "common.schema.json#/$defs/KeyID"
+                },
+                "minItems": 1
+              },
+              "sealerKeys": {
+                "type": "array",
+                "items": {
+                  "$ref": "common.schema.json#/$defs/KeyID"
+                }
+              }
+            },
+            "required": [
+              "streamPrefix",
+              "actorPrefixes",
+              "issuerKeys",
+              "sealerKeys"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "checkpointKeys": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/KeyID"
+          }
+        }
+      },
+      "required": [
+        "bindings",
+        "checkpointKeys"
+      ],
+      "additionalProperties": false
+    },
+    "durability": {
+      "type": "object",
+      "properties": {
+        "failureDomain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requiredPayloads": {
+          "enum": [
+            "submitted",
+            "submitted-and-policy-inputs"
+          ]
+        },
+        "onFailure": {
+          "enum": [
+            "refuse",
+            "pending"
+          ]
+        }
+      },
+      "required": [
+        "failureDomain",
+        "requiredPayloads",
+        "onFailure"
+      ],
+      "additionalProperties": false
+    },
+    "policyRequiredKinds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "$comment": "Every listed kind requires inline body.policy conforming to PolicyEvaluation under the active profile. A later separately recorded PolicyDecision does not satisfy this requirement."
+    },
+    "deploymentPolicyRef": {
+      "$ref": "common.schema.json#/$defs/BytesRef"
+    },
+    "retention": {
+      "$comment": "How long the content of records made under this profile must be kept, fixed when the record is made. Leaving it out means the content is never disposed of.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "disposal": {
+              "const": "never"
+            }
+          },
+          "required": [
+            "disposal"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "disposal": {
+              "const": "by-record"
+            },
+            "keepContentForSeconds": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "disposal",
+            "keepContentForSeconds"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "required": [
+    "format",
+    "schemas",
+    "authority",
+    "durability",
+    "policyRequiredKinds",
+    "deploymentPolicyRef"
+  ],
+  "additionalProperties": false
+}

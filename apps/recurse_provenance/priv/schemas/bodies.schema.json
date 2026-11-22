@@ -1,0 +1,590 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://r5e.io/proposals/provenance-v2/schemas/bodies.schema.json",
+  "title": "Provenance v2 known body definitions",
+  "$defs": {
+    "PolicyEvaluation": {
+      "type": "object",
+      "properties": {
+        "policyRef": {
+          "$ref": "common.schema.json#/$defs/ExactRef"
+        },
+        "outcome": {
+          "enum": [
+            "allow",
+            "deny",
+            "error"
+          ]
+        },
+        "inputRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "evaluatorRef": {
+          "$ref": "common.schema.json#/$defs/ExactRef"
+        },
+        "decisionRef": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "activationRef": {
+          "$ref": "common.schema.json#/$defs/ExactRef"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "policyRef",
+        "outcome",
+        "inputRefs"
+      ],
+      "additionalProperties": false
+    },
+    "Snapshot": {
+      "type": "object",
+      "properties": {
+        "stateRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef"
+        },
+        "schemaRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef"
+        },
+        "interpretationRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef"
+        },
+        "queryRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef",
+          "$comment": "Addresses the self-contained SnapshotSelection value with query and finite selected stream membership."
+        },
+        "at": {
+          "$ref": "common.schema.json#/$defs/Frontier"
+        }
+      },
+      "required": [
+        "stateRef",
+        "schemaRef",
+        "interpretationRef",
+        "queryRef",
+        "at"
+      ],
+      "additionalProperties": false
+    },
+    "ModelCall": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEvaluation"
+        },
+        "retryOf": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        },
+        "result": {
+          "$ref": "#/$defs/CallResult"
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "inputRefs"
+      ],
+      "additionalProperties": false
+    },
+    "ToolCall": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEvaluation"
+        },
+        "retryOf": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        },
+        "result": {
+          "$ref": "#/$defs/CallResult"
+        }
+      },
+      "required": [
+        "tool",
+        "inputRefs"
+      ],
+      "additionalProperties": false
+    },
+    "ModelResponse": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "common.schema.json#/$defs/ResponseOutcome"
+        },
+        "outputRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "call": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "outcome",
+        "outputRefs"
+      ],
+      "additionalProperties": false
+    },
+    "ToolResult": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "common.schema.json#/$defs/ResponseOutcome"
+        },
+        "outputRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "call": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "outcome",
+        "outputRefs"
+      ],
+      "additionalProperties": false
+    },
+    "PolicyDecision": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "$ref": "common.schema.json#/$defs/ExactRef"
+        },
+        "evaluation": {
+          "$ref": "#/$defs/PolicyEvaluation"
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "subject",
+        "evaluation"
+      ],
+      "additionalProperties": false
+    },
+    "SessionOpened": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "common.schema.json#/$defs/IdentityURI"
+        },
+        "continues": {
+          "$ref": "common.schema.json#/$defs/IdentityURI"
+        },
+        "contextRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "SessionClosed": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "common.schema.json#/$defs/IdentityURI"
+        },
+        "outcome": {
+          "$ref": "common.schema.json#/$defs/SessionOutcome"
+        },
+        "through": {
+          "$ref": "common.schema.json#/$defs/Frontier"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "session",
+        "outcome",
+        "through"
+      ],
+      "additionalProperties": false
+    },
+    "Observation": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contentRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "about": {
+          "anyOf": [
+            {
+              "$ref": "common.schema.json#/$defs/ExactRef"
+            },
+            {
+              "$ref": "common.schema.json#/$defs/IdentityURI"
+            }
+          ]
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "topic",
+        "contentRefs"
+      ],
+      "additionalProperties": false
+    },
+    "PublishedView": {
+      "type": "object",
+      "properties": {
+        "viewRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef"
+        },
+        "about": {
+          "$ref": "common.schema.json#/$defs/ExactRef"
+        }
+      },
+      "required": [
+        "viewRef"
+      ],
+      "additionalProperties": false
+    },
+    "EpochSeal": {
+      "type": "object",
+      "properties": {
+        "stream": {
+          "$ref": "common.schema.json#/$defs/IdentityURI"
+        },
+        "firstSeq": {
+          "$ref": "common.schema.json#/$defs/Position"
+        },
+        "lastSeq": {
+          "$ref": "common.schema.json#/$defs/Position"
+        },
+        "previousSeal": {
+          "anyOf": [
+            {
+              "$ref": "common.schema.json#/$defs/EvidenceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "root": {
+          "$ref": "common.schema.json#/$defs/Digest"
+        },
+        "manifestRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef"
+        }
+      },
+      "required": [
+        "stream",
+        "firstSeq",
+        "lastSeq",
+        "previousSeal",
+        "root",
+        "manifestRef"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "firstSeq": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "previousSeal": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "previousSeal": {
+                "$ref": "common.schema.json#/$defs/EvidenceRef"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Checkpoint": {
+      "type": "object",
+      "properties": {
+        "seals": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/EvidenceRef"
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "previous": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/Snapshot"
+        }
+      },
+      "required": [
+        "seals"
+      ],
+      "additionalProperties": false
+    },
+    "RetentionHold": {
+      "type": "object",
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "until": {
+          "$ref": "common.schema.json#/$defs/Timestamp"
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "targets",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "RetentionHoldRelease": {
+      "type": "object",
+      "properties": {
+        "hold": {
+          "$ref": "common.schema.json#/$defs/EvidenceRef"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "hold",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "PayloadDisposition": {
+      "type": "object",
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "action": {
+          "enum": [
+            "expired",
+            "deleted",
+            "restored"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        }
+      },
+      "required": [
+        "targets",
+        "action",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "Disclosure": {
+      "type": "object",
+      "properties": {
+        "requestedRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "providedRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "recipient": {
+          "$ref": "common.schema.json#/$defs/IdentityURI"
+        },
+        "outcome": {
+          "enum": [
+            "provided",
+            "partial",
+            "denied"
+          ]
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEvaluation"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestedRefs",
+        "providedRefs",
+        "recipient",
+        "outcome"
+      ],
+      "additionalProperties": false
+    },
+    "Verification": {
+      "type": "object",
+      "properties": {
+        "targetRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "verifierRef": {
+          "$ref": "common.schema.json#/$defs/ExactRef"
+        },
+        "reportRef": {
+          "$ref": "common.schema.json#/$defs/BytesRef"
+        },
+        "outcome": {
+          "enum": [
+            "valid",
+            "invalid",
+            "incomplete",
+            "unsupported"
+          ]
+        }
+      },
+      "required": [
+        "targetRefs",
+        "verifierRef",
+        "reportRef",
+        "outcome"
+      ],
+      "additionalProperties": false
+    },
+    "CallResult": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "common.schema.json#/$defs/ResponseOutcome"
+        },
+        "outputRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          }
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "completedAt": {
+          "$ref": "common.schema.json#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "outcome",
+        "outputRefs"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

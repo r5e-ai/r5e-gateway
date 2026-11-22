@@ -1,0 +1,20 @@
+{
+  "apiVersion": "provenance.r5e.io/v2",
+  "kind": "SessionOpened",
+  "schemaRef": "bytes:sha256:4130ef1cd140212365320a2a53fecb2f0f38b64163ce0b547e715eed30a30e1f",
+  "profileRef": "bytes:sha256:4fed26c471f3b37dea948f8c1957a4a746b258c38d0938c5826024b72997380c",
+  "issuer": "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd",
+  "actor": "spiffe://example.test/workload/observer",
+  "stream": "urn:r5e:stream:example:observer-sessionopened:incarnation-01",
+  "seq": 1,
+  "previous": null,
+  "capturedAt": "2026-10-30T12:00:00Z",
+  "body": {
+    "session": "urn:r5e:session:example:interactive-01",
+    "continues": "urn:r5e:session:example:previous-interaction",
+    "contextRefs": [
+      "bytes:sha256:97a0701ac4c2667e21e8691b161622798376658ffd7f58ec27ffc1af05a9cd4c"
+    ]
+  },
+  "session": "urn:r5e:session:example:interactive-01"
+}

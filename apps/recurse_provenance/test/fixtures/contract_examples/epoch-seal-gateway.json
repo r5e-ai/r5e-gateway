@@ -1,0 +1,20 @@
+{
+  "apiVersion": "provenance.r5e.io/v2",
+  "kind": "EpochSeal",
+  "schemaRef": "bytes:sha256:792a84d45369489ff943d69416cd43aa54fc512418c0d9b54ce195b6e4eb64a1",
+  "profileRef": "bytes:sha256:4fed26c471f3b37dea948f8c1957a4a746b258c38d0938c5826024b72997380c",
+  "issuer": "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd",
+  "actor": "spiffe://example.test/workload/control",
+  "stream": "urn:r5e:stream:example:control:incarnation-01",
+  "seq": 1,
+  "previous": null,
+  "capturedAt": "2026-10-30T12:00:00Z",
+  "body": {
+    "stream": "urn:r5e:stream:example:gateway:incarnation-01",
+    "firstSeq": 1,
+    "lastSeq": 2,
+    "previousSeal": null,
+    "root": "sha256:276f5d6b1fdd524f0e8e91d2eaf7f69939a77e6e8aba05ddecd28af4a1a7878d",
+    "manifestRef": "bytes:sha256:d1747ae92a04556cc56a9b4ff4b857054cfa80c824cd748e98eb1efaaeb5e8ea"
+  }
+}

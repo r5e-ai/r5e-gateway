@@ -1,0 +1,414 @@
+defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
+  @moduledoc """
+  The evidence API against real records in Postgres: who may call, what
+  comes back, and that an exported bundle verifies.
+
+  `async: false` because the policy bundle loader, the provider registry
+  and evidence capture are node-wide.
+  """
+  use ExUnit.Case, async: false
+
+  @moduletag :tmp_dir
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Recurse.Gateway.Evidence.ApiHandler
+  alias Recurse.Gateway.Policy.BundleLoader
+  alias Recurse.Gateway.ProviderRegistry
+  alias Recurse.Gateway.Provenance.{Runtime, SessionName}
+  alias Recurse.Gateway.Test.JwtTestHelper
+  alias Recurse.Provenance.{Body, Export, Key, Pipeline, Ref}
+  alias Recurse.Providers.Impls.PostgresEvidenceStore
+  alias Recurse.Providers.Impls.PostgresMerkleLedger
+  alias Recurse.Providers.Repo
+
+  @tenant "01HQZN5K7J8M9N0P1Q2R3S4T5V"
+  @alice "urn:r5e:principal:test:alice"
+  @args ~s({"command":"ls"})
+  @policy "permit(principal, action, resource);"
+
+  setup %{tmp_dir: tmp_dir} do
+    :ok = Sandbox.checkout(Repo)
+    Sandbox.mode(Repo, {:shared, self()})
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {BundleLoader,
+         bundle_path: write_bundle(),
+         entity_schema_path:
+           Path.join([
+             Application.app_dir(:recurse_gateway, "priv"),
+             "cedar",
+             "schema.cedarschema.json"
+           ]),
+         trap_sighup: false,
+         name: nil},
+        id: make_ref()
+      )
+    )
+
+    ProviderRegistry.install_raw!(%{
+      llm: {Recurse.Gateway.Test.StubLLM, %{}},
+      ledger: {PostgresMerkleLedger, %{repo: Repo, pubsub: Recurse.PubSub, config: %{}}},
+      storage: {Recurse.Gateway.Test.StubStorage, %{}},
+      secrets: {Recurse.Gateway.Test.StubSecretsProvider, %{}},
+      tenant_id: @tenant,
+      signer: "observed://gateway/test"
+    })
+
+    restore = [
+      put_env(:jwt_validator_opts,
+        audience: "recurse-gateway-test",
+        issuer: "https://test-broker.example.invalid",
+        known_kids: [{"test-key-rs256", JwtTestHelper.public_jwk(:rs256)}]
+      ),
+      put_env(:browser_session,
+        cookie_name: "r5e_session",
+        secret_key_base: :crypto.strong_rand_bytes(64),
+        secure_cookie?: false,
+        absent_cookie_redirect: :always_401
+      )
+    ]
+
+    deployment = "api-#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Runtime,
+       deployment: deployment,
+       signer: Key.generate("ed25519"),
+       store: {PostgresEvidenceStore, Repo},
+       dir: tmp_dir,
+       partitions: 1,
+       flush_interval_ms: 20}
+    )
+
+    on_exit(fn ->
+      :persistent_term.erase({Runtime, :info})
+      ProviderRegistry.uninstall()
+      Enum.each(restore, & &1.())
+    end)
+
+    session = "s-#{System.unique_integer([:positive])}"
+    receipts = for _ <- 1..2, do: capture(recorded(session))
+
+    [foreign] = [
+      capture(SessionName.for("01OTHER000000000000000000", @alice, session <> "-x"))
+    ]
+
+    {:ok, [_seal]} = Runtime.seal()
+
+    %{
+      session: session,
+      receipts: receipts,
+      foreign: foreign,
+      profile_ref: Runtime.info().profile_ref
+    }
+  end
+
+  defp recorded(id), do: SessionName.for(@tenant, @alice, id)
+
+  defp put_env(key, value) do
+    previous = Application.get_env(:recurse_gateway, key)
+    Application.put_env(:recurse_gateway, key, value)
+
+    fn ->
+      if previous,
+        do: Application.put_env(:recurse_gateway, key, previous),
+        else: Application.delete_env(:recurse_gateway, key)
+    end
+  end
+
+  defp capture(session) do
+    {:ok, receipt} =
+      Pipeline.capture(Runtime.pipeline(), %{
+        kind_path: "provenance.r5e.io/v2/ToolCall",
+        actor: "urn:r5e:principal:test:alice",
+        session: session,
+        attachments: [%{name: "args", bytes: @args}],
+        blobs: [@policy],
+        body:
+          Body.tool_call(
+            tool: "Bash",
+            content_ref: "attachment:args",
+            media_type: "application/json",
+            size: byte_size(@args),
+            policy:
+              Body.policy_evaluation(
+                policy_ref: Ref.bytes(@policy),
+                outcome: "allow",
+                input_refs: ["attachment:args"]
+              )
+          )
+      })
+
+    receipt
+  end
+
+  defp write_bundle do
+    source =
+      [
+        Application.app_dir(:recurse_gateway, "priv"),
+        "reference_policies",
+        "platform_roles.cedar"
+      ]
+      |> Path.join()
+      |> File.read!()
+
+    path = Path.join(System.tmp_dir!(), "evidence_api_bundle_#{System.unique_integer()}.cedar")
+    File.write!(path, source)
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  defp request(method, path, opts \\ []) do
+    conn = Plug.Test.conn(method, path)
+
+    conn =
+      case Keyword.get(opts, :role, "tenant_auditor") do
+        nil ->
+          conn
+
+        role ->
+          token =
+            JwtTestHelper.mint_test_jwt(
+              recurse_role: role,
+              audience: "recurse-gateway-test",
+              issuer: "https://test-broker.example.invalid"
+            )
+
+          Plug.Conn.put_req_header(conn, "authorization", "Bearer " <> token)
+      end
+
+    conn
+    |> Map.put(:path_params, Keyword.get(opts, :params, %{}))
+    |> Map.put(:body_params, Keyword.get(opts, :body, %{}))
+  end
+
+  defp record(ref, opts \\ []),
+    do:
+      ApiHandler.record(
+        request(:get, "/v1/evidence/records/x", [params: %{"ref" => ref}] ++ opts)
+      )
+
+  defp session(id, opts \\ []),
+    do:
+      ApiHandler.session(
+        request(:get, "/v1/evidence/sessions/x", [params: %{"session_id" => id}] ++ opts)
+      )
+
+  defp export(body, opts \\ []),
+    do: ApiHandler.export(request(:post, "/v1/evidence/export", [body: body] ++ opts))
+
+  defp verify(body, opts \\ []),
+    do: ApiHandler.verify(request(:post, "/v1/evidence/verify", [body: body] ++ opts))
+
+  defp body(conn), do: JSON.decode!(conn.resp_body)
+
+  describe "who may call" do
+    test "no credentials is 401 on every route", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      assert record(ref, role: nil).status == 401
+      assert session(ctx.session, role: nil).status == 401
+      assert export(%{"session" => ctx.session}, role: nil).status == 401
+      assert verify(%{"bundle" => %{}}, role: nil).status == 401
+    end
+
+    test "the data-plane caller role is refused", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      assert record(ref, role: "caller").status == 403
+      assert session(ctx.session, role: "caller").status == 403
+      assert export(%{"session" => ctx.session}, role: "caller").status == 403
+    end
+  end
+
+  describe "retention" do
+    test "only an operator places a hold or disposes; an auditor may look", ctx do
+      scope = recorded(ctx.session)
+      hold = %{"scope" => scope, "reason" => "litigation"}
+      post = fn path, body, opts -> request(:post, path, [body: body] ++ opts) end
+
+      assert ApiHandler.hold(post.("/v1/evidence/retention/holds", hold, role: nil)).status == 401
+      assert ApiHandler.hold(post.("/v1/evidence/retention/holds", hold, [])).status == 403
+
+      assert ApiHandler.dispose(
+               post.("/v1/evidence/retention/disposals", %{"scope" => scope, "reason" => "x"}, [])
+             ).status == 403
+
+      placed =
+        ApiHandler.hold(post.("/v1/evidence/retention/holds", hold, role: "platform_operator"))
+
+      assert placed.status == 201
+      assert %{"hold" => "evidence:sha256:" <> _ = ref, "seq" => 1} = body(placed)
+
+      # The hold stands in the way of a disposal, and the answer says which.
+      refused =
+        ApiHandler.dispose(
+          post.("/v1/evidence/retention/disposals", %{"scope" => scope, "reason" => "x"},
+            role: "platform_operator"
+          )
+        )
+
+      assert refused.status == 409
+      assert %{"error" => "under_hold", "about" => ^ref} = body(refused)
+
+      listed = ApiHandler.retention(request(:get, "/v1/evidence/retention"))
+      assert listed.status == 200
+      assert %{"holds" => [%{"ref" => ^ref, "scope" => ^scope}], "disposals" => []} = body(listed)
+
+      assert ApiHandler.hold(
+               post.("/v1/evidence/retention/holds", %{"reason" => "no scope"},
+                 role: "platform_operator"
+               )
+             ).status == 400
+    end
+  end
+
+  describe "records" do
+    test "a record is returned with its signed envelope", ctx do
+      [%{ref: ref, stream: stream} | _] = ctx.receipts
+      conn = record(ref)
+
+      assert conn.status == 200
+
+      assert %{
+               "ref" => ^ref,
+               "stream" => ^stream,
+               "seq" => 1,
+               "kind" => "provenance.r5e.io/v2/ToolCall",
+               "envelope" => %{"payload" => _, "signatures" => [_]}
+             } = body(conn)
+    end
+
+    test "an unknown or malformed reference is 404" do
+      assert record(Ref.evidence("nothing")).status == 404
+      assert record("not-a-reference").status == 404
+    end
+  end
+
+  describe "sessions" do
+    test "a session's records come back in order", ctx do
+      refs = Enum.map(ctx.receipts, & &1.ref)
+      conn = session(ctx.session)
+
+      assert conn.status == 200
+
+      assert %{"session" => urn, "records" => [%{"seq" => 1}, %{"seq" => 2}] = records} =
+               body(conn)
+
+      assert urn == recorded(ctx.session)
+      assert Enum.map(records, & &1["ref"]) == refs
+    end
+
+    test "an id two people used is not guessed at; the reader is given the names", ctx do
+      # Someone else's client happens to use the same id. It is another
+      # session, and a reader asking by the id alone is told there are two.
+      other = SessionName.for(@tenant, "urn:r5e:principal:test:bob", ctx.session)
+      capture(other)
+      :ok = Runtime.flush()
+
+      conn = session(ctx.session)
+      assert conn.status == 409
+      mine = recorded(ctx.session)
+
+      assert %{"error" => "more_than_one_session_has_this_id", "sessions" => sessions} =
+               body(conn)
+
+      assert Enum.sort(sessions) == Enum.sort([mine, other])
+
+      # By its recorded name, or the part after the tenant, each is read alone.
+      assert %{"session" => ^other, "records" => [_]} = body(session(other))
+      "urn:r5e:session:" <> rest = mine
+      [_tenant, tail] = String.split(rest, ":", parts: 2)
+      assert %{"session" => ^mine, "records" => [_, _]} = body(session(tail))
+      assert export(%{"session" => other}).status == 200
+    end
+
+    test "a session recorded under another tenant cannot be reached by its id", ctx do
+      assert session(ctx.session <> "-x").status == 404
+      assert export(%{"session" => ctx.session <> "-x"}).status == 404
+    end
+
+    test "a session with no records is 404" do
+      assert session("never-happened").status == 404
+    end
+  end
+
+  describe "export" do
+    test "content is withheld unless asked for, and the bundle verifies", ctx do
+      conn = export(%{"session" => ctx.session})
+      assert conn.status == 200
+      bundle = body(conn)
+
+      assert Enum.any?(
+               bundle["omissions"],
+               &(&1 == %{"ref" => Ref.bytes(@args), "reason" => "withheld"})
+             )
+
+      refute Enum.any?(bundle["blobs"], &(&1["ref"] == Ref.bytes(@args)))
+
+      report = Export.verify(bundle, trusted_profiles: [ctx.profile_ref])
+      assert %{failed: 0} = report.summary
+
+      # The seal also covers the other tenant's record, which is not in
+      # this bundle, so each record is proved a member instead.
+      assert Enum.count(report.findings, &match?(%{check: :membership, result: :ok}, &1)) == 2
+    end
+
+    test "with content, everything the records refer to is carried",
+         ctx do
+      conn = export(%{"session" => ctx.session, "content" => true})
+      assert conn.status == 200
+      bundle = body(conn)
+
+      assert Enum.any?(bundle["blobs"], &(&1["ref"] == Ref.bytes(@args)))
+
+      report = Export.verify(bundle, trusted_profiles: [ctx.profile_ref])
+      assert %{failed: 0} = report.summary
+
+      # Everything the two records refer to is carried. The only content
+      # not carried is the seal's manifest, which is named as not selected.
+      assert [%{code: "omitted_not_selected"}] =
+               Enum.filter(report.findings, &(&1.check == :content and &1.result != :ok))
+    end
+
+    test "a body without a session is 400" do
+      assert export(%{}).status == 400
+    end
+  end
+
+  describe "verify" do
+    test "a submitted bundle is checked and the report returned", ctx do
+      bundle = body(export(%{"session" => ctx.session, "content" => true}))
+
+      conn = verify(%{"bundle" => bundle, "trustedProfiles" => [ctx.profile_ref]})
+      assert conn.status == 200
+
+      assert %{"format" => "r5e.provenance-verify-report/v2", "summary" => %{"failed" => 0}} =
+               body(conn)
+    end
+
+    test "a tampered bundle is reported, not refused", ctx do
+      bundle = body(export(%{"session" => ctx.session}))
+
+      tampered =
+        update_in(
+          bundle,
+          ["records", Access.at(0), "envelope", "signatures", Access.at(0), "sig"],
+          fn sig ->
+            <<first, rest::binary>> = Base.decode64!(sig)
+            Base.encode64(<<Bitwise.bxor(first, 1), rest::binary>>)
+          end
+        )
+
+      conn = verify(%{"bundle" => tampered})
+      assert conn.status == 200
+      assert %{"summary" => %{"failed" => failed}} = body(conn)
+      assert failed > 0
+    end
+
+    test "trusted profiles that are not references are 400", ctx do
+      bundle = body(export(%{"session" => ctx.session}))
+      assert verify(%{"bundle" => bundle, "trustedProfiles" => ["mine"]}).status == 400
+      assert verify(%{}).status == 400
+    end
+  end
+end

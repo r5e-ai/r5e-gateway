@@ -1,0 +1,18 @@
+{
+  "submissionId": "example-sdk-retained-submission-01",
+  "kind": "ToolCall",
+  "body": {
+    "tool": "example.fs.read",
+    "inputRefs": [
+      "attachment:request"
+    ]
+  },
+  "attachments": [
+    {
+      "name": "request",
+      "mediaType": "application/json",
+      "text": "{\"path\":\"example.txt\"}"
+    }
+  ],
+  "session": "urn:r5e:session:example:interactive-01"
+}

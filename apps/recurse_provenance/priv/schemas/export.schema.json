@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://r5e.io/proposals/provenance-v2/schemas/export.schema.json",
+  "title": "Provenance v2 Export",
+  "$comment": "Transport shape for scoped offline verification inputs. Does not verify digests, signatures, keys, profiles, authorization, completeness, proofs or omissions. Records contain only v2 SignedEvidence; v1 bytes may be attachments and require an explicit separate reader.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "const": "r5e.provenance-export/v2"
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "$ref": "common.schema.json#/$defs/JSONValue"
+        },
+        "at": {
+          "$ref": "common.schema.json#/$defs/Frontier"
+        }
+      },
+      "required": [
+        "query",
+        "at"
+      ],
+      "additionalProperties": false
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "$ref": "common.schema.json#/$defs/EvidenceRef"
+          },
+          "envelope": {
+            "$ref": "signed-evidence.schema.json"
+          }
+        },
+        "required": [
+          "ref",
+          "envelope"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "blobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "$ref": "common.schema.json#/$defs/BytesRef"
+          },
+          "base64": {
+            "$ref": "common.schema.json#/$defs/Base64"
+          },
+          "mediaType": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref",
+          "base64"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "keys": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "keyid": {
+            "$ref": "common.schema.json#/$defs/KeyID"
+          },
+          "algorithm": {
+            "enum": [
+              "ed25519",
+              "es256",
+              "es384"
+            ]
+          },
+          "bytes": {
+            "$ref": "common.schema.json#/$defs/Base64"
+          }
+        },
+        "required": [
+          "keyid",
+          "algorithm",
+          "bytes"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "seals": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/EvidenceRef"
+      }
+    },
+    "checkpoints": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/EvidenceRef"
+      }
+    },
+    "proofs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "record": {
+            "$ref": "common.schema.json#/$defs/EvidenceRef"
+          },
+          "seal": {
+            "$ref": "common.schema.json#/$defs/EvidenceRef"
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "siblings": {
+            "type": "array",
+            "items": {
+              "$ref": "common.schema.json#/$defs/Digest"
+            }
+          }
+        },
+        "required": [
+          "record",
+          "seal",
+          "index",
+          "siblings"
+        ],
+        "additionalProperties": false,
+        "$comment": "index is zero-based. The named record must match the seal stream and position firstSeq + index; proof length, leaf and tree shape require semantic verification."
+      }
+    },
+    "publicationProofs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "targetProfileRef": {
+            "$ref": "common.schema.json#/$defs/BytesRef"
+          },
+          "commitment": {
+            "$ref": "common.schema.json#/$defs/EvidenceRef"
+          },
+          "proofRef": {
+            "$ref": "common.schema.json#/$defs/BytesRef"
+          }
+        },
+        "required": [
+          "targetProfileRef",
+          "commitment",
+          "proofRef"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "omissions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "$ref": "common.schema.json#/$defs/ExactRef"
+          },
+          "reason": {
+            "enum": [
+              "unavailable",
+              "withheld",
+              "expired",
+              "not-selected",
+              "unsupported"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "format",
+    "scope",
+    "records",
+    "blobs",
+    "keys",
+    "seals",
+    "checkpoints",
+    "proofs",
+    "publicationProofs",
+    "omissions"
+  ],
+  "additionalProperties": false
+}

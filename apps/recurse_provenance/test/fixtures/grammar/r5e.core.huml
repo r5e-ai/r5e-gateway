@@ -1,0 +1,778 @@
+%HUML v0.2.0
+# R5E Core + Provenance Foundation Package (core.r5e.io/v1)
+#
+# The minimal, language-agnostic open provenance and meta-API foundation.
+# Contains ONLY primitives indispensable to verifiable provenance, content
+# addressing, API definition lineage, cryptographic authority, optional
+# session/WAL roll-ups, and multi-chain anchoring.
+#
+# Organizational hierarchies, policy engines, sandboxes, and workflow tasks
+# live in optional domain packages (`r5e.enterprise`, `r5e.harmony`, etc.).
+
+format: "r5e.contract-package/v2"
+package: "r5e.core"
+group: "core.r5e.io"
+version: "v1"
+foundation: true
+imports:: {}
+
+# ---------------------------------------------------------------------------
+# Reusable Scalar & Structural Types
+# ---------------------------------------------------------------------------
+types::
+  Digest::
+    type: "string"
+    pattern: "^sha256:[0-9a-f]{64}$"
+
+  BytesAddress::
+    type: "string"
+    pattern: "^bytes:sha256:[0-9a-f]{64}$"
+
+  EventAddress::
+    type: "string"
+    pattern: "^event:sha256:[0-9a-f]{64}$"
+
+  DefinitionRef::
+    type: "string"
+    description: "Exact named definition: the content reference of a package manifest, then `#`, then the kind path of one of its members."
+    pattern: "^bytes:sha256:[0-9a-f]{64}#[a-z0-9.-]+/v[0-9a-z]+/[A-Za-z0-9]+$"
+
+  KeyId::
+    type: "string"
+    pattern: "^key:[a-z0-9._-]+:sha256:[0-9a-f]{64}$"
+
+  Timestamp::
+    type: "string"
+    description: "RFC 3339 calendar-valid instant with up to nanosecond precision; leap seconds and unknown -00:00 offsets are outside this profile. ordered compares UTC instants, not text."
+    pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"
+
+  KindPath::
+    type: "string"
+    pattern: "^[a-z0-9.-]+/v[0-9a-z]+/[A-Za-z0-9]+$"
+
+  KindPattern::
+    type: "string"
+    pattern: "^([a-z0-9.-]+/v[0-9a-z]+/([A-Za-z0-9]+|\\*)|\\*)$"
+
+  MetadataMap::
+    type: "object"
+    description: "Open no-float scalar metadata (`string | integer | boolean`) collected on records and evaluated by policy."
+    values::
+      type:: "string", "integer", "boolean"
+
+  PublicKey::
+    type: "object"
+    description: "Public key under an explicitly supported algorithm wire profile (PROVENANCE-WIRE.md). Baseline ed25519 uses unpadded base64url raw 32-byte key bytes. Optional attestation provides custody evidence; unknown profiles are not verified."
+    additionalProperties: false
+    required:: "algorithm", "bytes"
+    properties::
+      algorithm::
+        type: "string"
+        pattern: "^[a-z0-9._-]+$"
+      bytes::
+        type: "string"
+        description: "Canonical encoding required by algorithm profile; not a PEM string or arbitrary provider representation."
+      attestationRef::
+        type: "ref"
+        ref::
+          bytes: true
+
+  CasEncryption::
+    type: "object"
+    description: "Envelope encryption metadata for encrypted CAS payloads while keeping Action and Artifact provenance verifiable on-chain."
+    additionalProperties: false
+    required:: "algorithm", "keyRef", "nonce", "ciphertextDigest"
+    properties::
+      algorithm::
+        type: "string"
+      keyRef::
+        type: "string"
+      nonce::
+        type: "string"
+      aadDigest::
+        use: "Digest"
+      ciphertextDigest::
+        use: "Digest"
+
+  WorkloadAttestation::
+    type: "object"
+    description: "Endpoint/SPIRE-style workload identity measurements bound into a Badge by `r5e_helper` or a runtime attestor."
+    additionalProperties: false
+    properties::
+      spiffeId::
+        type: "string"
+      binaryDigest::
+        use: "Digest"
+      imageDigest::
+        use: "Digest"
+      hostKey::
+        use: "KeyId"
+
+  BytesRef::
+    type: "ref"
+    ref::
+      bytes: true
+
+  AnyInputRef::
+    type: "ref"
+    description: "Typed reference to local or cross-chain (`chain:<chainId>/...` anchored via ChainAnchor) CAS bytes, Resources, Events, or exact definition members."
+    ref::
+      crossChain: true
+      anyOf::
+        - ::
+          bytes: true
+        - ::
+          kind: "*"
+        - ::
+          event: "*"
+        - ::
+          definition: true
+
+  GrantCeiling::
+    type: "object"
+    description: "Domain-neutral, checkable delegation ceiling on an Endorsement or Badge. Supports task/resource binding (`boundRefs`), pre-authorized `actions`, tangential `stepUpActions`, organizational/project `scopeRefs`, and policy-evaluated `attributes`."
+    additionalProperties: false
+    properties::
+      boundRefs::
+        type: "array"
+        items::
+          use: "AnyInputRef"
+      scopeRefs::
+        type: "array"
+        items::
+          use: "AnyInputRef"
+      actions::
+        type: "array"
+        items::
+          type: "string"
+      stepUpActions::
+        type: "array"
+        items::
+          type: "string"
+      environments::
+        type: "array"
+        items::
+          type: "string"
+      resources::
+        type: "array"
+        items::
+          type: "string"
+      attributes::
+        use: "MetadataMap"
+
+  PolicyDecision::
+    type: "object"
+    description: "Exact policy evaluation receipt bound to an individual Action (`allow`, `deny`, `escalate`, `observe`, `error`)."
+    additionalProperties: false
+    required:: "engine", "decision"
+    properties::
+      engine::
+        type: "string"
+      decision::
+        type: "string"
+        enum:: "allow", "deny", "escalate", "observe", "error"
+      bundleRef::
+        use: "AnyInputRef"
+      bundleDigest::
+        use: "Digest"
+      shapeDigest::
+        use: "Digest"
+      matchedPolicies::
+        type: "array"
+        items::
+          type: "string"
+      evaluationRef::
+        use: "BytesRef"
+
+  OverrideSpec::
+    type: "object"
+    description: "Explicit domain-rule modifications declared against an `extends` parent. Protected Core foundation fields may never be dropped or weakened."
+    additionalProperties: false
+    required::
+      - "reason"
+    properties::
+      reason::
+        type: "string"
+      drop::
+        type: "array"
+        items::
+          type: "string"
+      optional::
+        type: "array"
+        items::
+          type: "string"
+      replace::
+        type: "object"
+      dropConstraints::
+        type: "array"
+        items::
+          type: "string"
+          enum:: "ordered", "requires", "exactlyOne", "atMostOne", "predicates", "terminal"
+
+  DefinitionPins::
+    type: "object"
+    description: "Resolved member-view pins computed from the package manifest. `manifestRef` is the content reference of the manifest this definition is a member of; the other pins are exact definition refs. This view is derived, never authored or signed."
+    additionalProperties: false
+    required::
+      - "manifestRef"
+    properties::
+      manifestRef::
+        use: "BytesAddress"
+      definedByRef::
+        use: "DefinitionRef"
+      extendsRef::
+        use: "DefinitionRef"
+      dependencyRefs::
+        type: "object"
+        values::
+          use: "DefinitionRef"
+
+  EpistemicScope::
+    type: "object"
+    additionalProperties: false
+    required:: "claims", "doesNotClaim"
+    properties::
+      claims::
+        type: "array"
+        items::
+          type: "string"
+      doesNotClaim::
+        type: "array"
+        items::
+          type: "string"
+
+# ---------------------------------------------------------------------------
+# Core + Provenance Kinds (15 Foundational Kinds)
+# ---------------------------------------------------------------------------
+kinds::
+
+  # =========================================================================
+  # 1. Meta-API, Content-Addressed Bytes & Extensible Artifact Base
+  # =========================================================================
+
+  KindDefinition::
+    substrate: "resource"
+    naming::
+      mode: "path"
+      admitBy: "authority"
+      readmitBy: "authority"
+    requiresAuthority: true
+    protected:: "group", "version", "kind", "substrate", "description", "schema", "pins"
+    description: "Contract governing a named member of a signed API publication. Resource naming and authority govern registry heads; revisions are DefinitionRefs, not independently signed member envelopes. Supports unhydrated extends, explicit domain overrides, semantic provenance, and ordinary meta-kind extensions."
+    schema::
+      additionalProperties: false
+      required:: "group", "version", "kind", "substrate", "description", "schema", "pins"
+      properties::
+        group::
+          type: "string"
+        version::
+          type: "string"
+        kind::
+          type: "string"
+        substrate::
+          type: "string"
+          enum:: "resource", "event", "artifact"
+        definedBy::
+          use: "KindPath"
+        extends::
+          use: "KindPath"
+        derivedFrom::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+        protected::
+          type: "array"
+          items::
+            type: "string"
+        overrides::
+          use: "OverrideSpec"
+        pins::
+          use: "DefinitionPins"
+        naming::
+          type: "object"
+        description::
+          type: "string"
+        schema::
+          type: "object"
+        epistemicScope::
+          use: "EpistemicScope"
+        predicates::
+          type: "array"
+        signatures::
+          type: "integer"
+          minimum: 1
+        requiresAuthority::
+          type: "boolean"
+        terminal::
+          type: "object"
+    epistemicScope::
+      claims::
+        - "at the recorded revision, this definition and its pinned dependency closure defined the structural and semantic contract for instances citing its `kindRevision`"
+      doesNotClaim::
+        - "that a descendant declaring `extends` conforms to its parent contract when domain rules were overridden"
+        - "that an off-chain producer enforced non-structural semantic obligations without supporting Assertions or Reviews"
+
+  CasObject::
+    substrate: "resource"
+    naming::
+      mode: "derived"
+      derive: "{address}"
+      readmitBy: "immutable"
+    protected:: "address", "size", "mediaType"
+    description: "Immutable content-addressed byte payload (`bytes:sha256:<64 hex>`). Storage location is independent of identity; payloads may be envelope-encrypted via `encryption`."
+    schema::
+      additionalProperties: false
+      required:: "address", "size", "mediaType", "retention"
+      properties::
+        address::
+          use: "BytesAddress"
+        size::
+          type: "integer"
+          minimum: 0
+        mediaType::
+          type: "string"
+        retention::
+          type: "string"
+        classification::
+          type: "string"
+        encryption::
+          use: "CasEncryption"
+
+  CasExpired::
+    substrate: "event"
+    naming::
+      mode: "content"
+    requiresAuthority: true
+    protected::
+      - "address"
+    description: "Provenance record of lawful retention erasure or encryption-key destruction for non-`public-record` CAS payloads."
+    schema::
+      additionalProperties: false
+      required:: "address", "reason"
+      properties::
+        address::
+          use: "BytesAddress"
+        reason::
+          type: "string"
+        destroyedKeyRef::
+          type: "string"
+
+  Artifact::
+    substrate: "artifact"
+    naming::
+      mode: "content"
+    protected:: "contentRef", "mediaType", "size"
+    description: "Universal base primitive for content-addressed objects (policies, prompts, session segments, workspace trees, context bundles, specs, reviews, assertions). Requires no Task, Session, or S3 deployment."
+    schema::
+      additionalProperties: false
+      required:: "contentRef", "mediaType", "size"
+      properties::
+        contentRef::
+          use: "BytesRef"
+        mediaType::
+          type: "string"
+        size::
+          type: "integer"
+          minimum: 0
+        summary::
+          type: "string"
+        classification::
+          type: "string"
+        derivedFrom::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+    epistemicScope::
+      claims::
+        - "the signer attested to an immutable payload at `contentRef` of `size` bytes and `mediaType`, optionally derived from `derivedFrom`"
+      doesNotClaim::
+        - "semantic correctness or fitness of the payload without a separate Review or Assertion"
+
+  # =========================================================================
+  # 2. Cryptographic Identity & Delegated Authority
+  # =========================================================================
+
+  Principal::
+    substrate: "resource"
+    naming::
+      mode: "derived"
+      derive: "{key}"
+      readmitBy: "actorOfRecordOrSuccessor"
+    protected:: "key", "kind", "custody"
+    description: "Optional profile published by a cryptographic key (`person`, `agent`, `org`, `service`, `instrument`, or domain-specific actor kind) declaring custody (e.g. `yubikey`, `cac-piv`, `passkey`, `tpm`, `kms`, `host`, `self`) and optional SPIFFE or sponsor links."
+    schema::
+      additionalProperties: false
+      required:: "key", "kind", "custody"
+      properties::
+        key::
+          use: "KeyId"
+        kind::
+          type: "string"
+        custody::
+          type: "string"
+        spiffeId::
+          type: "string"
+        sponsorRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Principal"
+        displayName::
+          type: "string"
+
+  Endorsement::
+    substrate: "event"
+    naming::
+      mode: "content"
+    protected:: "subject", "subjectKey", "kinds", "mayIssue", "notBefore", "notAfter", "parent"
+    description: "Signed authority delegation from an authorizing key to `subjectKey` over specific Kinds and an optional structured `ceiling`."
+    schema::
+      additionalProperties: false
+      required:: "subject", "subjectKey", "kinds", "mayIssue", "notBefore", "notAfter"
+      nonEmpty::
+        - "kinds"
+      ordered::
+        - ::
+          - "notBefore"
+          - "notAfter"
+      requires::
+        - ::
+          when::
+            envelope: "authority"
+            present: true
+          then::
+            - "parent"
+      properties::
+        subject::
+          use: "KeyId"
+        subjectKey::
+          use: "PublicKey"
+        role::
+          type: "string"
+        kinds::
+          type: "array"
+          items::
+            use: "KindPattern"
+        ceiling::
+          use: "GrantCeiling"
+        mayIssue::
+          type: "boolean"
+        notBefore::
+          use: "Timestamp"
+        notAfter::
+          use: "Timestamp"
+        parent::
+          type: "ref"
+          ref::
+            event:: "core.r5e.io/v1/Endorsement", "core.r5e.io/v1/Badge"
+
+  Badge::
+    substrate: "event"
+    naming::
+      mode: "content"
+    signatures: 2
+    protected:: "subject", "subjectKey", "subjectKind", "kinds", "mayIssue", "notBefore", "notAfter", "parent"
+    description: "Issued credential (workload SVID, task-scoped agent token, or identity badge) signed by issuer (signer 1) and countersigned by `subject` (signer 2)."
+    schema::
+      additionalProperties: false
+      required:: "subject", "subjectKey", "subjectKind", "kinds", "mayIssue", "notBefore", "notAfter"
+      nonEmpty::
+        - "kinds"
+      ordered::
+        - ::
+          - "notBefore"
+          - "notAfter"
+      requires::
+        - ::
+          when::
+            envelope: "authority"
+            present: true
+          then::
+            - "parent"
+      properties::
+        subject::
+          use: "KeyId"
+          matchesSigner: 2
+        subjectKey::
+          use: "PublicKey"
+        subjectKind::
+          type: "string"
+        role::
+          type: "string"
+        kinds::
+          type: "array"
+          items::
+            use: "KindPattern"
+        ceiling::
+          use: "GrantCeiling"
+        workloadAttestation::
+          use: "WorkloadAttestation"
+        mayIssue::
+          type: "boolean"
+        notBefore::
+          use: "Timestamp"
+        notAfter::
+          use: "Timestamp"
+        parent::
+          type: "ref"
+          ref::
+            event:: "core.r5e.io/v1/Endorsement", "core.r5e.io/v1/Badge"
+
+  Succession::
+    substrate: "event"
+    naming::
+      mode: "content"
+    signatures: 2
+    protected:: "predecessor", "successor", "successorKey"
+    description: "Cryptographic key rotation signed by predecessor (signer 1) and successor (signer 2)."
+    schema::
+      additionalProperties: false
+      required:: "predecessor", "successor", "successorKey"
+      properties::
+        predecessor::
+          use: "KeyId"
+          matchesSigner: 1
+        successor::
+          use: "KeyId"
+          matchesSigner: 2
+        successorKey::
+          use: "PublicKey"
+
+  Revocation::
+    substrate: "event"
+    naming::
+      mode: "content"
+    protected::
+      - "target"
+    description: "Permanent withdrawal of an Endorsement or Badge by its issuer or successor."
+    schema::
+      additionalProperties: false
+      required:: "target", "reason"
+      properties::
+        target::
+          type: "ref"
+          ref::
+            event:: "core.r5e.io/v1/Endorsement", "core.r5e.io/v1/Badge"
+        reason::
+          type: "string"
+
+  # =========================================================================
+  # 3. Provenance Acts, Optional Spans & Multi-Chain Roll-Ups
+  # =========================================================================
+
+  Action::
+    substrate: "event"
+    naming::
+      mode: "content"
+    protected:: "actionType", "target", "outcome", "occurredAt"
+    description: "A single signed, verifiable act. Standalone-capable: requires neither `Session` nor `Run`. Inside a Session, individual signed Action envelopes are appended to a local WAL and packaged into `SessionSegment` Artifacts with per-call signatures and `policyDecision` preserved intact."
+    schema::
+      additionalProperties: false
+      required:: "actionType", "target", "outcome", "occurredAt"
+      properties::
+        actionType::
+          type: "string"
+        target::
+          type: "string"
+        outcome::
+          type: "string"
+        vantage::
+          type: "string"
+        occurredAt::
+          use: "Timestamp"
+        subjectRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Principal"
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        runRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Run"
+        causedByRef::
+          use: "AnyInputRef"
+        approvalRefs::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+        argumentsDigest::
+          use: "Digest"
+        inputs::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+        outputs::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+        metadata::
+          use: "MetadataMap"
+        policyDecision::
+          use: "PolicyDecision"
+
+  Session::
+    substrate: "resource"
+    naming::
+      mode: "caller"
+      readmitBy: "actorOfRecordOrAuthority"
+    protected:: "actorKey", "state", "openedAt"
+    description: "Optional lifecycle anchor for an interactive, gateway, endpoint, or sandboxed session. Recorded at open/handoff/close only — never re-signed for derived runtime status."
+    schema::
+      additionalProperties: false
+      required:: "actorKey", "environment", "state", "openedAt"
+      properties::
+        actorKey::
+          use: "KeyId"
+        sponsorRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Principal"
+        scopeRef::
+          use: "AnyInputRef"
+        environment::
+          type: "string"
+        state::
+          type: "string"
+        openedAt::
+          use: "Timestamp"
+        closedAt::
+          use: "Timestamp"
+
+  SessionSegment::
+    extends: "core.r5e.io/v1/Artifact"
+    protected:: "sessionRef", "epoch", "firstSeq", "lastSeq", "actionCount", "merkleRoot"
+    description: "Unhydrated Artifact extension packaging a nonempty JCS array of full signed session-WAL envelopes, committed by the Merkle construction and session correlation rules in PROVENANCE-WIRE.md. actionCount counts envelopes."
+    schema::
+      required:: "sessionRef", "epoch", "firstSeq", "lastSeq", "actionCount", "merkleRoot"
+      ordered::
+        - ::
+          - "firstSeq"
+          - "lastSeq"
+      properties::
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        epoch::
+          type: "integer"
+          minimum: 1
+          description: "One-based nonempty checkpoint flush index within the session; not a policy version."
+        firstSeq::
+          type: "integer"
+          minimum: 1
+        lastSeq::
+          type: "integer"
+          minimum: 1
+        actionCount::
+          type: "integer"
+          minimum: 1
+        merkleRoot::
+          use: "Digest"
+        metadata::
+          use: "MetadataMap"
+        policyBundles::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+
+  SessionCheckpoint::
+    substrate: "event"
+    naming::
+      mode: "content"
+    protected:: "sessionRef", "epoch", "segmentRef", "merkleRoot", "final"
+    description: "Compact chain commitment to an exact SessionSegment. PROVENANCE-WIRE.md requires matching session, epoch and root, contiguous sequence/predecessor linkage, and no successor to a final checkpoint."
+    schema::
+      additionalProperties: false
+      required:: "sessionRef", "epoch", "segmentRef", "merkleRoot", "final"
+      properties::
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        epoch::
+          type: "integer"
+          minimum: 1
+        prevCheckpointRef::
+          type: "ref"
+          ref::
+            event: "core.r5e.io/v1/SessionCheckpoint"
+        segmentRef::
+          type: "ref"
+          ref::
+            event: "core.r5e.io/v1/SessionSegment"
+        merkleRoot::
+          use: "Digest"
+        policyTransitioned::
+          type: "boolean"
+        final::
+          type: "boolean"
+
+  Run::
+    substrate: "resource"
+    naming::
+      mode: "caller"
+      readmitBy: "actorOfRecordOrAuthority"
+    protected:: "state", "startedAt"
+    description: "Optional execution span grouping Actions, inputs, and outputs without imposing runtime lease or fencing machinery on standalone producers."
+    schema::
+      additionalProperties: false
+      required:: "state", "startedAt"
+      properties::
+        sessionRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Session"
+        parentRunRef::
+          type: "ref"
+          ref::
+            kind: "core.r5e.io/v1/Run"
+        state::
+          type: "string"
+        startedAt::
+          use: "Timestamp"
+        endedAt::
+          use: "Timestamp"
+        inputs::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+        outputs::
+          type: "array"
+          items::
+            use: "AnyInputRef"
+
+  ChainAnchor::
+    substrate: "event"
+    naming::
+      mode: "content"
+    protected:: "chainId", "fromSeq", "toSeq", "headDigest", "rootKey"
+    description: "Horizontal roll-up and federation anchor: commits the verified head range (`fromSeq..toSeq`, `headDigest`) of a micro-chain, offline endpoint chain, or air-gapped enclave bundle onto a parent chain alongside optional off-site witness receipts."
+    schema::
+      additionalProperties: false
+      required:: "chainId", "fromSeq", "toSeq", "headDigest", "rootKey"
+      ordered::
+        - ::
+          - "fromSeq"
+          - "toSeq"
+      properties::
+        chainId::
+          type: "string"
+          pattern: "^[A-Za-z0-9._:-]+$"
+        fromSeq::
+          type: "integer"
+          minimum: 1
+        toSeq::
+          type: "integer"
+          minimum: 1
+        headDigest::
+          use: "Digest"
+        rootKey::
+          use: "KeyId"
+        bundleRef::
+          use: "BytesRef"
+        witnessReceipts::
+          type: "array"
+          items::
+            use: "BytesRef"

@@ -1,0 +1,51 @@
+{
+  "format": "r5e.capture-profile/v2",
+  "schemas": {
+    "Checkpoint": "bytes:sha256:c5d9156363c8be59a50bc1b03455350a4e7e511b80ea70b9a2c22ea0232bbf71",
+    "Disclosure": "bytes:sha256:f195bc838da76bb71f8151abd5d5ac2672974485682bb4ae80e60d22ed43415d",
+    "EpochSeal": "bytes:sha256:792a84d45369489ff943d69416cd43aa54fc512418c0d9b54ce195b6e4eb64a1",
+    "ExampleExtension": "bytes:sha256:1c1085344f0ebbb6422e9b919703104b71fd180c647f3652500d09ff5749dc74",
+    "ModelCall": "bytes:sha256:96e144b6295f6cbe0f967837dbba1ebd1928cae4d941c6ddffa5503a8ec31bd0",
+    "ModelResponse": "bytes:sha256:2654fbcd0adbaba82b9665b293f727d04d72d03c13e6569a84886e7b210c6e0f",
+    "Observation": "bytes:sha256:7dbce58386aa5392465d72ab6ae3c725a1fe737a338bbbf783f310cb8d07708c",
+    "PayloadDisposition": "bytes:sha256:ee88682c4d4d5d84a09fc2b0669550178b841c5afd30e83019f67a102c442348",
+    "PolicyDecision": "bytes:sha256:9692650a43d39043ffe30742b3d360c273b912bc6f4230885f9fa98fdd1fe885",
+    "PublishedView": "bytes:sha256:ff102dc00b4103424a90c67b1ecd95bdd853de1dbe42670357e61810dda38a9b",
+    "RetentionHold": "bytes:sha256:e8693a7357da7e5e1ffd4df5a3cfa514aac12651a48486308d597ff380502b0a",
+    "RetentionHoldRelease": "bytes:sha256:52a95eec727fcf31c774d919339711b771c6bddf51e2cfa46c59a716f414076a",
+    "SessionClosed": "bytes:sha256:b9f9cff774fd622ee54f70de94e3ee29d601ed68f2723c8308fd96bea82a02b0",
+    "SessionOpened": "bytes:sha256:4130ef1cd140212365320a2a53fecb2f0f38b64163ce0b547e715eed30a30e1f",
+    "ToolCall": "bytes:sha256:54ac987d3ea7c144ffb384cf13f2f3e3cc83e211da1cd808f6f59d288cf8b26f",
+    "ToolResult": "bytes:sha256:e088d06b28150c8cff09e9c9ccc88ccd36f087ce3e63970af87e76f3b1649483",
+    "Verification": "bytes:sha256:e567a0119a9c997f33f8fa0e511108e5884e77c61fe8be2372573a62187b67f8"
+  },
+  "authority": {
+    "bindings": [
+      {
+        "streamPrefix": "urn:r5e:stream:example:",
+        "actorPrefixes": [
+          "spiffe://example.test/workload/"
+        ],
+        "issuerKeys": [
+          "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd"
+        ],
+        "sealerKeys": [
+          "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd"
+        ]
+      }
+    ],
+    "checkpointKeys": [
+      "key:ed25519:sha256:ac6afaa625ded6a6d7668df7282cb3c2fb1ef23e382ad079648d4ee3eb18efbd"
+    ]
+  },
+  "durability": {
+    "failureDomain": "illustrative replicated recorder storage",
+    "requiredPayloads": "submitted-and-policy-inputs",
+    "onFailure": "pending"
+  },
+  "policyRequiredKinds": [
+    "ModelCall",
+    "ToolCall"
+  ],
+  "deploymentPolicyRef": "bytes:sha256:fda9ddef44d540c3e47982e6a34907ba8f928a099f316c0a2dcab58d18757240"
+}

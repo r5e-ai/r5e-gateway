@@ -1,0 +1,24 @@
+# Local-dev services. Not shipped; not used in production.
+# Phase-1 deps: Postgres 16+ for persistent state + Postgres-Merkle LedgerProvider dev backend.
+# See quickstart.md for usage.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: recurse-dev-postgres
+    environment:
+      POSTGRES_USER: recurse
+      POSTGRES_PASSWORD: recurse
+      POSTGRES_DB: recurse_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - recurse-dev-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recurse -d recurse_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  recurse-dev-pgdata:

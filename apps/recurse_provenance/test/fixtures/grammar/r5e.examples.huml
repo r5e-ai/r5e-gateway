@@ -1,0 +1,95 @@
+%HUML v0.2.0
+# Worked Meta-API & Extension Examples (examples.r5e.io/v1)
+#
+# Exercises all critical Meta-API guarantees:
+# 1. `SecurityReview`: compatible extension (`conformsTo` includes `Artifact` and `Review`).
+# 2. `ExploratoryReview`: explicit domain override (`drop: ["verdict"]`); retains `Artifact`
+#    conformance and `Review` derivation lineage while dropping `Review` conformance.
+# 3. `SpecializedExploratoryReview`: extends `ExploratoryReview` additively; proves broken
+#    ancestor conformance (`Review`) is NEVER regained downstream.
+# 4. `DocDiscoveryMetric`: concrete metric Kind published via `definedBy: harmony.MetricDefinition`,
+#    binding semantic plain-language explanation + structural `metric` handle + `Assertion` base.
+# 5. `StrictDocDiscoveryMetric`: extends `DocDiscoveryMetric` without re-declaring `definedBy` or
+#    `metric`, proving meta-kind contract inheritance and full `conformsTo` preservation across `extends`.
+
+format: "r5e.contract-package/v2"
+package: "r5e.examples"
+group: "examples.r5e.io"
+version: "v1"
+imports::
+  core: "r5e.core"
+  harmony: "r5e.harmony"
+
+kinds::
+
+  SecurityReview::
+    extends: "harmony.r5e.io/v1/Review"
+    description: "Policy and network-topology review stage in a cognitively isolated pipeline. Preserves all `Review` and `Artifact` guarantees."
+    schema::
+      required::
+        - "policyBundleDigest"
+      properties::
+        policyBundleDigest::
+          use: "core.Digest"
+        networkZone::
+          type: "string"
+
+  ExploratoryReview::
+    extends: "harmony.r5e.io/v1/Review"
+    overrides::
+      drop::
+        - "verdict"
+      reason: "Develops open research questions and hypotheses rather than an acceptance verdict."
+    description: "Exploratory peer critique derived from `Review`. Valid `Artifact` with explicit derivation from `Review`, but intentionally incompatible with workflows requiring a `Review` verdict."
+    schema::
+      required::
+        - "questions"
+      properties::
+        questions::
+          type: "array"
+          items::
+            type: "string"
+        hypotheses::
+          type: "array"
+          items::
+            type: "string"
+
+  SpecializedExploratoryReview::
+    extends: "examples.r5e.io/v1/ExploratoryReview"
+    description: "Architecture-specific exploratory review. Adds `subsystem` without overrides; inherits `conformsTo: [Artifact, ExploratoryReview]` and MUST NOT regain `Review` conformance."
+    schema::
+      required::
+        - "subsystem"
+      properties::
+        subsystem::
+          type: "string"
+
+  DocDiscoveryMetric::
+    definedBy: "harmony.r5e.io/v1/MetricDefinition"
+    extends: "harmony.r5e.io/v1/Assertion"
+    metric::
+      valueField: "unnecessaryReads"
+      unit: "files"
+      direction: "lower-is-better"
+      subjectField: "subjectRef"
+      evaluationMethod: "Count file reads outside the task's cited documentation closure prior to first relevant doc read."
+    description: "Measures whether an agent located relevant governing documentation before editing code. Lower `unnecessaryReads` indicates less blind repo thrashing."
+    schema::
+      required:: "unnecessaryReads", "relevantDocsFound"
+      properties::
+        unnecessaryReads::
+          type: "integer"
+          minimum: 0
+        relevantDocsFound::
+          type: "boolean"
+
+  StrictDocDiscoveryMetric::
+    extends: "examples.r5e.io/v1/DocDiscoveryMetric"
+    description: "Team-specialized documentation-discovery metric adding a `budgetReads` threshold while inheriting `MetricDefinition` (`definedBy` and `metric`) from `DocDiscoveryMetric`."
+    schema::
+      required::
+        - "budgetReads"
+      properties::
+        budgetReads::
+          type: "integer"
+          minimum: 0

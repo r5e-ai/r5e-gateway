@@ -1,0 +1,36 @@
+{
+  "type": "example.CapturedInteractions",
+  "schemaRef": "bytes:sha256:a2f00043cbc033da77848d911c9727b5a2602d1a8d9ff7e9355070b93321331b",
+  "interpretationRef": "bytes:sha256:dad6eb846892d10f94337d33d015fbd3bf1e63e3f9d64226b3f9cea748e1d021",
+  "at": [
+    {
+      "stream": "urn:r5e:stream:example:gateway:incarnation-01",
+      "seq": 2,
+      "event": "evidence:sha256:a7bdd7013eb4188ca0985cd81f4b1ed6e032a9afcad5d2a9c19a186a1a8f56e4"
+    },
+    {
+      "stream": "urn:r5e:stream:example:worker:incarnation-01",
+      "seq": 2,
+      "event": "evidence:sha256:fd3fda9194aa97f90f1bf508ae53f037b0cf3876a2677135ba3d1be653f2089c"
+    }
+  ],
+  "query": {
+    "selection": "known interactions at the supplied frontier"
+  },
+  "data": {
+    "entries": [
+      {
+        "kind": "ModelResponse",
+        "event": "evidence:sha256:a7bdd7013eb4188ca0985cd81f4b1ed6e032a9afcad5d2a9c19a186a1a8f56e4"
+      },
+      {
+        "kind": "ToolResult",
+        "event": "evidence:sha256:fd3fda9194aa97f90f1bf508ae53f037b0cf3876a2677135ba3d1be653f2089c"
+      }
+    ]
+  },
+  "coverage": "partial",
+  "missingRefs": [
+    "bytes:sha256:f6448506c00b767e2f30288533cb14f36b791e0adcb1bfe3b70a28b78c8d0e96"
+  ]
+}
