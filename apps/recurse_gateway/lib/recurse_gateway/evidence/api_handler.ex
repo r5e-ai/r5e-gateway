@@ -324,9 +324,19 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   defp disposed?({module, handle}, scope) do
     case module.by_kind(handle, @disposition, "urn:r5e:stream:#{deployment()}:") do
-      {:ok, entries} -> Enum.any?(entries, &(&1.evidence["body"]["scope"] == scope))
-      _ -> false
+      {:ok, entries} ->
+        Enum.any?(entries, &(&1.evidence["body"]["scope"] == scope)) or
+          Enum.any?(entries, &under?(module, handle, scope, &1.ref))
+
+      _ ->
+        false
     end
+  end
+
+  # A disposal of whoever the session belongs to names that person, not
+  # the session, and destroys the session's key all the same.
+  defp under?(module, handle, scope, disposal) do
+    function_exported?(module, :disposed_by?, 3) and module.disposed_by?(handle, scope, disposal)
   end
 
   defp gone(conn), do: json(conn, 410, %{"error" => "ERR_CONTENT_DISPOSED"})

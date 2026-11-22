@@ -170,7 +170,7 @@ defmodule Recurse.Provenance.Shipper do
           {:ok, %{evidence: evidence}} <- [Envelope.open(entry["envelope"])],
           ref <- refs,
           uniq: true,
-          do: {ref, Evidence.content_scope(evidence)}
+          do: {ref, Evidence.content_owner(evidence)}
 
     result =
       Enum.reduce_while(wanted, :ok, fn {ref, scope}, :ok ->

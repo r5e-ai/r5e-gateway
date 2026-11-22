@@ -79,8 +79,19 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
         :ok = LocalKeyService.generate(key_file)
         {:ok, keys} = LocalKeyService.open(key_file)
 
-        {{PostgresEvidenceStore, %{repo: Repo, keys: {LocalKeyService, keys}}},
-         [put_env(:evidence_content_key_file, key_file) | restore]}
+        handle = %{repo: Repo, keys: {LocalKeyService, keys}}
+        restore = [put_env(:evidence_content_key_file, key_file) | restore]
+
+        # Where a test says who its subjects are, sessions are locked
+        # under their owner's key.
+        case ctx[:subjects] do
+          nil ->
+            {{PostgresEvidenceStore, handle}, restore}
+
+          pattern ->
+            {{PostgresEvidenceStore, Map.put(handle, :subjects, Regex.compile!(pattern))},
+             [put_env(:evidence_subject_pattern, pattern) | restore]}
+        end
       else
         {{PostgresEvidenceStore, Repo}, restore}
       end
@@ -493,6 +504,25 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert gone.status == 410
       assert %{"error" => "ERR_CONTENT_DISPOSED"} = body(gone)
 
+      assert dispose(recorded(ctx.session)).status == 409
+    end
+
+    @tag :encrypted
+    @tag subjects: "^urn:r5e:principal:test:"
+    test "disposing of a person disposes of every session of theirs, in one record", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      other = capture(recorded(ctx.session <> "-later"))
+      assert content(ref, Ref.bytes(@args)).resp_body == @args
+
+      disposed = dispose("urn:r5e:principal:test:alice")
+      assert disposed.status == 201
+      assert %{"outcome" => "disposed"} = body(disposed)
+
+      for gone <- [ref, other.ref] do
+        assert content(gone, Ref.bytes(@args)).status == 410
+      end
+
+      assert dispose("urn:r5e:principal:test:alice").status == 409
       assert dispose(recorded(ctx.session)).status == 409
     end
   end

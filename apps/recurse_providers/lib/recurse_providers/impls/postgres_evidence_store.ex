@@ -409,6 +409,13 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
         l.scope == ^scope or fragment("starts_with(?, ?)", l.scope, ^(scope <> @later))
       )
 
+  defp of_scope(:under, scope),
+    do:
+      dynamic(
+        [k],
+        k.under == ^scope or fragment("starts_with(?, ?)", k.under, ^(scope <> @later))
+      )
+
   defp of_scope(:key, scope),
     do:
       dynamic(
@@ -453,16 +460,16 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   # recording. What was written under the old one stays as it is:
   # unreadable, and not said to have been disposed of, because nothing on
   # the record disposed of it.
-  defp writing_key(handle, scope) do
+  defp writing_key(handle, scope, subject) do
     under = writing_scope(handle, scope)
 
-    case scope_key(handle, under) do
+    case scope_key(handle, under, subject) do
       {:ok, key} ->
         {:ok, under, key}
 
       {:error, :not_unwrappable} ->
         moved = next_scope(scope, scope_keys(handle, scope))
-        with {:ok, key} <- scope_key(handle, moved), do: {:ok, moved, key}
+        with {:ok, key} <- scope_key(handle, moved, subject), do: {:ok, moved, key}
 
       {:error, reason} ->
         {:error, reason}
@@ -470,14 +477,28 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   end
 
   @impl true
-  def put_content(handle, ref, content, scope)
+  def put_content(handle, ref, content, {scope, subject}) when is_binary(scope),
+    do: keep_content(handle, ref, content, scope, subject_named(handle, scope, subject))
 
-  def put_content(%{keys: {_module, _state}} = handle, ref, content, scope)
-      when is_binary(scope) do
+  def put_content(handle, ref, content, scope), do: keep_content(handle, ref, content, scope, nil)
+
+  # Whose key a new session key is locked by. Only a deployment that says
+  # what its subjects look like has any: a session whose owner does not
+  # fit (a service, an operator) is locked by the key service as before.
+  # A name with a space could be taken for another scope's later key.
+  defp subject_named(%{subjects: %Regex{} = pattern}, scope, subject)
+       when is_binary(subject) and subject != scope do
+    if Regex.match?(pattern, subject) and not String.contains?(subject, " "), do: subject
+  end
+
+  defp subject_named(_handle, _scope, _subject), do: nil
+
+  defp keep_content(%{keys: {_module, _state}} = handle, ref, content, scope, subject)
+       when is_binary(scope) do
     copies =
       repo(handle).all(from(b in "evidence_blobs", where: b.ref == ^ref, select: b.copy))
 
-    with {:ok, under, scope_key} <- writing_key(handle, scope) do
+    with {:ok, under, scope_key} <- writing_key(handle, scope, subject) do
       cond do
         # Held unencrypted already (structure, or from before encryption).
         "" in copies and content != :own ->
@@ -504,10 +525,10 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
 
   # With no key service nothing says which scope content belongs to, so
   # a scope cannot be shown to hold it already.
-  def put_content(_handle, _ref, :own, _scope), do: {:error, :not_held}
+  defp keep_content(_handle, _ref, :own, _scope, _subject), do: {:error, :not_held}
 
   # Structure, or a store with no key service: held as it is.
-  def put_content(handle, ref, :held, _scope),
+  defp keep_content(handle, ref, :held, _scope, _subject),
     do: if(match?({:ok, _}, get_blob(handle, ref)), do: :ok, else: {:error, :not_held})
 
   # Content that waited encrypted on the gateway's disk is only ever read
@@ -515,7 +536,7 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   # keep it in the clear, which is the one thing it waited encrypted for.
   # Structure (a seal's manifest: references, never content) has no scope
   # and is kept as it is, as it always was; it is small and read whole.
-  def put_content(%{keys: {_module, _state}} = handle, ref, {:reader, _path, open}, nil) do
+  defp keep_content(%{keys: {_module, _state}} = handle, ref, {:reader, _path, open}, nil, _) do
     with {:ok, bytes} <- read_whole(open) do
       if Ref.bytes(bytes) == ref,
         do: put_blob(handle, ref, bytes),
@@ -523,10 +544,10 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     end
   end
 
-  def put_content(_handle, _ref, {:reader, _path, _open}, _scope),
+  defp keep_content(_handle, _ref, {:reader, _path, _open}, _scope, _subject),
     do: {:error, :reader_requires_key_service}
 
-  def put_content(handle, ref, content, _scope), do: put_blob(handle, ref, content)
+  defp keep_content(handle, ref, content, _scope, _subject), do: put_blob(handle, ref, content)
 
   @hold_scope "urn:r5e:hold:"
 
@@ -726,8 +747,34 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     error -> {:error, error}
   end
 
-  # Every record made under the scope, each judged by the profile it cites.
+  @doc """
+  The sessions whose keys are locked by this scope's key: the sessions
+  of a subject. Disposing of the scope disposes of them all, so whoever
+  judges a disposal judges each of them as well.
+  """
+  @spec scopes_under(term(), String.t()) :: [String.t()]
+  def scopes_under(handle, scope) when is_binary(scope) do
+    repo(handle).all(
+      from(k in "evidence_content_keys", where: ^of_scope(:under, scope), select: k.scope)
+    )
+    |> Enum.map(&(&1 |> String.split(@later) |> hd()))
+    |> Enum.uniq()
+  rescue
+    _ -> []
+  end
+
+  # The scope and every session locked under it must allow the disposal.
   defp all_allow(handle, scope, at) do
+    Enum.reduce_while([scope | scopes_under(handle, scope)], :ok, fn each, :ok ->
+      case records_allow(handle, each, at) do
+        :ok -> {:cont, :ok}
+        refused -> {:halt, refused}
+      end
+    end)
+  end
+
+  # Every record made under the scope, each judged by the profile it cites.
+  defp records_allow(handle, scope, at) do
     where =
       case scope do
         "stream:" <> stream -> dynamic([r], r.stream == ^stream and is_nil(r.session))
@@ -787,8 +834,14 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     end
   end
 
+  # A scope's key goes together with every key locked under it. Those
+  # could be opened by nothing once it is gone; marking them destroyed
+  # in the same statement keeps "is this content gone" a question about
+  # one row.
   defp destroy_key(handle, scope, reason) do
-    of_scope = from(k in "evidence_content_keys", where: ^of_scope(:key, scope))
+    own = of_scope(:key, scope)
+    under = of_scope(:under, scope)
+    of_scope = from(k in "evidence_content_keys", where: ^dynamic(^own or ^under))
     live = from(k in of_scope, where: not is_nil(k.wrapped))
 
     case repo(handle).update_all(live,
@@ -1085,12 +1138,14 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     :ok
   end
 
-  # The scope's key, made and locked by the key service on first use.
-  defp scope_key(handle, scope) do
+  # The scope's key, made and locked on first use: by the subject's key
+  # when the scope is a session that belongs to a subject, and otherwise
+  # by the key service. Who locks a key is fixed when the key is made.
+  defp scope_key(handle, scope, subject \\ nil) do
     case existing_scope_key(handle, scope) do
       {:ok, key} -> {:ok, key}
       {:error, :destroyed} -> {:error, :content_key_destroyed}
-      {:error, :none} -> new_scope_key(handle, scope)
+      {:error, :none} -> new_scope_key(handle, scope, subject)
       {:error, reason} -> {:error, reason}
     end
   end
@@ -1099,31 +1154,57 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     query =
       from(k in "evidence_content_keys",
         where: k.scope == ^scope,
-        select: {k.wrapped, k.destroyed_at}
+        select: {k.wrapped, k.destroyed_at, k.under}
       )
 
     case repo(handle).one(query) do
       nil -> {:error, :none}
-      {nil, _destroyed_at} -> {:error, :destroyed}
-      {wrapped, nil} -> module.unwrap(state, wrapped, scope)
+      {nil, _destroyed_at, _under} -> {:error, :destroyed}
+      {wrapped, nil, nil} -> module.unwrap(state, wrapped, scope)
+      {wrapped, nil, under} -> opened_under(handle, wrapped, scope, under)
     end
   end
 
   defp existing_scope_key(_no_key_service, _scope), do: {:error, :no_key_service}
 
-  defp new_scope_key(%{keys: {module, state}} = handle, scope) do
+  # A key locked by another row's key. When that key is gone, so is this
+  # one: nothing else can open it.
+  defp opened_under(handle, wrapped, scope, under) do
+    with {:ok, subject_key} <- existing_scope_key(handle, under) do
+      case ContentCipher.unlock(wrapped, subject_key, scope) do
+        {:ok, key} -> {:ok, key}
+        {:error, :not_decryptable} -> {:error, :not_unwrappable}
+      end
+    else
+      {:error, :none} -> {:error, :destroyed}
+      other -> other
+    end
+  end
+
+  defp new_scope_key(%{keys: {module, state}} = handle, scope, subject) do
     key = :crypto.strong_rand_bytes(32)
 
-    with {:ok, wrapped} <- module.wrap(state, key, scope) do
+    with {:ok, wrapped, under} <- locked(handle, key, scope, subject) do
       repo(handle).insert_all(
         "evidence_content_keys",
-        [%{scope: scope, wrapped: wrapped, key_service: module.describe(state)}],
+        [%{scope: scope, wrapped: wrapped, key_service: module.describe(state), under: under}],
         on_conflict: :nothing
       )
 
       # Another writer may have made this scope's key first; theirs stands.
       existing_scope_key(handle, scope)
     end
+  end
+
+  defp locked(%{keys: {module, state}}, key, scope, nil) do
+    with {:ok, wrapped} <- module.wrap(state, key, scope), do: {:ok, wrapped, nil}
+  end
+
+  # The subject's own key is locked by the key service, and is replaced
+  # like any scope's when it has been destroyed or can no longer be opened.
+  defp locked(handle, key, scope, subject) do
+    with {:ok, under, subject_key} <- writing_key(handle, subject, nil),
+         do: {:ok, ContentCipher.lock(key, subject_key, scope), under}
   end
 
   defp hold_encrypted(handle, ref, {:file, path}, content_key) do

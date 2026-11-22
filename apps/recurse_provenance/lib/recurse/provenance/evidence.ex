@@ -175,4 +175,21 @@ defmodule Recurse.Provenance.Evidence do
         "stream:" <> evidence["stream"]
     end
   end
+
+  @doc """
+  A record's content scope together with who the session belongs to:
+  the person a call was made for, or else whoever made it. A store that
+  encrypts can lock a session's key under its owner's, so that one
+  person's content across all their sessions is disposed of together.
+  Only a session has an owner; any other scope is given as it is.
+  """
+  @spec content_owner(t()) :: String.t() | {String.t(), String.t()} | nil
+  def content_owner(evidence) do
+    scope = content_scope(evidence)
+    subject = evidence["onBehalfOf"] || evidence["actor"]
+
+    if is_binary(scope) and scope == evidence["session"] and is_binary(subject),
+      do: {scope, subject},
+      else: scope
+  end
 end

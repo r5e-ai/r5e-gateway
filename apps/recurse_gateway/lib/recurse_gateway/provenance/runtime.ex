@@ -356,10 +356,36 @@ defmodule Recurse.Gateway.Provenance.Runtime do
             correlation_id: "evidence-recorder"
           })
 
-        {PostgresEvidenceStore, with_keys(%{repo: repo, content: {module, state, ctx}})}
+        {PostgresEvidenceStore,
+         with_subjects(with_keys(%{repo: repo, content: {module, state, ctx}}))}
 
       _ ->
-        {PostgresEvidenceStore, with_keys(%{repo: repo})}
+        {PostgresEvidenceStore, with_subjects(with_keys(%{repo: repo}))}
+    end
+  end
+
+  # Which session owners get a key of their own, as a pattern the
+  # owner's identity must match. The deployment says what its subjects
+  # look like (a school: its student pseudonyms); the gateway does not
+  # know what a student is. A pattern needs a key service to mean
+  # anything, and a pattern that does not compile stops the node.
+  defp with_subjects(handle) do
+    case Application.get_env(:recurse_gateway, :evidence_subject_pattern) do
+      nil ->
+        handle
+
+      pattern when is_binary(pattern) and is_map_key(handle, :keys) ->
+        case Regex.compile(pattern) do
+          {:ok, regex} ->
+            Map.put(handle, :subjects, regex)
+
+          {:error, reason} ->
+            raise "R5E_EVIDENCE_SUBJECT_PATTERN is not a pattern: #{inspect(reason)}"
+        end
+
+      _pattern ->
+        raise "R5E_EVIDENCE_SUBJECT_PATTERN is set but evidence content is not encrypted: " <>
+                "set a key service as well"
     end
   end
 

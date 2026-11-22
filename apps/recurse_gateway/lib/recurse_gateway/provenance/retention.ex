@@ -340,6 +340,11 @@ defmodule Recurse.Gateway.Provenance.Retention do
   and `reason`, and may say `action` (`"deleted"`, the default, or
   `"expired"`) and `details`.
 
+  The scope is a session, or, where the deployment keeps each session's
+  key under its owner's, the owner: one record then disposes of every
+  session of theirs, and each of those sessions is judged as if it had
+  been named.
+
   Refused, with nothing recorded, while a hold covers anything in the
   scope, when any record in the scope was made under a profile that
   does not yet allow it, or when the scope has no content key left to
@@ -436,9 +441,14 @@ defmodule Recurse.Gateway.Provenance.Retention do
     counting = counting(info, entries)
     holds = for %{evidence: %{"kind" => @hold}} = entry <- entries, do: entry
 
+    # A subject's disposal takes its sessions with it, so a hold on any
+    # of them stands in the way as one on the subject would.
+    scopes = [scope | sessions_under(module, handle, scope)]
+
     in_scope =
       if Enum.any?(holds, &is_list(&1.evidence["body"]["targets"])) do
-        for %{ref: ref, evidence: evidence} <- scope_records(module, handle, scope),
+        for covered <- scopes,
+            %{ref: ref, evidence: evidence} <- scope_records(module, handle, covered),
             each <- [ref | Rules.content_refs(evidence)],
             into: MapSet.new(),
             do: each
@@ -448,7 +458,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
 
     touching =
       Enum.filter(holds, fn %{evidence: %{"body" => body}} ->
-        body["scope"] == scope or
+        body["scope"] in scopes or
           Enum.any?(List.wrap(body["targets"]), &MapSet.member?(in_scope, &1))
       end)
 
@@ -467,6 +477,12 @@ defmodule Recurse.Gateway.Provenance.Retention do
       covering ->
         {:error, {:under_hold, covering.ref}}
     end
+  end
+
+  defp sessions_under(module, handle, scope) do
+    if function_exported?(module, :scopes_under, 2),
+      do: module.scopes_under(handle, scope),
+      else: []
   end
 
   defp scope_records(module, handle, "stream:" <> stream) do

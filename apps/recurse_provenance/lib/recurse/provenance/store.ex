@@ -163,12 +163,18 @@ defmodule Recurse.Provenance.Store do
   came from outside and its bytes did not: knowing a reference is not a
   right to the content. A `nil` scope is structure (a profile, a
   definition, a seal's manifest) and is held as it is.
+
+  A session may be given with who it belongs to, as `{scope, subject}`
+  (see `Recurse.Provenance.Evidence.content_owner/1`). A store that can
+  then keeps the session's key under the subject's, so the subject's
+  content is disposed of together; one that cannot treats it as the
+  scope alone.
   """
   @callback put_content(
               handle(),
               Ref.t(),
               content() | :held | :own,
-              scope :: String.t() | nil
+              scope :: String.t() | {String.t(), subject :: String.t()} | nil
             ) ::
               :ok | {:error, term()}
 

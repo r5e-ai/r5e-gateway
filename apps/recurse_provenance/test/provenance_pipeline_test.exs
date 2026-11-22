@@ -466,7 +466,7 @@ defmodule Recurse.Provenance.PipelineTest do
 
       missing_ref = Ref.bytes("moved aside")
 
-      assert [{^missing_ref, "urn:r5e:session:staged"}] =
+      assert [{^missing_ref, {"urn:r5e:session:staged", _owner}}] =
                Agent.get(state, &Enum.uniq(&1.not_held_calls))
 
       assert {:ok, _} = Memory.fetch(mem, gone.ref)
