@@ -19,13 +19,31 @@ defmodule Recurse.Gateway.McpRegistry.LoaderTest do
   setup do
     # Reset persistent_term + app config between tests so order doesn't matter.
     :persistent_term.erase({Loader, :registry})
-    Application.delete_env(:recurse_gateway, :mcp_registry_path)
-    on_exit(fn -> :persistent_term.erase({Loader, :registry}) end)
+    # A registry with servers in it; the one a deployment ships with is empty.
+    Application.put_env(
+      :recurse_gateway,
+      :mcp_registry_path,
+      Path.expand("../fixtures/mcp_registry/sample-registry.json", __DIR__)
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:recurse_gateway, :mcp_registry_path)
+      :persistent_term.erase({Loader, :registry})
+    end)
+
     :ok
   end
 
-  describe "load!/0 — production catalog" do
-    test "loads + parses the priv-shipped registry.json without raising" do
+  describe "the registry a deployment ships with" do
+    test "is empty until the deployment registers its own servers" do
+      Application.delete_env(:recurse_gateway, :mcp_registry_path)
+      assert :ok = Loader.load!()
+      assert %{entries: []} = Loader.catalog()
+    end
+  end
+
+  describe "load!/0 — a catalog with servers" do
+    test "loads + parses a registry file without raising" do
       assert :ok = Loader.load!()
       catalog = Loader.catalog()
 
@@ -108,7 +126,11 @@ defmodule Recurse.Gateway.McpRegistry.LoaderTest do
 
   describe "config override — :mcp_registry_path" do
     test "reads the override path when set" do
-      tmp = Path.join(System.tmp_dir!(), "mcp_test_registry_#{System.unique_integer([:positive])}.json")
+      tmp =
+        Path.join(
+          System.tmp_dir!(),
+          "mcp_test_registry_#{System.unique_integer([:positive])}.json"
+        )
 
       File.write!(
         tmp,

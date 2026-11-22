@@ -15,9 +15,20 @@ defmodule Recurse.Gateway.Admin.McpRegistryHandlerTest do
 
   setup do
     :persistent_term.erase({Loader, :registry})
-    Application.delete_env(:recurse_gateway, :mcp_registry_path)
+    # A registry with servers in it; the one a deployment ships with is empty.
+    Application.put_env(
+      :recurse_gateway,
+      :mcp_registry_path,
+      Path.expand("../fixtures/mcp_registry/sample-registry.json", __DIR__)
+    )
+
     :ok = Loader.load!()
-    on_exit(fn -> :persistent_term.erase({Loader, :registry}) end)
+
+    on_exit(fn ->
+      Application.delete_env(:recurse_gateway, :mcp_registry_path)
+      :persistent_term.erase({Loader, :registry})
+    end)
+
     :ok
   end
 
@@ -39,7 +50,8 @@ defmodule Recurse.Gateway.Admin.McpRegistryHandlerTest do
 
       first = List.first(body["entries"])
       # All required wire fields present.
-      for k <- ~w(id name description source version transport trust_tier publisher capabilities policy_constraints sbom) do
+      for k <-
+            ~w(id name description source version transport trust_tier publisher capabilities policy_constraints sbom) do
         assert Map.has_key?(first, k), "missing key #{inspect(k)} in entry"
       end
 
