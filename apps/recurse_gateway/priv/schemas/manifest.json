@@ -156,7 +156,7 @@
       "method": "POST",
       "schema_uri": "https://gateway.example.com/v1/schemas/mcp_tool_call_response.json",
       "request_schema_uri": "https://gateway.example.com/v1/schemas/mcp_tool_call_request.json",
-      "_comment": "Hosted MCP tool dispatch. Bearer-authenticated (RFC 8693 token-exchanged JWT in production; demo accepts a stub `Bearer demo-mcp-token-*` synthetic token labeled in code). Trust-tier + Cedar gate inside handler; emits :mcp_tool_call attestation per call (allow OR deny — both are attested per Principle III).",
+      "_comment": "Hosted MCP tool dispatch. Bearer-authenticated: a token for this gateway from the broker's token exchange, verified by the handler. Trust-tier + Cedar gate inside handler; emits :mcp_tool_call attestation per call (allow OR deny — both are attested per Principle III).",
       "event_kind": "mcp_tool_call"
     }
   ],

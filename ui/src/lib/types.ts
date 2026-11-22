@@ -30,9 +30,9 @@
 //   - apps/recurse_gateway/priv/schemas/session_timeline.json
 //   - apps/recurse_gateway/priv/schemas/verify_response.json
 //
-// Schema-set checksum (sha256): d0d545afb8c64ec341d24fbdb8ece7d013f3f5fd200da2491ea4b6962c0511ed
+// Schema-set checksum (sha256): d5a722907200207b5d8ac58dff97db07aca4ddd342df1066ee212d7362d04043
 
-export const SCHEMAS_CHECKSUM = "d0d545afb8c64ec341d24fbdb8ece7d013f3f5fd200da2491ea4b6962c0511ed" as const;
+export const SCHEMAS_CHECKSUM = "d5a722907200207b5d8ac58dff97db07aca4ddd342df1066ee212d7362d04043" as const;
 
 /**
  * F004 placeholder schema for attestation. Full shape lands in the implementation phase that owns this entity (see contracts/audit_api_extensions.md). DO NOT consume this skeleton in production code without verifying the published version's x-version is stable.

@@ -5,7 +5,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
   Asserts:
 
     * Authentication: missing / malformed bearers → 401.
-    * Demo synthetic-token shape (`Bearer demo-mcp-token-*`) is accepted.
+    * Only a verified bearer token is accepted.
     * Real (non-demo) bearer is also accepted as the production-stub
       placeholder (until the broker wire-up lands).
     * Registry miss → 404.
@@ -24,6 +24,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
   alias Recurse.Gateway.DataPlane.McpServerHandler
   alias Recurse.Gateway.McpRegistry.Loader
   alias Recurse.Gateway.ProviderRegistry
+  alias Recurse.Gateway.Test.JwtTestHelper
 
   setup do
     :persistent_term.erase({Loader, :registry})
@@ -48,7 +49,19 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
       signer: "observed://gateway/mcp-test"
     })
 
+    previous = Application.get_env(:recurse_gateway, :jwt_validator_opts)
+
+    Application.put_env(:recurse_gateway, :jwt_validator_opts,
+      audience: "recurse-gateway-test",
+      issuer: "https://test-broker.example.invalid",
+      known_kids: [{"test-key-rs256", JwtTestHelper.public_jwk(:rs256)}]
+    )
+
     on_exit(fn ->
+      if previous,
+        do: Application.put_env(:recurse_gateway, :jwt_validator_opts, previous),
+        else: Application.delete_env(:recurse_gateway, :jwt_validator_opts)
+
       ProviderRegistry.uninstall()
       Application.delete_env(:recurse_gateway, :mcp_registry_path)
       :persistent_term.erase({Loader, :registry})
@@ -112,13 +125,29 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
       assert conn.status == 401
     end
 
-    test "synthetic Bearer demo-mcp-token-* is accepted (Phase-1 demo path)" do
+    test "a token nobody signed is refused, whatever it looks like" do
+      for unsigned <- ["demo-mcp-token-test-001", "anything-at-all", "a.b.c"] do
+        conn =
+          build_conn(
+            "r5e-audit-mcp",
+            "r5e.audit.list_receipts",
+            %{"arguments" => %{}},
+            [{"authorization", "Bearer " <> unsigned}]
+          )
+          |> McpServerHandler.handle()
+
+        assert conn.status == 401, "accepted #{unsigned}"
+        assert JSON.decode!(conn.resp_body)["error"] == "invalid_token"
+      end
+    end
+
+    test "a verified token is accepted" do
       conn =
         build_conn(
           "r5e-audit-mcp",
           "r5e.audit.list_receipts",
           %{"arguments" => %{}},
-          [{"authorization", "Bearer demo-mcp-token-test-001"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -133,7 +162,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "no-such-mcp",
           "r5e.audit.list_receipts",
           %{"arguments" => %{}},
-          [{"authorization", "Bearer demo-mcp-token-x"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -147,7 +176,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "r5e-audit-mcp",
           "r5e.audit.fictional_tool",
           %{"arguments" => %{}},
-          [{"authorization", "Bearer demo-mcp-token-x"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -165,7 +194,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "legacy-pdf-mcp",
           "r5e.audit.list_receipts",
           %{"arguments" => %{}},
-          [{"authorization", "Bearer demo-mcp-token-q"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -192,7 +221,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "r5e-audit-mcp",
           "r5e.audit.list_receipts",
           %{"arguments" => %{"limit" => 3}},
-          [{"authorization", "Bearer demo-mcp-token-a"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -219,7 +248,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "r5e-audit-mcp",
           "r5e.audit.verify_receipt",
           %{"arguments" => %{"run_id" => "demo-run-1"}},
-          [{"authorization", "Bearer demo-mcp-token-v"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -236,7 +265,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "r5e-audit-mcp",
           "r5e.audit.query_attestations",
           %{"arguments" => %{"query" => "policy_denied"}},
-          [{"authorization", "Bearer demo-mcp-token-q"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
@@ -254,11 +283,19 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
           "r5e-audit-mcp",
           "r5e.audit.list_receipts",
           %{"id" => "req-42", "arguments" => %{}},
-          [{"authorization", "Bearer demo-mcp-token-x"}]
+          [{"authorization", "Bearer " <> token()}]
         )
         |> McpServerHandler.handle()
 
       assert JSON.decode!(conn.resp_body)["id"] == "req-42"
     end
+  end
+
+  defp token do
+    JwtTestHelper.mint_test_jwt(
+      recurse_role: "tenant_auditor",
+      audience: "recurse-gateway-test",
+      issuer: "https://test-broker.example.invalid"
+    )
   end
 end

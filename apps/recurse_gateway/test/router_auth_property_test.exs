@@ -177,10 +177,7 @@ defmodule Recurse.Gateway.RouterAuthPropertyTest do
     {:get, "/v1/mcp/registry/r5e-audit-mcp"},
     {:patch, "/v1/mcp/registry/r5e-audit-mcp"},
 
-    # MCP tool dispatch — bearer-authenticated INSIDE the handler
-    # (handler-self-defended; the demo accepts a synthetic
-    # `Bearer demo-mcp-token-*` synthetic token alongside production
-    # JWTs so the route doesn't go through CookieOrBearerPlug).
+    # MCP tool dispatch — bearer only; the handler verifies the token.
     {:post, "/v1/mcp/r5e-audit-mcp/tools/r5e.audit.list_receipts"}
   ]
 
