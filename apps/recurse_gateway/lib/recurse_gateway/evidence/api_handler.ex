@@ -12,6 +12,10 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       read on. A parameter this route does not know is refused, so that
       a filter that was not applied is never mistaken for one that
       matched nothing.
+    * `GET  /v1/evidence/records/:ref/content/:bytes_ref` — one piece
+      of content a record names, as a download. 404 when the record does
+      not name it or it is not held, 410 when the record's content was
+      disposed of, 503 when the key service did not answer.
     * `GET  /v1/evidence/sessions/:session_id` — a session's records in
       stream order. `:session_id` is the session's recorded name, or
       the part after the tenant, or the client's id alone; an id that
@@ -67,7 +71,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   Cookie or bearer, then the policy bundle: `ReadReceipts` to read
   records and to verify, `ExportEvidence` to export, `ReadPayload`
-  as well when an export asks for content, `EnrolWorkload` to be
+  as well when an export asks for content or content is read directly, `EnrolWorkload` to be
   given a badge, and `ManageRetention` to place or release a hold or to
   dispose of content. `SubmitEvidence` to open a session or hand over
   a workload's records. A badge is taken back by the person it acts for
@@ -91,7 +95,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Gateway.Provenance.{Admission, Carried, Disclosing, Enrolment, Retention, Runtime}
   alias Recurse.Gateway.Provenance.SessionName
-  alias Recurse.Provenance.{Export, Exporter, Key, Ref}
+  alias Recurse.Provenance.{Evidence, Export, Exporter, Key, Ref}
   alias Recurse.Shared.IdentityContext
 
   @read ~s(Recurse::Action::"ReadReceipts")
@@ -217,6 +221,73 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end)
   end
 
+  @disposition "provenance.r5e.io/v2/PayloadDisposition"
+
+  @doc """
+  `GET /v1/evidence/records/:ref/content/:bytes_ref`
+
+  Content is reached through a record that names it, never by its
+  reference alone: the record says which session's key opens it, and
+  knowing a reference is not a right to the bytes. It is always sent as
+  a download of unstated type. What was captured may be anything, and it
+  must never be shown as a page on this origin.
+  """
+  @spec content(Plug.Conn.t()) :: Plug.Conn.t()
+  def content(%Plug.Conn{path_params: %{"ref" => ref, "bytes_ref" => bytes_ref}} = conn) do
+    endpoint = "/v1/evidence/records/content"
+
+    gated(conn, @read, endpoint, fn conn, _ctx, index ->
+      case content_allowed(conn, true, endpoint) do
+        :ok -> held(conn, index, ref, bytes_ref)
+        {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
+      end
+    end)
+  end
+
+  defp held(conn, {module, handle} = index, ref, bytes_ref) do
+    with true <- Ref.valid?(ref, :evidence) and Ref.valid?(bytes_ref, :bytes),
+         {:ok, entry} <- module.fetch(handle, ref),
+         true <- bytes_ref in Exporter.content_refs([entry]),
+         scope = Evidence.content_scope(entry.evidence),
+         {:ok, bytes} <- readable(index, bytes_ref, scope) do
+      download(conn, bytes_ref, bytes)
+    else
+      {:error, :key_service_unavailable} -> json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+      {:unreadable, scope} -> if disposed?(index, scope), do: gone(conn), else: not_found(conn)
+      _ -> not_found(conn)
+    end
+  end
+
+  defp readable({module, handle}, bytes_ref, scope) do
+    case module.get_content(handle, bytes_ref, scope) do
+      :error -> {:unreadable, scope}
+      other -> other
+    end
+  end
+
+  defp download(conn, bytes_ref, bytes) do
+    conn
+    |> Plug.Conn.put_resp_content_type("application/octet-stream", nil)
+    |> Plug.Conn.put_resp_header("content-disposition", "attachment")
+    |> Plug.Conn.put_resp_header("x-content-type-options", "nosniff")
+    |> Plug.Conn.put_resp_header("cache-control", "no-store, private")
+    |> Plug.Conn.put_resp_header("x-r5e-content-ref", bytes_ref)
+    |> Plug.Conn.send_resp(200, bytes)
+  end
+
+  # Whether a disposal of this scope's content is on record. Asked only
+  # once the content has turned out not to be readable.
+  defp disposed?(_index, nil), do: false
+
+  defp disposed?({module, handle}, scope) do
+    case module.by_kind(handle, @disposition, "urn:r5e:stream:#{deployment()}:") do
+      {:ok, entries} -> Enum.any?(entries, &(&1.evidence["body"]["scope"] == scope))
+      _ -> false
+    end
+  end
+
+  defp gone(conn), do: json(conn, 410, %{"error" => "ERR_CONTENT_DISPOSED"})
+
   @doc "`GET /v1/evidence/sessions/:session_id`"
   @spec session(Plug.Conn.t()) :: Plug.Conn.t()
   def session(%Plug.Conn{path_params: %{"session_id" => id}} = conn) do
@@ -237,7 +308,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     content? = body["content"] == true
 
     gated(conn, @export, "/v1/evidence/export", fn conn, ctx, index ->
-      with :ok <- content_allowed(conn, content?),
+      with :ok <- content_allowed(conn, content?, "/v1/evidence/export"),
            {:ok, session} <- named(ctx, id, index),
            {:ok, %{"records" => [_ | _]} = bundle} <-
              Exporter.session(index, session, content: content?) do
@@ -491,7 +562,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   def disclose(%Plug.Conn{body_params: request} = conn) do
     gated(conn, @disclose, "/v1/evidence/disclosures", fn conn, ctx, _index ->
       with true <- Runtime.running?() || :not_running,
-           :ok <- content_allowed(conn, true) do
+           :ok <- content_allowed(conn, true, "/v1/evidence/export") do
         # Whoever asked is on the record, person or service.
         case Disclosing.disclose(request, caller(ctx).principal) do
           {:ok, body} ->
@@ -645,10 +716,10 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   end
 
   # Asking for content needs the right to read payloads too.
-  defp content_allowed(_conn, false), do: :ok
+  defp content_allowed(_conn, false, _endpoint), do: :ok
 
-  defp content_allowed(conn, true) do
-    case Authz.gate(conn, @payload, resource("/v1/evidence/export")) do
+  defp content_allowed(conn, true, endpoint) do
+    case Authz.gate(conn, @payload, resource(endpoint)) do
       {:ok, _conn, _ctx, _bundle_ref} -> :ok
       error -> {:forbidden, error}
     end

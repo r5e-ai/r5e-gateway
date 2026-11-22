@@ -76,6 +76,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
        deployment: deployment,
        signer: Key.generate("ed25519"),
        store: {PostgresEvidenceStore, Repo},
+       retention: {:keep_for_seconds, 0},
        dir: tmp_dir,
        partitions: 1,
        flush_interval_ms: 20}
@@ -193,6 +194,16 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
     do:
       ApiHandler.records(request(:get, "/v1/evidence/records?" <> URI.encode_query(query), opts))
 
+  defp content(ref, bytes_ref, opts \\ []),
+    do:
+      ApiHandler.content(
+        request(
+          :get,
+          "/v1/evidence/records/x/content/y",
+          [params: %{"ref" => ref, "bytes_ref" => bytes_ref}] ++ opts
+        )
+      )
+
   defp session(id, opts \\ []),
     do:
       ApiHandler.session(
@@ -298,6 +309,84 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
         assert conn.status == 400, "expected 400 for #{inspect(query)}, got #{conn.status}"
         assert %{"error" => "ERR_BAD_REQUEST"} = body(conn)
       end
+    end
+  end
+
+  describe "reading content through a record" do
+    test "the bytes come as a download of unstated type", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      args_ref = Ref.bytes(@args)
+
+      conn = content(ref, args_ref)
+      assert conn.status == 200
+      assert conn.resp_body == @args
+      assert Plug.Conn.get_resp_header(conn, "content-type") == ["application/octet-stream"]
+      assert Plug.Conn.get_resp_header(conn, "content-disposition") == ["attachment"]
+      assert Plug.Conn.get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+      assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store, private"]
+      assert Plug.Conn.get_resp_header(conn, "x-r5e-content-ref") == [args_ref]
+    end
+
+    test "only content the record names, and only for someone who may read content", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      args_ref = Ref.bytes(@args)
+
+      assert content(ref, args_ref, role: nil).status == 401
+      assert content(ref, args_ref, role: "caller").status == 403
+
+      # Held by the deployment, but this record does not name it.
+      assert content(ref, ctx.profile_ref).status == 404
+      assert content(ref, Ref.bytes("never recorded")).status == 404
+      assert content(Ref.evidence("no such record"), args_ref).status == 404
+      assert content("not-a-ref", args_ref).status == 404
+    end
+
+    test "a disposal that could destroy nothing leaves the content readable", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+
+      # This deployment has no key service, so content is held as it is
+      # and there is no key to destroy. The disposal says so in its answer.
+      disposed =
+        ApiHandler.dispose(
+          request(:post, "/v1/evidence/retention/disposals",
+            body: %{"scope" => recorded(ctx.session), "reason" => "erasure request"},
+            role: "platform_operator"
+          )
+        )
+
+      assert disposed.status == 201
+      assert %{"outcome" => "nothing_encrypted_under_scope"} = body(disposed)
+
+      # What is still held is still served: 410 is only for content that
+      # can no longer be read.
+      assert content(ref, Ref.bytes(@args)).status == 200
+    end
+  end
+
+  describe "the active policy" do
+    alias Recurse.Gateway.Policy.ActiveHandler
+
+    test "its source, the reference records name it by, and where it came from" do
+      conn = ActiveHandler.show(request(:get, "/v1/policies/active"))
+      assert conn.status == 200
+
+      assert %{
+               "bundleRef" => "bytes:sha256:" <> _ = bundle_ref,
+               "source" => source,
+               "sourceMode" => "filesystem",
+               "activatedAt" => activated_at
+             } = body(conn)
+
+      assert bundle_ref == Ref.bytes(source)
+      assert source =~ "permit"
+      assert {:ok, _, 0} = DateTime.from_iso8601(activated_at)
+    end
+
+    test "needs credentials and a role that may replay decisions" do
+      assert ActiveHandler.show(request(:get, "/v1/policies/active", role: nil)).status == 401
+
+      assert ActiveHandler.show(request(:get, "/v1/policies/active", role: "caller")).status ==
+               403
     end
   end
 

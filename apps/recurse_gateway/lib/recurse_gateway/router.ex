@@ -303,6 +303,16 @@ defmodule Recurse.Gateway.Router do
   )
 
   dual_auth_get(
+    "/v1/evidence/records/:ref/content/:bytes_ref",
+    &Recurse.Gateway.Evidence.ApiHandler.content/1
+  )
+
+  dual_auth_get(
+    "/v1/policies/active",
+    &Recurse.Gateway.Policy.ActiveHandler.show/1
+  )
+
+  dual_auth_get(
     "/v1/evidence/sessions/:session_id",
     &Recurse.Gateway.Evidence.ApiHandler.session/1
   )
