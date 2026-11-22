@@ -13,7 +13,7 @@
 //     wiring lives one level up (debounced PATCH from PolicySimulator).
 //
 // T144 (Phase-9 polish): when the user types, we debounce a `POST
-// /v1/policy/simulate` validation request with the current source. If the
+// /v1/policies/simulate` validation request with the current source. If the
 // server returns `cedar parse error: <message>`, we extract the line/col
 // diagnostic from the error string and stamp a Monaco marker on the offending
 // line so the user sees an inline red squiggle. The parse error does NOT
@@ -48,7 +48,7 @@ interface Props {
   height?: string | number;
   /**
    * Optional override for the Cedar parse-error validation endpoint. Defaults
-   * to `/v1/policy/simulate`. Tests pass a stub URL.
+   * to `/v1/policies/simulate`. Tests pass a stub URL.
    */
   validationEndpoint?: string;
   /** Optional debounce delay in ms; defaults to 500. */
@@ -91,7 +91,7 @@ export default function CedarEditor({
   onChange,
   readOnly = false,
   height = "100%",
-  validationEndpoint = apiPaths.policy.simulate,
+  validationEndpoint = apiPaths.policies.simulate,
   debounceMs = 500,
 }: Props): JSX.Element {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
@@ -181,12 +181,18 @@ export default function CedarEditor({
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({
-          cedar_source: source,
-          // Synthetic minimal request — we only care about the parse step.
-          principal: { kind: "obo_human", id: "validation@local" },
-          action: 'Recurse::Action::"DashboardQuery"',
-          resource: { kind: "Recurse::Resource::ConsoleSurface", id: "validation" },
-          context: {},
+          cedarSource: source,
+          principal: { id: "validation@local", kind: "obo_human", groups: [] },
+          action: 'Action::"invoke_tool"',
+          resource: { tool: "read_file" },
+          context: {
+            model: "claude-sonnet-4-5",
+            tenant: "r5e-dev",
+            sessionId: "urn:r5e:session:r5e-dev:validation",
+            upstreamDomain: "api.anthropic.com",
+            transport: "https_sse",
+            estimatedCompletionTokens: 0,
+          },
         }),
         signal: ctrl.signal,
       });

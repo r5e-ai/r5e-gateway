@@ -19,15 +19,22 @@ export default defineConfig({
     timeout: 5_000,
   },
   use: {
-    baseURL: "http://localhost:4000",
+    baseURL:
+      process.env.PLAYWRIGHT_BASE_URL ||
+      (process.env.VITE_DEV_MOCKS ? "http://localhost:5179" : "http://localhost:4000"),
     trace: "on-first-retry",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    video: isCI ? "retain-on-failure" : "off",
   },
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        ...(process.env.PLAYWRIGHT_CHROME_CHANNEL
+          ? { channel: process.env.PLAYWRIGHT_CHROME_CHANNEL }
+          : {}),
+      },
     },
     {
       name: "firefox",
@@ -38,15 +45,20 @@ export default defineConfig({
       use: { ...devices["Desktop Safari"] },
     },
   ],
-  // Probe the Gateway is up before starting tests. Tests assume the Gateway
-  // serves /admin/login at boot (T056 / T058 / T060 land that route).
   webServer: process.env.PLAYWRIGHT_NO_WEBSERVER
     ? undefined
-    : {
-        command:
-          "cd .. && mix run --no-halt --no-compile -e 'Application.ensure_all_started(:recurse_gateway)'",
-        url: "http://localhost:4000/admin/login",
-        reuseExistingServer: !isCI,
-        timeout: 60_000,
-      },
+    : process.env.VITE_DEV_MOCKS
+      ? {
+          command: "VITE_DEV_MOCKS=1 pnpm dev --port 5179 --strictPort",
+          url: "http://localhost:5179/admin/",
+          reuseExistingServer: !isCI,
+          timeout: 30_000,
+        }
+      : {
+          command:
+            "cd .. && mix run --no-halt --no-compile -e 'Application.ensure_all_started(:recurse_gateway)'",
+          url: "http://localhost:4000/admin/login",
+          reuseExistingServer: !isCI,
+          timeout: 60_000,
+        },
 });

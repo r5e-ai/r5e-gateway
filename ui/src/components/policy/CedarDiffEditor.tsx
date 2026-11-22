@@ -9,7 +9,7 @@
 // The original (left) side is read-only — that's the deployed bundle excerpt
 // returned in the replay response. The modified (right) side is editable and
 // the parent debounces its `onChange` to re-fire the replay with
-// `override_cedar_source` per audit_api_extensions.md POST /v1/policy/replay.
+// `cedarSource` via `POST /v1/policies/replay`.
 
 import { DiffEditor, type Monaco } from "@monaco-editor/react";
 
@@ -54,6 +54,8 @@ export default function CedarDiffEditor({
       <DiffEditor
         original={original}
         modified={modified}
+        keepCurrentOriginalModel={true}
+        keepCurrentModifiedModel={true}
         beforeMount={registerCedar}
         language={CEDAR_LANGUAGE_ID}
         theme="vs-dark"

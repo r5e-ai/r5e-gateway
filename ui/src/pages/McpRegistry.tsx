@@ -2,7 +2,7 @@
 //
 // Per design/briefs/07-mcp-registry.md (F7). The list view is the entry
 // point into the MCP/SBOM/Trusted-Registry vertical-slice demo (Path B):
-// every MCP tool call gets a receipt with cryptographic provenance, every
+// every MCP tool call records cryptographic provenance, every
 // server has an SBOM, vulnerable servers are quarantined.
 //
 // Layout per F7 brief:

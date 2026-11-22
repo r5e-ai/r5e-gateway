@@ -7,7 +7,7 @@
 //   - Always centered in its container; the container provides the box.
 //
 // Constitution Principle VII: extracted on the third inline copy
-// (PolicySimulatorSuggestions, Dashboard, ReceiptDetail had separate
+// Shared empty-state surface across Dashboard, Timeline, and PolicySimulator.
 // inline empty-state renderings before this primitive landed).
 //
 // Callers compose: <EmptyState title="No matching events"

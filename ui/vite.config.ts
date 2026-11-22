@@ -50,17 +50,17 @@ export default defineConfig(async () => {
     port: 5173,
     strictPort: true,
     proxy: {
+      "/v1/evidence/tail": {
+        target: "ws://localhost:4000",
+        ws: true,
+        changeOrigin: false,
+      },
       "/v1": {
         target: "http://localhost:4000",
         changeOrigin: false,
       },
       "/.well-known": {
         target: "http://localhost:4000",
-        changeOrigin: false,
-      },
-      "/admin/live-tail": {
-        target: "ws://localhost:4000",
-        ws: true,
         changeOrigin: false,
       },
       "/admin/login": {
