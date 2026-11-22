@@ -668,7 +668,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
   defp write(%{store: {module, handle}}, placed, keys, profiles, blobs, badges) do
     Enum.reduce_while(placed, {:ok, []}, fn {%{evidence: evidence} = record, status},
                                             {:ok, acc} ->
-      scope = Evidence.content_scope(evidence)
+      owner = Evidence.content_owner(evidence)
       wanted = Rules.content_refs(evidence)
 
       # Content first, each piece under the record's own scope and never
@@ -679,7 +679,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
       {held, missing} =
         Enum.split_with(wanted, fn ref ->
           content = Map.get(blobs, ref, :own)
-          module.put_content(handle, ref, content, scope) == :ok
+          module.put_content(handle, ref, content, owner) == :ok
         end)
 
       result =

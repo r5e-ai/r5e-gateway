@@ -295,9 +295,14 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
          {:ok, bytes} <- readable(index, bytes_ref, scope) do
       download(conn, bytes_ref, bytes)
     else
-      {:error, :key_service_unavailable} -> json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
-      {:unreadable, scope} -> if disposed?(index, scope), do: gone(conn), else: not_found(conn)
-      _ -> not_found(conn)
+      {:error, :key_service_unavailable} ->
+        json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+
+      {:unreadable, scope} ->
+        if disposed?(index, scope, bytes_ref), do: gone(conn), else: not_found(conn)
+
+      _ ->
+        not_found(conn)
     end
   end
 
@@ -320,12 +325,20 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   # Whether a disposal of this scope's content is on record. Asked only
   # once the content has turned out not to be readable.
-  defp disposed?(_index, nil), do: false
+  defp disposed?(_index, nil, _bytes_ref), do: false
 
-  defp disposed?({module, handle}, scope) do
-    case module.by_kind(handle, @disposition, "urn:r5e:stream:#{deployment()}:") do
-      {:ok, entries} -> Enum.any?(entries, &(&1.evidence["body"]["scope"] == scope))
-      _ -> false
+  # A store that keeps keys knows whether this content's own key was
+  # destroyed on the record, whether the disposal named the session or
+  # whoever the session belongs to. One that does not is asked for a
+  # disposal that names the scope.
+  defp disposed?({module, handle}, scope, bytes_ref) do
+    if function_exported?(module, :content_disposed?, 3) do
+      module.content_disposed?(handle, bytes_ref, scope)
+    else
+      case module.by_kind(handle, @disposition, "urn:r5e:stream:#{deployment()}:") do
+        {:ok, entries} -> Enum.any?(entries, &(&1.evidence["body"]["scope"] == scope))
+        _ -> false
+      end
     end
   end
 

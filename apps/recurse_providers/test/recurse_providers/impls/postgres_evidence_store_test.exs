@@ -518,6 +518,104 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
       assert :already = Store.dispose_content(handle, session, disposal(3))
     end
 
+    test "a subject's sessions are locked under the subject's key, and go with it",
+         %{handle: handle} do
+      handle = Map.put(handle, :subjects, ~r/^urn:r5e:student:/)
+      n = System.unique_integer([:positive])
+      student = "urn:r5e:student:test:#{n}"
+      [one, two, service] = for s <- 1..3, do: "urn:r5e:session:test:subject-#{s}-#{n}"
+      [first, second, third] = for s <- 1..3, do: "said in session #{s} of #{n}"
+      key = "subject:" <> student
+
+      assert :ok = Store.put_content(handle, Ref.bytes(first), first, {one, student})
+      assert :ok = Store.put_content(handle, Ref.bytes(second), second, {two, student})
+      # An owner that is not a subject of this deployment: locked as before.
+      assert :ok = Store.put_content(handle, Ref.bytes(third), third, {service, @actor})
+
+      assert %{rows: [[^key, nil], [^one, ^key], [^two, ^key], [^service, nil]]} =
+               Repo.query!(
+                 "SELECT scope, under FROM evidence_content_keys WHERE scope = ANY($1) ORDER BY scope",
+                 [[key, one, two, service]]
+               )
+
+      assert {:ok, ^first} = Store.get_content(handle, Ref.bytes(first), one)
+      assert {:ok, ^second} = Store.get_content(handle, Ref.bytes(second), two)
+      assert :error = Store.get_content(handle, Ref.bytes(first), two)
+      assert Enum.sort([one, two]) == Enum.sort(Store.scopes_under(handle, student))
+
+      # One disposal, of the subject.
+      assert :ok = Store.dispose_content(handle, student, disposal())
+      assert :error = Store.get_content(handle, Ref.bytes(first), one)
+      assert :error = Store.get_content(handle, Ref.bytes(second), two)
+      assert {:ok, ^third} = Store.get_content(handle, Ref.bytes(third), service)
+      assert [service] == Store.live_scopes(handle, [student, one, two, service])
+      assert Store.content_disposed?(handle, Ref.bytes(first), one)
+      refute Store.content_disposed?(handle, Ref.bytes(third), service)
+      assert :already = Store.dispose_content(handle, student, disposal(2))
+
+      # The same person and session recording again are kept under new keys.
+      again = "said after the disposal #{n}"
+      assert :ok = Store.put_content(handle, Ref.bytes(again), again, {one, student})
+      assert {:ok, ^again} = Store.get_content(handle, Ref.bytes(again), one)
+      assert :error = Store.get_content(handle, Ref.bytes(first), one)
+      refute Store.content_disposed?(handle, Ref.bytes(again), one)
+
+      # A disposal dated before a session began leaves that session alone,
+      # and a person with nothing left to make unreadable is not live.
+      before = %{
+        ref: Ref.evidence("before #{n}"),
+        at: DateTime.add(DateTime.utc_now(), -60, :second)
+      }
+
+      assert [] == Store.live_scopes(handle, [student], before.at)
+      assert :none = Store.dispose_content(handle, student, before)
+      assert {:ok, ^again} = Store.get_content(handle, Ref.bytes(again), one)
+    end
+
+    test "a subject is not disposed of while a record of one of its sessions must be kept",
+         %{handle: handle} = ctx do
+      handle = Map.put(handle, :subjects, ~r/^urn:r5e:student:/)
+      pipeline = ctx.start.({Store, handle})
+      n = System.unique_integer([:positive])
+      student = "urn:r5e:student:test:kept-#{n}"
+      session = "urn:r5e:session:test:kept-#{n}"
+      said = "kept for a while #{n}"
+
+      {:ok, _} =
+        Pipeline.capture(
+          pipeline,
+          tool_call(%{
+            session: session,
+            on_behalf_of: student,
+            attachments: [%{name: "args", bytes: said}]
+          })
+        )
+
+      :ok = Pipeline.flush(pipeline)
+
+      key = "subject:" <> student
+
+      assert %{rows: [[^key]]} =
+               Repo.query!("SELECT under FROM evidence_content_keys WHERE scope = $1", [session])
+
+      # The session existed when the disposal is dated, and its record did not allow it yet.
+      Repo.query!(
+        "UPDATE evidence_content_keys SET created_at = now() - interval '2 minutes' WHERE scope = $1",
+        [session]
+      )
+
+      early = %{
+        ref: Ref.evidence("early #{n}"),
+        at: DateTime.add(DateTime.utc_now(), -60, :second)
+      }
+
+      assert {:error, {:kept_until, _ref}} = Store.dispose_content(handle, student, early)
+      assert {:ok, ^said} = Store.get_content(handle, Ref.bytes(said), session)
+
+      assert :ok = Store.dispose_content(handle, student, disposal())
+      assert :error = Store.get_content(handle, Ref.bytes(said), session)
+    end
+
     test "a key service that cannot be reached is an outage, never content lost",
          %{dir: dir, start: start} do
       alias Recurse.Providers.Impls.FakeKeyService
