@@ -63,6 +63,8 @@ export interface EvidenceRecordEntry {
   capturedAt: string;
   actor?: string | null;
   session?: string | null;
+  policyOutcome?: PolicyOutcome | null;
+  target?: string | null;
   envelope: SignedEvidenceEnvelope;
   /** Only populated on single-record detail (`GET /v1/evidence/records/:ref`), never on list rows. */
   sealRef?: string | null;
@@ -316,20 +318,112 @@ export function contentRefOf(payload: EvidenceEnvelopePayload | null): string | 
   return typeof ref === "string" && ref.startsWith("bytes:sha256:") ? ref : null;
 }
 
-export function targetDisplayOf(payload: EvidenceEnvelopePayload | null): string {
-  if (!payload?.body) return "—";
+export interface EvidenceHistogramBucket {
+  start: string;
+  count: number;
+  byOutcome?: Record<string, number>;
+}
+
+export interface EvidenceHistogramResponse {
+  since: string;
+  until: string;
+  bucketSeconds: number;
+  buckets: EvidenceHistogramBucket[];
+}
+
+export interface EvidenceFacetBucket {
+  value: string;
+  count: number;
+}
+
+export interface EvidenceFacetsResponse {
+  total: number;
+  facets: {
+    kind: EvidenceFacetBucket[];
+    policyOutcome: EvidenceFacetBucket[];
+    target: EvidenceFacetBucket[];
+  };
+}
+
+export interface TargetDisplay {
+  primary: string;
+  secondary?: string;
+}
+
+export function targetDetailOf(payload: EvidenceEnvelopePayload | null): TargetDisplay {
+  if (!payload?.body) return { primary: "—" };
   const body = payload.body;
-  if (typeof body.tool === "string") return body.tool;
-  if (typeof body.model === "string") {
-    const provider = typeof body.provider === "string" ? `${body.provider}/` : "";
-    return `${provider}${body.model}`;
+  const details =
+    body.details && typeof body.details === "object"
+      ? (body.details as Record<string, unknown>)
+      : null;
+  const evalObj = policyEvaluationOf(payload);
+
+  if (typeof body.tool === "string" && body.tool.length > 0) {
+    const sub =
+      typeof details?.command === "string"
+        ? details.command
+        : typeof body.callId === "string"
+          ? body.callId
+          : undefined;
+    return { primary: body.tool, secondary: sub };
   }
-  if (typeof body.call === "string") return truncateRef(body.call);
-  if (typeof body.subject === "string") return truncateRef(body.subject);
-  if (typeof body.about === "string") return truncateRef(body.about);
-  if (typeof body.outcome === "string") return body.outcome;
-  if (typeof body.reason === "string") return body.reason;
-  return "—";
+
+  if (typeof body.model === "string" && body.model.length > 0) {
+    const provider = typeof body.provider === "string" ? `${body.provider}/` : "";
+    return { primary: `${provider}${body.model}` };
+  }
+
+  // Prefer human-readable details/reason over raw bytes:sha256: / evidence:sha256: hashes
+  const detailTool =
+    typeof details?.tool === "string"
+      ? details.tool
+      : typeof details?.action === "string"
+        ? details.action
+        : typeof details?.target === "string"
+          ? details.target
+          : typeof details?.rule_id === "string"
+            ? details.rule_id
+            : typeof details?.ruleId === "string"
+              ? details.ruleId
+              : null;
+
+  const refSecondary =
+    typeof body.subject === "string"
+      ? truncateRef(body.subject, 10)
+      : typeof body.call === "string"
+        ? truncateRef(body.call, 10)
+        : typeof body.about === "string"
+          ? truncateRef(body.about, 10)
+          : undefined;
+
+  if (detailTool) {
+    return { primary: detailTool, secondary: evalObj?.reason ?? refSecondary };
+  }
+
+  if (evalObj?.reason) {
+    return { primary: evalObj.reason, secondary: refSecondary };
+  }
+
+  if (typeof body.outcome === "string") {
+    return { primary: body.outcome, secondary: refSecondary };
+  }
+  if (typeof body.reason === "string") {
+    return { primary: body.reason, secondary: refSecondary };
+  }
+  if (typeof body.call === "string") return { primary: truncateRef(body.call, 12) };
+  if (typeof body.subject === "string") return { primary: truncateRef(body.subject, 12) };
+  if (typeof body.about === "string") return { primary: truncateRef(body.about, 12) };
+  return { primary: "—" };
+}
+
+export function targetDisplayOf(payload: EvidenceEnvelopePayload | null): string {
+  return targetDetailOf(payload).primary;
+}
+
+export function formatActorShort(actor: string | null | undefined): string {
+  if (!actor) return "—";
+  return actor.replace(/^urn:r5e:/, "");
 }
 
 export function truncateRef(ref: string, keep = 12): string {

@@ -20,10 +20,17 @@ import { api } from "~/lib/api";
 import { authMePath, type AuthState } from "~/lib/auth";
 import type { AuthMe } from "~/lib/types";
 
+type AuthMeResponse = AuthMe & {
+  display_name?: string | null;
+  email?: string | null;
+  name?: string | null;
+  subject?: string | null;
+};
+
 export function useAuth(): AuthState {
-  const { data, isLoading, isError } = useQuery<AuthMe>({
+  const { data, isLoading, isError } = useQuery<AuthMeResponse>({
     queryKey: ["auth", "me"],
-    queryFn: () => api.get<AuthMe>(authMePath),
+    queryFn: () => api.get<AuthMeResponse>(authMePath),
     staleTime: 60_000,
     retry: false,
   });
@@ -35,7 +42,13 @@ export function useAuth(): AuthState {
 
   return {
     status: "authenticated",
-    principal: data.principal_subject,
+    principal:
+      data.display_name ||
+      data.email ||
+      data.name ||
+      data.principal_subject ||
+      data.subject ||
+      "",
     role: data.recurse_role,
     tenantId: data.tenant_id,
   };

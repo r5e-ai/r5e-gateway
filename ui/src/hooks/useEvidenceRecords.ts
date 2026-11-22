@@ -1,16 +1,20 @@
 // useEvidenceRecords — TanStack-Query infinite hook for `GET /v1/evidence/records`.
-// Provenance v2 list contract: keyset cursor over `(capturedAt, ref)`, limit default 50 max 200,
-// server-side filters: full `kind` path, `session`, `actor`, `since`, `until`.
+// Keyset cursor over `(capturedAt, ref)`, limit default 50 max 200.
+// Supports server-side filters: `kind`, `session`, `actor`, `since`, `until`,
+// `policyOutcome`, `target`, and `q`.
 
 import { useInfiniteQuery, type InfiniteData } from "@tanstack/react-query";
 
 import { api } from "~/lib/api";
 import { apiPaths } from "~/lib/apiPaths";
-import type { EvidenceListResponse } from "~/lib/evidenceTypes";
+import type { EvidenceListResponse, PolicyOutcome } from "~/lib/evidenceTypes";
 
 export interface EvidenceFilter {
   /** Open-string full kind path (e.g. "provenance.r5e.io/v2/ToolCall"). */
   kind?: string;
+  policyOutcome?: PolicyOutcome;
+  target?: string;
+  q?: string;
   actor?: string;
   session?: string;
   since?: string;
@@ -28,7 +32,16 @@ export function evidenceQueryKey(filter: EvidenceFilter): readonly unknown[] {
   return ["evidence-records", sorted] as const;
 }
 
-const ALLOWED_FILTER_KEYS = ["kind", "actor", "session", "since", "until"] as const;
+const ALLOWED_FILTER_KEYS = [
+  "kind",
+  "policyOutcome",
+  "target",
+  "q",
+  "actor",
+  "session",
+  "since",
+  "until",
+] as const;
 
 function buildPath(filter: EvidenceFilter, cursor: string | undefined): string {
   const params = new URLSearchParams();
