@@ -55,7 +55,8 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       `{"payload", "ticket", "signature": {"keyid", "sig"},
       "releasedBy", "authority"?}`.
     * `POST /v1/evidence/retention/disposals` — dispose of a scope's
-      content. Body: `{"scope", "reason", "action"?}`.
+      content. Body: `{"scope", "reason", "action"?}`. 409 when the
+      scope has no content key left to destroy.
       (`Recurse.Gateway.Provenance.Retention`.)
 
     * `POST /v1/evidence/sessions` — open a session for the caller and
@@ -699,6 +700,15 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   defp retention_answer(conn, _status, {:error, :malformed_request}),
     do: bad_request(conn, "the request does not describe a hold, a release or a disposal")
+
+  defp retention_answer(conn, _status, {:error, :nothing_to_dispose}),
+    do:
+      json(conn, 409, %{
+        "error" => "ERR_NOTHING_TO_DISPOSE",
+        "message" =>
+          "No content key is held for this scope, so nothing would be made unreadable: " <>
+            "its content was never encrypted, or was disposed of before. Nothing was recorded."
+      })
 
   # Another request took the next position on the stream; ask again.
   defp retention_answer(conn, _status, {:error, reason})

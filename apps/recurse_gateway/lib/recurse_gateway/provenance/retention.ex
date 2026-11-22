@@ -50,6 +50,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
           | :no_such_hold
           | :hold_already_released
           | :releaser_has_no_standing
+          | :nothing_to_dispose
           | {:under_hold, String.t()}
           | {:never_disposed_of | :kept_until | :profile_not_held, String.t()}
           | atom()
@@ -340,8 +341,11 @@ defmodule Recurse.Gateway.Provenance.Retention do
   `"expired"`) and `details`.
 
   Refused, with nothing recorded, while a hold covers anything in the
-  scope, or when any record in the scope was made under a profile that
-  does not yet allow it. Otherwise the disposal is recorded first and
+  scope, when any record in the scope was made under a profile that
+  does not yet allow it, or when the scope has no content key left to
+  destroy: content that was never encrypted, or was disposed of before,
+  cannot be made unreadable now, and a record saying it was would be
+  false. Otherwise the disposal is recorded first and
   the scope's key destroyed after, so content is never gone without a
   record saying so.
   """
@@ -364,6 +368,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
          :ok <- may_record(info, @disposal),
          {:ok, ended} <- holds_over(info, scope, at),
          :ok <- module.disposal_allowed(handle, scope, at),
+         :ok <- key_left(module, handle, scope),
          {:ok, receipt} <- record(info, @disposal, body, on_behalf_of, at) do
       # Holds that touched this scope and have ended, by a release that
       # counts or by running out, give up their locks now, so that what
@@ -412,6 +417,14 @@ defmodule Recurse.Gateway.Provenance.Retention do
   end
 
   def dispose(_request, _on_behalf_of), do: {:error, :malformed_request}
+
+  # A disposal destroys a key. With none left there is nothing it can do.
+  defp key_left(module, handle, scope) do
+    case module.live_scopes(handle, [scope]) do
+      [] -> {:error, :nothing_to_dispose}
+      _live -> :ok
+    end
+  end
 
   # The holds that touch a scope: one that names the scope, or names a
   # record made under it or content such a record refers to. If any is

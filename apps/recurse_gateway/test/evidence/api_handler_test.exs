@@ -17,7 +17,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
   alias Recurse.Gateway.Provenance.{Runtime, SessionName}
   alias Recurse.Gateway.Test.JwtTestHelper
   alias Recurse.Provenance.{Body, Export, Key, Pipeline, Ref}
-  alias Recurse.Providers.Impls.PostgresEvidenceStore
+  alias Recurse.Providers.Impls.{LocalKeyService, PostgresEvidenceStore}
   alias Recurse.Providers.Impls.PostgresMerkleLedger
   alias Recurse.Providers.Repo
 
@@ -26,7 +26,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
   @args ~s({"command":"ls"})
   @policy "permit(principal, action, resource);"
 
-  setup %{tmp_dir: tmp_dir} do
+  setup %{tmp_dir: tmp_dir} = ctx do
     :ok = Sandbox.checkout(Repo)
     Sandbox.mode(Repo, {:shared, self()})
 
@@ -71,11 +71,25 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
 
     deployment = "api-#{System.unique_integer([:positive])}"
 
+    # Content is encrypted only where a test asks: the handler opens the
+    # store from the node's settings, so the key file is named there too.
+    {store, restore} =
+      if ctx[:encrypted] do
+        key_file = Path.join(tmp_dir, "content.key")
+        :ok = LocalKeyService.generate(key_file)
+        {:ok, keys} = LocalKeyService.open(key_file)
+
+        {{PostgresEvidenceStore, %{repo: Repo, keys: {LocalKeyService, keys}}},
+         [put_env(:evidence_content_key_file, key_file) | restore]}
+      else
+        {{PostgresEvidenceStore, Repo}, restore}
+      end
+
     start_supervised!(
       {Runtime,
        deployment: deployment,
        signer: Key.generate("ed25519"),
-       store: {PostgresEvidenceStore, Repo},
+       store: store,
        retention: {:keep_for_seconds, 0},
        dir: tmp_dir,
        partitions: 1,
@@ -222,6 +236,15 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       filter: filter
     }
   end
+
+  defp dispose(scope),
+    do:
+      ApiHandler.dispose(
+        request(:post, "/v1/evidence/retention/disposals",
+          body: %{"scope" => scope, "reason" => "erasure request"},
+          role: "platform_operator"
+        )
+      )
 
   defp content(ref, bytes_ref, opts \\ []),
     do:
@@ -443,25 +466,34 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert content("not-a-ref", args_ref).status == 404
     end
 
-    test "a disposal that could destroy nothing leaves the content readable", ctx do
+    test "where content is not encrypted a disposal is refused and nothing is recorded", ctx do
       [%{ref: ref} | _] = ctx.receipts
 
-      # This deployment has no key service, so content is held as it is
-      # and there is no key to destroy. The disposal says so in its answer.
-      disposed =
-        ApiHandler.dispose(
-          request(:post, "/v1/evidence/retention/disposals",
-            body: %{"scope" => recorded(ctx.session), "reason" => "erasure request"},
-            role: "platform_operator"
-          )
-        )
+      refused = dispose(recorded(ctx.session))
 
-      assert disposed.status == 201
-      assert %{"outcome" => "nothing_encrypted_under_scope"} = body(disposed)
+      assert refused.status == 409
+      assert %{"error" => "ERR_NOTHING_TO_DISPOSE"} = body(refused)
 
-      # What is still held is still served: 410 is only for content that
-      # can no longer be read.
+      assert %{"records" => []} =
+               body(records(%{"kind" => "provenance.r5e.io/v2/PayloadDisposition"}))
+
       assert content(ref, Ref.bytes(@args)).status == 200
+    end
+
+    @tag :encrypted
+    test "disposed content answers 410, and cannot be disposed of twice", ctx do
+      [%{ref: ref} | _] = ctx.receipts
+      assert content(ref, Ref.bytes(@args)).resp_body == @args
+
+      disposed = dispose(recorded(ctx.session))
+      assert disposed.status == 201
+      assert %{"outcome" => "disposed"} = body(disposed)
+
+      gone = content(ref, Ref.bytes(@args))
+      assert gone.status == 410
+      assert %{"error" => "ERR_CONTENT_DISPOSED"} = body(gone)
+
+      assert dispose(recorded(ctx.session)).status == 409
     end
   end
 
