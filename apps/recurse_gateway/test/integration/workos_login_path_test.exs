@@ -388,6 +388,8 @@ defmodule RecurseGateway.Integration.WorkosLoginPathTest do
 
       auth_me_body = JSON.decode!(auth_me_out.resp_body)
       assert auth_me_body["principal_subject"] == @workos_user_id
+      # The name the identity provider gave, for the console to show.
+      assert auth_me_body["display_name"] == "Thomas"
       assert auth_me_body["tenant_id"] == @workos_default_org_id
       assert auth_me_body["recurse_role"] == "platform_operator"
       assert is_binary(auth_me_body["browser_session_id"])
