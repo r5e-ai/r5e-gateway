@@ -204,8 +204,7 @@ defmodule Recurse.Gateway.Admin.McpRegistryHandlerQuarantineTest do
 
       assert conn.status == 200
 
-      assert_receive {:ui_receipt_emitted,
-                      %{event_kind: :ui_mcp_quarantine, reason: nil}},
+      assert_receive {:ui_receipt_emitted, %{event_kind: :ui_mcp_quarantine, reason: nil}},
                      2_000
     end
 
@@ -247,7 +246,8 @@ defmodule Recurse.Gateway.Admin.McpRegistryHandlerQuarantineTest do
       assert get_in(result, ["entry", "policy_constraints", "rate_limit_per_minute"]) == 60
 
       # Snapshot fields are dropped on restore (no leftover state).
-      assert get_in(result, ["entry", "policy_constraints", "pre_quarantine_cedar_policies"]) == nil
+      assert get_in(result, ["entry", "policy_constraints", "pre_quarantine_cedar_policies"]) ==
+               nil
 
       assert get_in(result, [
                "entry",
@@ -607,14 +607,11 @@ defmodule Recurse.Gateway.Admin.McpRegistryHandlerQuarantineTest do
   # ---------------------------------------------------------------------------
 
   defp copy_registry_to_tmp do
-    source =
-      Path.join([
-        Application.app_dir(:recurse_gateway, "priv"),
-        "mcp_registry",
-        "registry.json"
-      ])
+    source = Path.expand("../fixtures/mcp_registry/sample-registry.json", __DIR__)
 
-    tmp_dir = Path.join(System.tmp_dir!(), "mcp-registry-test-#{System.unique_integer([:positive])}")
+    tmp_dir =
+      Path.join(System.tmp_dir!(), "mcp-registry-test-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(tmp_dir)
     tmp_path = Path.join(tmp_dir, "registry.json")
     File.cp!(source, tmp_path)

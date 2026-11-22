@@ -27,7 +27,13 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
 
   setup do
     :persistent_term.erase({Loader, :registry})
-    Application.delete_env(:recurse_gateway, :mcp_registry_path)
+    # A registry with servers in it; the one a deployment ships with is empty.
+    Application.put_env(
+      :recurse_gateway,
+      :mcp_registry_path,
+      Path.expand("../fixtures/mcp_registry/sample-registry.json", __DIR__)
+    )
+
     :ok = Loader.load!()
 
     # Stub provider registry — telemetry-only emission path (no real ledger
@@ -44,6 +50,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandlerTest do
 
     on_exit(fn ->
       ProviderRegistry.uninstall()
+      Application.delete_env(:recurse_gateway, :mcp_registry_path)
       :persistent_term.erase({Loader, :registry})
     end)
 

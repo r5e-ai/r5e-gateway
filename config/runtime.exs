@@ -729,6 +729,9 @@ config :recurse_gateway,
   # Whose definitions this deployment admits while running, and about
   # which domains: "key:…=r5e.io key:…=acme.example". Unset, none.
   evidence_publishers: env.("R5E_EVIDENCE_PUBLISHERS"),
+  # The file listing the MCP servers this deployment knows. Unset, the
+  # deployment starts with none.
+  mcp_registry_path: env.("R5E_MCP_REGISTRY_PATH"),
   evidence_content_key_file: env.("R5E_EVIDENCE_CONTENT_KEY_FILE"),
   evidence_start_chain?: env_bool.("R5E_EVIDENCE_START_CHAIN", false),
   # Serve what was provided to the public with no login. Off unless set.
