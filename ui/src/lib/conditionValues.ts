@@ -7,7 +7,7 @@
 //
 //   - chip-list  (`in` kind):       string[]  (also tolerates legacy
 //                                              comma-blob `"a,b,c"` from
-//                                              from-receipt skeletons)
+//                                              draft skeletons)
 //   - ISO range  (`time_window`):   [start, end]  (also tolerates legacy
 //                                                  `"start..end"` string)
 //
@@ -22,7 +22,7 @@
  * Accepted inputs:
  *   - string[]  → filtered to non-empty entries (after String() coercion)
  *   - string    → split on `,`, trimmed, non-empty entries kept
- *                 (legacy comma-blob shape; from-receipt skeletons may
+ *                 (legacy comma-blob shape; draft skeletons may
  *                 emit this on the backend round-trip)
  *   - anything else (number, boolean, null, undefined, object) → []
  *

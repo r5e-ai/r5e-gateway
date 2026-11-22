@@ -23,9 +23,8 @@
 // a future iteration where the gateway emits an axis-coverage report.
 //
 // State is fully controlled — the parent owns the array. Conditions are
-// stored on the draft as `condition_metadata`; the parent regenerates the
-// Cedar source skeleton from scope + conditions when in Draft-from-Receipt
-// mode (we keep the Cedar-string generation in one place to avoid drift).
+// stored on the draft as `condition_metadata`; the parent generates the
+// Cedar source skeleton from scope + conditions in Draft mode.
 //
 // Wire-shape note: each row emits `{kind, attr, value}` — `kind` is the
 // backend-required discriminator (per `PolicyDraft.changeset/2`'s
@@ -44,35 +43,26 @@ interface Props {
 
 type ConditionKind = PolicyDraftConditionKind;
 
-// Canonical Cedar axes per `09-cedar-reference.md`. Ordered by likely
-// frequency (tool_kind / verb top because they're the spine of every
-// suggestion-engine template).
+// Canonical CedarToolUseGate axes per `priv/cedar/schema.cedarschema.json`.
 const CANONICAL_ATTRIBUTES: ReadonlyArray<{ key: string; hint: string }> = [
-  { key: "resource.tags.tool_kind", hint: 'e.g. "bash" / "edit" / "mcp"' },
-  { key: "resource.tags.verb", hint: 'e.g. "rm" / "Edit" / "query_metrics"' },
-  { key: "resource.tags.argument_body", hint: "the action subject" },
-  { key: "resource.tags.scope_kind", hint: 'e.g. "file_outside_workdir"' },
-  { key: "resource.tags.category", hint: 'e.g. "subprocess_exec"' },
-  { key: "resource.tags.target_resources", hint: "list of touched resources" },
-  { key: "resource.tags.semantic_args.host", hint: "webfetch host" },
-  { key: "resource.tags.semantic_args.scheme", hint: "http / https" },
-  { key: "resource.tags.semantic_args.outside_workdir", hint: "true / false" },
-  { key: "resource.tags.semantic_args.file_path", hint: "edit/read path" },
-  { key: "resource.tags.semantic_args.server", hint: "mcp server" },
-  { key: "resource.tags.semantic_args.tool", hint: "mcp tool" },
-  { key: "resource.tags.semantic_args.subagent_type", hint: "agent dispatch" },
-  { key: "principal.subject", hint: "for obo_human" },
-  { key: "principal.kind", hint: "obo_human / service_account / autonomous" },
-  { key: "principal.tenant_id", hint: "tenant identifier" },
-  { key: "principal.role", hint: "platform_operator / …" },
-  { key: "context.session_age_seconds", hint: "how long the session has been open" },
+  { key: "context.tool_args.command", hint: 'e.g. "rm -rf" (requires `context has tool_args`)' },
+  { key: "context.tool_args.path", hint: "file path argument" },
+  { key: "context.tool_args.url", hint: "outbound URL argument" },
+  { key: "context.model", hint: 'e.g. "claude-sonnet-4-5"' },
+  { key: "context.tenant", hint: 'e.g. "r5e-dev"' },
+  { key: "context.upstream_domain", hint: 'e.g. "api.anthropic.com"' },
+  { key: "context.transport", hint: '"https_sse" | "wss"' },
+  { key: "context.estimated_completion_tokens", hint: "numeric token budget" },
+  { key: "context.tool_args_size_bytes", hint: "args payload size in bytes" },
+  { key: "context.parallel_tool_call_index", hint: "-1 sequential or >=0 parallel index" },
+  { key: "principal.kind", hint: '"obo_human" | "service_account" | "autonomous"' },
+  { key: "context.principal_kind", hint: '"obo_human" | "service_account" | "autonomous"' },
+  { key: "context.session_id", hint: "urn:r5e:session:..." },
 ];
 
 const CONDITION_TEMPLATES: ReadonlyArray<{
   kind: ConditionKind;
   label: string;
-  /** Shape of the value input (chip-list for `in`, ISO range tuple for
-   *  `time_window`, single text otherwise). */
   valueShape: "single" | "chips" | "range";
   defaultAttr: string;
   valuePlaceholder: string;
@@ -82,23 +72,23 @@ const CONDITION_TEMPLATES: ReadonlyArray<{
     kind: "eq",
     label: "Attribute equals",
     valueShape: "single",
-    defaultAttr: "resource.tags.tool_kind",
-    valuePlaceholder: 'value (e.g. "bash")',
+    defaultAttr: "context.model",
+    valuePlaceholder: 'value (e.g. "claude-sonnet-4-5")',
     hint: "<key> == <value>",
   },
   {
     kind: "neq",
     label: "Attribute differs from",
     valueShape: "single",
-    defaultAttr: "resource.tags.tool_kind",
-    valuePlaceholder: 'value (e.g. "bash")',
+    defaultAttr: "context.upstream_domain",
+    valuePlaceholder: 'value (e.g. "api.openai.com")',
     hint: "<key> != <value>",
   },
   {
     kind: "in",
     label: "Attribute in set",
     valueShape: "chips",
-    defaultAttr: "resource.tags.verb",
+    defaultAttr: "context.model",
     valuePlaceholder: "value (press Enter or comma to add)",
     hint: "<key> in [a, b, …]",
   },
@@ -106,15 +96,8 @@ const CONDITION_TEMPLATES: ReadonlyArray<{
     kind: "time_window",
     label: "Time window",
     valueShape: "range",
-    // Per F009 — `defaultAttr` is `context.timestamp` (matches the ISO
-    // range placeholder). The pre-fix default was
-    // `context.session_age_seconds`, which is a numeric (seconds-since-
-    // session-start) axis incompatible with an ISO range; now that the
-    // splicer honors `attr` (F007), the operator MAY override this to
-    // `context.session_age_seconds` if they're authoring numeric bounds
-    // — but the default lines up with the placeholder shape.
-    defaultAttr: "context.timestamp",
-    valuePlaceholder: "ISO range (e.g. 2026-04-24T09:00Z..17:00Z)",
+    defaultAttr: "context.started_at",
+    valuePlaceholder: "ISO range (e.g. 2026-11-22T09:00Z..17:00Z)",
     hint: "<attr> >= ts1 && <attr> <= ts2",
   },
   {

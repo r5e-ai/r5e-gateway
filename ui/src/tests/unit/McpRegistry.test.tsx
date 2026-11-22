@@ -69,7 +69,7 @@ const mockEntries: McpRegistryEntry[] = [
     transport: "http",
     trust_tier: "verified",
     publisher: "r5e-group",
-    capabilities: { tools: [{ name: "list_receipts", description: "list" }] },
+    capabilities: { tools: [{ name: "list_records", description: "list" }] },
     policy_constraints: { cedar_policies: [], rate_limit_per_minute: 60 },
     sbom: {
       format: "cyclonedx-1.5-subset",

@@ -27,7 +27,7 @@ describe("ConditionBuilder — F4 5-kind condition builder", () => {
     // entry; `:op` is rejected with "every entry must be a map with a
     // :kind key".
     expect(onChange).toHaveBeenCalledWith([
-      { kind: "eq", attr: "resource.tags.tool_kind", value: "" },
+      { kind: "eq", attr: "context.model", value: "" },
     ]);
   });
 

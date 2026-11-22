@@ -94,7 +94,7 @@ const baseEntries: McpRegistryEntry[] = [
     transport: "http",
     trust_tier: "verified",
     publisher: "r5e-group",
-    capabilities: { tools: [{ name: "list_receipts", description: "list" }] },
+    capabilities: { tools: [{ name: "list_records", description: "list" }] },
     policy_constraints: { cedar_policies: [], rate_limit_per_minute: 60 },
     sbom: {
       format: "cyclonedx-1.5-subset",
@@ -218,7 +218,7 @@ describe("McpRegistryDetail PATCH mutation", () => {
     // Banner shows quarantine confirmation copy.
     const banner = await screen.findByTestId("mcp-detail-quarantine-status");
     expect(banner.textContent ?? "").toMatch(/quarantined/i);
-    expect(banner.textContent ?? "").toMatch(/receipt emitted/i);
+    expect(banner.textContent ?? "").toMatch(/provenance recorded/i);
 
     // Dialog closed on success.
     expect(screen.queryByTestId("mcp-detail-quarantine-dialog")).toBeNull();

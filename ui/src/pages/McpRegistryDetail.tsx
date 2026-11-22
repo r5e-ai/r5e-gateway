@@ -1,8 +1,7 @@
 // MCP Registry Detail — single-entry view with full SBOM + CVE breakdown.
 //
-// Per design/briefs/07-mcp-registry.md (F7) — the demo's "click here, see
-// SBOM, see CVE, here's the actual receipt of a tool call you can curl
-// right now" surface. Sections:
+// Per design/briefs/07-mcp-registry.md (F7) — SBOM, CVE breakdown, and
+// quarantine workflow for trusted MCP servers. Sections:
 //
 //   1. Header  — back-link to list + entry name as H1.
 //   2. Overview  — 2-column key/value (TRUST TIER, PUBLISHER, VERSION,
@@ -20,7 +19,7 @@
 //   - <QuarantineButton /> visible to platform_operator role only.
 //   - Opens a confirmation dialog; on confirm PATCHes the registry
 //     entry (`PATCH /v1/mcp/registry/<id>`) with the new trust_tier;
-//     backend emits the attested receipt and updates the policy
+//     backend records the quarantine change and updates the policy
 //     bundle. We invalidate the registry cache + show a success
 //     status banner.
 //
@@ -553,8 +552,8 @@ function QuarantineButton({ entry }: { entry: McpRegistryEntry }): JSX.Element {
       setStatusBanner({
         kind: "success",
         message: isQuarantined
-          ? `${entry.name} restored to ${targetTier}. Receipt emitted.`
-          : `${entry.name} quarantined. Cedar deny policy added; receipt emitted.`,
+          ? `${entry.name} restored to ${targetTier}. Provenance recorded.`
+          : `${entry.name} quarantined. Cedar deny policy added; provenance recorded.`,
       });
       setDialogError(null);
       setOpen(false);
@@ -660,16 +659,15 @@ function QuarantineDialog({
               This will set <code className="font-mono">trust_tier=quarantined</code>{" "}
               and add a forbid policy for all tool calls against this server.
               Existing in-flight tool calls will be denied. The change is
-              itself attested as a{" "}
-              <code className="font-mono">:ui_mcp_quarantine</code> receipt.
+              recorded as a Provenance v2 event.
             </>
           ) : (
             <>
               This will set{" "}
               <code className="font-mono">trust_tier={targetTier}</code> and
               remove the forbid policy. Tool calls become subject to the
-              global Cedar bundle only. The change is attested as a{" "}
-              <code className="font-mono">:ui_mcp_quarantine</code> receipt.
+              global Cedar bundle only. The change is recorded as a Provenance v2
+              event.
             </>
           )}
         </p>

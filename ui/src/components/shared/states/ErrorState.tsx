@@ -7,7 +7,7 @@
 //   - Optional retry button (`r5e-danger` outline).
 //   - Optional secondary link (e.g., "View pipeline status").
 //
-// Used by ReceiptDetail (US2 fetch failure) and ReceiptDetail's
+// Used by RecordDetail, Dashboard, and PolicySimulator on fetch failures.
 // payload tab (gone-shape) — extracted from the inline ErrorState
 // implementations in those modules.
 //

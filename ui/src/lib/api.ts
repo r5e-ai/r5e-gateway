@@ -2,9 +2,8 @@
 //
 // Per contracts/frontend_architecture.md §"Error handling":
 //   - Cookie-aware (credentials: 'include') — never reads/sends JWTs directly.
-//   - Normalizes non-2xx responses to the F001 error envelope shape and throws
-//     `ApiError` with `attested_run_id` so the error UX can deep-link to the
-//     denial receipt.
+//   - Normalizes non-2xx responses to the error envelope shape and throws
+//     `ApiError` with `attested_run_id` when the backend supplies one.
 //   - Skeletal runtime schema validation hook (`validateAgainstSchema`) — full
 //     zod schemas land in T043 alongside generated types.
 //
@@ -29,9 +28,7 @@ import {
  * F001 error-envelope shape (mirrored from
  * apps/recurse_gateway/priv/schemas/error_envelope.schema.json).
  *
- * `attested_run_id` is present for forbidden errors that produced a denial
- * receipt; the SPA uses it to render a "View attested receipt" link in error
- * toasts.
+ * Optional denial provenance reference surfaced in error toasts.
  */
 export type ApiErrorEnvelope = {
   error: string;

@@ -69,10 +69,10 @@ describe("Login (F8)", () => {
   });
 
   it("respects an inbound ?return_to= query param", () => {
-    renderWithSearch("?return_to=%2Fadmin%2Fpolicy-simulator%2Fsuggestions");
+    renderWithSearch("?return_to=%2Fadmin%2Fpolicy-simulator");
     const cta = screen.getByTestId("login-sso-button");
     expect(cta.getAttribute("href")).toBe(
-      `/admin/login/start?return_to=${encodeURIComponent("/admin/policy-simulator/suggestions")}`,
+      `/admin/login/start?return_to=${encodeURIComponent("/admin/policy-simulator")}`,
     );
   });
 
