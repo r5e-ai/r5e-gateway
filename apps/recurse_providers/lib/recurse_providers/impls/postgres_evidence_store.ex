@@ -242,7 +242,8 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
 
   @doc """
   How many records match, and how they divide by kind, by how policy
-  decided, and by what was called (the twenty most frequent). `asked`
+  decided, by what was called and by the reason a decision gave (the
+  twenty most frequent of each of the last two). `asked`
   narrows as it does for `list/2`; its limit and position are ignored.
   The counts are of every matching record, not of a page of them.
 
@@ -262,7 +263,7 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
 
     kinds =
       repo.all(
-        from(r in matching(Map.delete(asked, :kind_path)),
+        from(r in matching(Map.drop(asked, [:kind_path, :kind_paths])),
           group_by: r.kind_path,
           order_by: [desc: count(r.ref), asc: r.kind_path],
           select: {r.kind_path, count(r.ref)}
@@ -288,7 +289,8 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
        facets: %{
          "kind" => kinds,
          "policyOutcome" => labelled.("policyOutcome", :policy_outcome, 50),
-         "target" => labelled.("target", :target, 20)
+         "target" => labelled.("target", :target, 20),
+         "reason" => labelled.("reason", :reason, 20)
        }
      }}
   rescue
@@ -381,8 +383,14 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
       {:actor, actor}, query ->
         where(query, [r], r.actor == ^actor)
 
+      {:kind_paths, kinds}, query ->
+        where(query, [r], r.kind_path in ^kinds)
+
       {:policy_outcome, outcome}, query ->
         labelled(query, "policyOutcome", outcome)
+
+      {:reason, reason}, query ->
+        labelled(query, "reason", reason)
 
       {:target, target}, query ->
         labelled(query, "target", target)

@@ -157,14 +157,19 @@ defmodule Recurse.Provenance.Evidence do
   @doc """
   What a record can be searched and counted by, beyond its kind, actor
   and session: how policy decided (`policyOutcome`) and what was called
-  (`target`: a tool, a named target, or a provider and model). Read from the body
+  (`target`: a tool, a named target, or a provider and model), and the
+  reason a policy decision gave (`reason`). Read from the body
   wherever a record has them, whatever its kind, so a new kind that
   carries a policy decision is found without anything being told about
   it. Empty for a record with neither.
   """
   @spec labels(t()) :: %{optional(String.t()) => String.t()}
   def labels(%{"body" => %{} = body}) do
-    for {name, value} <- [{"policyOutcome", outcome_of(body)}, {"target", target_of(body)}],
+    for {name, value} <- [
+          {"policyOutcome", outcome_of(body)},
+          {"target", target_of(body)},
+          {"reason", reason_of(body)}
+        ],
         is_binary(value) and value != "",
         into: %{},
         do: {name, value}
@@ -175,6 +180,10 @@ defmodule Recurse.Provenance.Evidence do
   defp outcome_of(%{"policy" => %{"outcome" => outcome}}), do: outcome
   defp outcome_of(%{"evaluation" => %{"outcome" => outcome}}), do: outcome
   defp outcome_of(_body), do: nil
+
+  defp reason_of(%{"policy" => %{"reason" => reason}}), do: reason
+  defp reason_of(%{"evaluation" => %{"reason" => reason}}), do: reason
+  defp reason_of(_body), do: nil
 
   defp target_of(%{"tool" => tool}) when is_binary(tool), do: tool
   defp target_of(%{"details" => %{"target" => target}}) when is_binary(target), do: target

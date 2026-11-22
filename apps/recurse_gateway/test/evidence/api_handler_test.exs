@@ -655,6 +655,55 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert {:ok, _, 0} = DateTime.from_iso8601(hd(buckets)["start"])
     end
 
+    test "several kinds are asked for together, and counted as one view" do
+      %{"records" => calls} = body(records(%{"kind" => @tool_call, "limit" => "200"}))
+      opened = "provenance.r5e.io/v2/EpochSeal"
+      %{"records" => openings} = body(records(%{"kind" => opened, "limit" => "200"}))
+      assert openings != []
+
+      both = @tool_call <> "," <> opened
+      %{"records" => together} = body(records(%{"kind" => both, "limit" => "200"}))
+      assert length(together) == length(calls) + length(openings)
+
+      assert %{"total" => total, "facets" => %{"kind" => kinds}} = body(facets(%{"kind" => both}))
+      assert total == length(together)
+      assert count_of(kinds, @tool_call) == length(calls)
+      assert count_of(kinds, opened) == length(openings)
+    end
+
+    test "a decision's reason is on the row, narrows the list and is counted" do
+      {:ok, _} =
+        Pipeline.capture(Runtime.pipeline(), %{
+          kind_path: "provenance.r5e.io/v2/ToolCall",
+          actor: @alice,
+          session: recorded("reasoned"),
+          attachments: [%{name: "args", bytes: @args}],
+          blobs: [@policy],
+          body:
+            Body.tool_call(
+              tool: "Bash",
+              content_ref: "attachment:args",
+              media_type: "application/json",
+              size: byte_size(@args),
+              policy:
+                Body.policy_evaluation(
+                  policy_ref: Ref.bytes(@policy),
+                  outcome: "deny",
+                  reason: "not_allowed_here",
+                  input_refs: ["attachment:args"]
+                )
+            )
+        })
+
+      {:ok, _} = Runtime.seal()
+
+      assert %{"records" => [%{"reason" => "not_allowed_here", "policyOutcome" => "deny"}]} =
+               body(records(%{"reason" => "not_allowed_here"}))
+
+      assert %{"facets" => %{"reason" => reasons}} = body(facets(%{}))
+      assert count_of(reasons, "not_allowed_here") == 1
+    end
+
     test "what is asked for is checked" do
       assert histogram(%{}).status == 400
 
