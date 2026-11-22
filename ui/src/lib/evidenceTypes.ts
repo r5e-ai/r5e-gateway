@@ -65,10 +65,27 @@ export interface EvidenceRecordEntry {
   session?: string | null;
   policyOutcome?: PolicyOutcome | null;
   target?: string | null;
+  reason?: string | null;
   envelope: SignedEvidenceEnvelope;
   /** Only populated on single-record detail (`GET /v1/evidence/records/:ref`), never on list rows. */
   sealRef?: string | null;
 }
+
+export const ACTIVITY_KINDS: ReadonlyArray<string> = [
+  "provenance.r5e.io/v2/ModelCall",
+  "provenance.r5e.io/v2/ModelResponse",
+  "provenance.r5e.io/v2/ToolCall",
+  "provenance.r5e.io/v2/ToolResult",
+  "provenance.r5e.io/v2/PolicyDecision",
+  "provenance.r5e.io/v2/SessionOpened",
+  "provenance.r5e.io/v2/SessionClosed",
+  "provenance.r5e.io/v2/Disclosure",
+  "provenance.r5e.io/v2/PayloadDisposition",
+  "provenance.r5e.io/v2/RetentionHold",
+  "provenance.r5e.io/v2/RetentionHoldRelease",
+];
+
+export const ACTIVITY_KIND_PARAM = ACTIVITY_KINDS.join(",");
 
 export interface EvidenceListResponse {
   records: EvidenceRecordEntry[];
@@ -342,6 +359,7 @@ export interface EvidenceFacetsResponse {
     kind: EvidenceFacetBucket[];
     policyOutcome: EvidenceFacetBucket[];
     target: EvidenceFacetBucket[];
+    reason?: EvidenceFacetBucket[];
   };
 }
 
@@ -350,70 +368,45 @@ export interface TargetDisplay {
   secondary?: string;
 }
 
-export function targetDetailOf(payload: EvidenceEnvelopePayload | null): TargetDisplay {
-  if (!payload?.body) return { primary: "—" };
+export function reasonOf(payload: EvidenceEnvelopePayload | null): string | null {
+  if (!payload?.body) return null;
+  const evalObj = policyEvaluationOf(payload);
+  if (evalObj?.reason && evalObj.reason.trim().length > 0) {
+    return evalObj.reason.trim();
+  }
+  return null;
+}
+
+/**
+ * Matches the server's `target` label extraction 1-to-1:
+ * `body.tool || body.details.target || provider/model || model`.
+ */
+export function serverTargetOf(payload: EvidenceEnvelopePayload | null): string | null {
+  if (!payload?.body) return null;
   const body = payload.body;
+  if (typeof body.tool === "string" && body.tool.trim().length > 0) {
+    return body.tool.trim();
+  }
   const details =
     body.details && typeof body.details === "object"
       ? (body.details as Record<string, unknown>)
       : null;
-  const evalObj = policyEvaluationOf(payload);
-
-  if (typeof body.tool === "string" && body.tool.length > 0) {
-    const sub =
-      typeof details?.command === "string"
-        ? details.command
-        : typeof body.callId === "string"
-          ? body.callId
-          : undefined;
-    return { primary: body.tool, secondary: sub };
+  if (typeof details?.target === "string" && details.target.trim().length > 0) {
+    return details.target.trim();
   }
-
-  if (typeof body.model === "string" && body.model.length > 0) {
-    const provider = typeof body.provider === "string" ? `${body.provider}/` : "";
-    return { primary: `${provider}${body.model}` };
+  if (typeof body.model === "string" && body.model.trim().length > 0) {
+    const provider =
+      typeof body.provider === "string" && body.provider.trim().length > 0
+        ? `${body.provider.trim()}/`
+        : "";
+    return `${provider}${body.model.trim()}`;
   }
+  return null;
+}
 
-  // Prefer human-readable details/reason over raw bytes:sha256: / evidence:sha256: hashes
-  const detailTool =
-    typeof details?.tool === "string"
-      ? details.tool
-      : typeof details?.action === "string"
-        ? details.action
-        : typeof details?.target === "string"
-          ? details.target
-          : typeof details?.rule_id === "string"
-            ? details.rule_id
-            : typeof details?.ruleId === "string"
-              ? details.ruleId
-              : null;
-
-  const refSecondary =
-    typeof body.subject === "string"
-      ? truncateRef(body.subject, 10)
-      : typeof body.call === "string"
-        ? truncateRef(body.call, 10)
-        : typeof body.about === "string"
-          ? truncateRef(body.about, 10)
-          : undefined;
-
-  if (detailTool) {
-    return { primary: detailTool, secondary: evalObj?.reason ?? refSecondary };
-  }
-
-  if (evalObj?.reason) {
-    return { primary: evalObj.reason, secondary: refSecondary };
-  }
-
-  if (typeof body.outcome === "string") {
-    return { primary: body.outcome, secondary: refSecondary };
-  }
-  if (typeof body.reason === "string") {
-    return { primary: body.reason, secondary: refSecondary };
-  }
-  if (typeof body.call === "string") return { primary: truncateRef(body.call, 12) };
-  if (typeof body.subject === "string") return { primary: truncateRef(body.subject, 12) };
-  if (typeof body.about === "string") return { primary: truncateRef(body.about, 12) };
+export function targetDetailOf(payload: EvidenceEnvelopePayload | null): TargetDisplay {
+  const canonical = serverTargetOf(payload);
+  if (canonical) return { primary: canonical };
   return { primary: "—" };
 }
 
@@ -421,9 +414,84 @@ export function targetDisplayOf(payload: EvidenceEnvelopePayload | null): string
   return targetDetailOf(payload).primary;
 }
 
+export function safeDecodeUri(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Decodes URL-encoded URNs into a concise operator-readable identity:
+ *   - `urn:r5e:principal:r5e-dev:alice%40example.test` -> `alice@example.test`
+ *   - `urn:r5e:user:alice%40example.test` -> `alice@example.test`
+ *   - `urn:r5e:workload:r5e-dev:edtech-tutor:97e9adbf4d3a` -> `edtech-tutor`
+ */
+export function formatIdentityDisplay(raw: string | null | undefined): string {
+  if (!raw) return "—";
+  const decoded = safeDecodeUri(raw);
+  if (!decoded.startsWith("urn:r5e:")) return decoded;
+  const parts = decoded.slice("urn:r5e:".length).split(":");
+  const kind = parts[0];
+  if ((kind === "principal" || kind === "user") && parts.length >= 2) {
+    return parts[parts.length - 1] || decoded;
+  }
+  if (kind === "workload" && parts.length >= 3) {
+    return parts[2] || parts[parts.length - 1] || decoded;
+  }
+  if (kind === "student" && parts.length >= 3) {
+    return `student:${truncateRef(parts.slice(2).join(":"), 8)}`;
+  }
+  return parts.join(":");
+}
+
 export function formatActorShort(actor: string | null | undefined): string {
-  if (!actor) return "—";
-  return actor.replace(/^urn:r5e:/, "");
+  return formatIdentityDisplay(actor);
+}
+
+export type TimeDisplayMode = "local" | "utc";
+
+export function formatUtcTimestamp(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return iso;
+    return d.toISOString().replace("T", " ").slice(0, 19) + "Z";
+  } catch {
+    return iso;
+  }
+}
+
+export function formatTimestamp(
+  iso: string,
+  mode: TimeDisplayMode,
+  nowMs = Date.now(),
+): { display: string; utc: string } {
+  const utc = formatUtcTimestamp(iso);
+  if (mode === "utc") return { display: utc, utc };
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return { display: iso, utc };
+  const diffMs = nowMs - ms;
+  if (diffMs >= 0 && diffMs < 24 * 60 * 60_000) {
+    const secs = Math.floor(diffMs / 1000);
+    if (secs < 45) return { display: "just now", utc };
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return { display: `${mins} min ago`, utc };
+    const hrs = Math.floor(mins / 60);
+    return { display: `${hrs} hr ago`, utc };
+  }
+  try {
+    const formatted = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(new Date(ms));
+    return { display: formatted, utc };
+  } catch {
+    return { display: utc, utc };
+  }
 }
 
 export function truncateRef(ref: string, keep = 12): string {

@@ -10,10 +10,11 @@ import { apiPaths } from "~/lib/apiPaths";
 import type { EvidenceListResponse, PolicyOutcome } from "~/lib/evidenceTypes";
 
 export interface EvidenceFilter {
-  /** Open-string full kind path (e.g. "provenance.r5e.io/v2/ToolCall"). */
+  /** Open-string full kind path or comma-separated list of kind paths. */
   kind?: string;
   policyOutcome?: PolicyOutcome;
   target?: string;
+  reason?: string;
   q?: string;
   actor?: string;
   session?: string;
@@ -36,6 +37,7 @@ const ALLOWED_FILTER_KEYS = [
   "kind",
   "policyOutcome",
   "target",
+  "reason",
   "q",
   "actor",
   "session",

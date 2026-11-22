@@ -6,6 +6,7 @@ import {
 } from "~/lib/evidenceColumns";
 import {
   formatActorShort,
+  reasonOf,
   targetDetailOf,
   type EvidenceEnvelopePayload,
 } from "~/lib/evidenceTypes";
@@ -13,11 +14,12 @@ import {
 describe("evidenceColumns & targetDetailOf", () => {
   it("reorders column IDs cleanly", () => {
     const prefs = defaultColumnPrefs();
+    expect(prefs.visible.reason).toBe(true);
     const reordered = reorderColumnIds(prefs.order, "actor", "kind");
     expect(reordered.indexOf("actor")).toBe(reordered.indexOf("kind") - 1);
   });
 
-  it("prefers human-readable details.tool/action over raw bytes:sha256: subject in PolicyDecision", () => {
+  it("extracts canonical target and reason separately and decodes actor identity", () => {
     const payload: EvidenceEnvelopePayload = {
       apiVersion: "provenance.r5e.io/v2",
       kind: "PolicyDecision",
@@ -38,13 +40,13 @@ describe("evidenceColumns & targetDetailOf", () => {
           reason: "Blocked shell command",
         },
         details: {
-          tool: "Bash",
+          target: "ExecCommand",
         },
       },
     };
     const detail = targetDetailOf(payload);
-    expect(detail.primary).toBe("Bash");
-    expect(detail.secondary).toBe("Blocked shell command");
-    expect(formatActorShort(payload.actor)).toBe("workload:r5e-dev:tutor-agent");
+    expect(detail.primary).toBe("ExecCommand");
+    expect(reasonOf(payload)).toBe("Blocked shell command");
+    expect(formatActorShort(payload.actor)).toBe("tutor-agent");
   });
 });

@@ -16,6 +16,7 @@ function buildAnalyticsParams(filter: EvidenceFilter): URLSearchParams {
   if (filter.kind) params.set("kind", filter.kind);
   if (filter.policyOutcome) params.set("policyOutcome", filter.policyOutcome);
   if (filter.target) params.set("target", filter.target);
+  if (filter.reason) params.set("reason", filter.reason);
   if (filter.q) params.set("q", filter.q);
   if (filter.actor) params.set("actor", filter.actor);
   if (filter.session) params.set("session", filter.session);

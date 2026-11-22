@@ -4,7 +4,11 @@ import {
   DEFAULT_TRUSTED_CHAIN,
   contentRefOf,
   decodeEvidencePayload,
+  formatIdentityDisplay,
+  formatTimestamp,
   policyEvaluationOf,
+  reasonOf,
+  serverTargetOf,
   shortKindName,
   truncateRef,
   type SignedEvidenceEnvelope,
@@ -54,5 +58,43 @@ describe("evidenceTypes helpers", () => {
     expect(shortKindName("provenance.r5e.io/v2/PolicyDecision")).toBe("PolicyDecision");
     expect(DEFAULT_TRUSTED_CHAIN).toMatch(/^evidence:sha256:[0-9a-f]{64}$/);
     expect(truncateRef(DEFAULT_TRUSTED_CHAIN, 8)).toContain("evidence:sha256:b1c6b5aa");
+  });
+
+  it("decodes URL-encoded principal URNs and extracts canonical target/reason separately", () => {
+    expect(formatIdentityDisplay("urn:r5e:principal:r5e-dev:alice%40example.test")).toBe(
+      "alice@example.test",
+    );
+    expect(
+      formatIdentityDisplay("urn:r5e:workload:r5e-dev:edtech-tutor:97e9adbf4d3a"),
+    ).toBe("edtech-tutor");
+
+    const env = makeEnvelope({
+      apiVersion: "provenance.r5e.io/v2",
+      kind: "PolicyDecision",
+      schemaRef: "bytes:sha256:" + "1".repeat(64),
+      profileRef: "bytes:sha256:" + "2".repeat(64),
+      issuer: "key:ed25519:sha256:" + "a".repeat(64),
+      actor: "urn:r5e:principal:r5e-dev:alice%40example.test",
+      stream: "urn:r5e:stream:s1",
+      seq: 4,
+      previous: null,
+      capturedAt: "2026-11-22T07:55:54Z",
+      body: {
+        evaluation: {
+          outcome: "deny",
+          policyRef: "bytes:sha256:" + "4".repeat(64),
+          inputRefs: [],
+          reason: "guardian_not_linked_to_student",
+        },
+      },
+    });
+    const decoded = decodeEvidencePayload(env);
+    expect(serverTargetOf(decoded)).toBeNull();
+    expect(reasonOf(decoded)).toBe("guardian_not_linked_to_student");
+
+    const nowMs = Date.parse("2026-11-22T07:58:54Z");
+    const rel = formatTimestamp("2026-11-22T07:55:54Z", "local", nowMs);
+    expect(rel.display).toBe("3 min ago");
+    expect(rel.utc).toBe("2026-11-22 07:55:54Z");
   });
 });

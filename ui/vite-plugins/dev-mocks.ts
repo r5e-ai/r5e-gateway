@@ -62,6 +62,7 @@ interface IndexedRecord {
   session: string | null;
   policyOutcome: "allow" | "deny" | "error" | null;
   target: string | null;
+  reason: string | null;
   envelope: SignedEnvelope;
   _decoded: Record<string, unknown>;
 }
@@ -72,6 +73,7 @@ const BLOB_BY_REF = new Map(RAW_SNAPSHOT.blobs.map((b) => [b.ref, b]));
 function extractRowMeta(decoded: Record<string, unknown>): {
   policyOutcome: "allow" | "deny" | "error" | null;
   target: string | null;
+  reason: string | null;
 } {
   const body = (decoded.body ?? {}) as Record<string, unknown>;
   const pol = (body.policy ?? body.evaluation) as Record<string, unknown> | undefined;
@@ -86,19 +88,22 @@ function extractRowMeta(decoded: Record<string, unknown>): {
       ? (body.details as Record<string, unknown>)
       : null;
   const target =
-    typeof body.tool === "string"
-      ? body.tool
-      : typeof details?.tool === "string"
-        ? details.tool
-        : typeof details?.action === "string"
-          ? details.action
-          : typeof details?.target === "string"
-            ? details.target
-            : typeof body.model === "string"
-              ? body.model
-              : null;
+    typeof body.tool === "string" && body.tool.trim().length > 0
+      ? body.tool.trim()
+      : typeof details?.target === "string" && details.target.trim().length > 0
+        ? details.target.trim()
+        : typeof body.model === "string" && body.model.trim().length > 0
+          ? typeof body.provider === "string" && body.provider.trim().length > 0
+            ? `${body.provider.trim()}/${body.model.trim()}`
+            : body.model.trim()
+          : null;
 
-  return { policyOutcome, target };
+  const reason =
+    typeof pol?.reason === "string" && pol.reason.trim().length > 0
+      ? pol.reason.trim()
+      : null;
+
+  return { policyOutcome, target, reason };
 }
 
 const SNAPSHOT_RECORDS: IndexedRecord[] = RAW_SNAPSHOT.records.map((r) => {
@@ -107,7 +112,7 @@ const SNAPSHOT_RECORDS: IndexedRecord[] = RAW_SNAPSHOT.records.map((r) => {
   ) as Record<string, unknown>;
   const apiVersion = String(decoded.apiVersion ?? "provenance.r5e.io/v2");
   const bareKind = String(decoded.kind ?? "Unknown");
-  const { policyOutcome, target } = extractRowMeta(decoded);
+  const { policyOutcome, target, reason } = extractRowMeta(decoded);
   return {
     ref: r.ref,
     stream: String(decoded.stream ?? ""),
@@ -118,6 +123,7 @@ const SNAPSHOT_RECORDS: IndexedRecord[] = RAW_SNAPSHOT.records.map((r) => {
     session: typeof decoded.session === "string" ? decoded.session : null,
     policyOutcome,
     target,
+    reason,
     envelope: r.envelope,
     _decoded: decoded,
   };
@@ -220,6 +226,7 @@ function toListRow(r: IndexedRecord) {
     session: r.session,
     policyOutcome: r.policyOutcome,
     target: r.target,
+    reason: r.reason,
     envelope: r.envelope,
   };
 }
@@ -227,21 +234,29 @@ function toListRow(r: IndexedRecord) {
 function matchesSharedFilters(
   r: IndexedRecord,
   params: URLSearchParams,
-  ignore?: "kind" | "policyOutcome" | "target",
+  ignore?: "kind" | "policyOutcome" | "target" | "reason",
 ): boolean {
   const kind = ignore === "kind" ? "" : params.get("kind")?.trim() ?? "";
   const policyOutcome =
     ignore === "policyOutcome" ? "" : params.get("policyOutcome")?.trim() ?? "";
   const target = ignore === "target" ? "" : params.get("target")?.trim() ?? "";
+  const reason = ignore === "reason" ? "" : params.get("reason")?.trim() ?? "";
   const actor = params.get("actor")?.trim() ?? "";
   const session = params.get("session")?.trim() ?? "";
   const since = params.get("since")?.trim() ?? "";
   const until = params.get("until")?.trim() ?? "";
   const q = params.get("q")?.trim().toLowerCase() ?? "";
 
-  if (kind && r.kind !== kind) return false;
+  if (kind) {
+    const kinds = kind
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean);
+    if (kinds.length > 0 && !kinds.includes(r.kind)) return false;
+  }
   if (policyOutcome && r.policyOutcome !== policyOutcome) return false;
   if (target && r.target !== target) return false;
+  if (reason && r.reason !== reason) return false;
   if (actor && r.actor !== actor) return false;
   if (session && r.session !== session) return false;
   if (since) {
@@ -263,7 +278,7 @@ function matchesSharedFilters(
     }
   }
   if (q) {
-    const hay = [r.actor ?? "", r.session ?? "", r.kind, r.target ?? "", r.ref]
+    const hay = [r.actor ?? "", r.session ?? "", r.kind, r.target ?? "", r.reason ?? "", r.ref]
       .join(" ")
       .toLowerCase();
     if (!hay.includes(q)) return false;
@@ -416,6 +431,7 @@ export function devMocksPlugin(): Plugin {
             "kind",
             "policyOutcome",
             "target",
+            "reason",
             "q",
             "actor",
             "session",
@@ -457,8 +473,9 @@ export function devMocksPlugin(): Plugin {
           ).length;
 
           const countAxis = (
-            axis: "kind" | "policyOutcome" | "target",
+            axis: "kind" | "policyOutcome" | "target" | "reason",
             extract: (r: IndexedRecord) => string | null,
+            cap?: number,
           ) => {
             const map = new Map<string, number>();
             for (const r of SNAPSHOT_RECORDS) {
@@ -466,9 +483,10 @@ export function devMocksPlugin(): Plugin {
               const v = extract(r);
               if (v) map.set(v, (map.get(v) ?? 0) + 1);
             }
-            return Array.from(map.entries())
-              .sort((a, b) => b[1] - a[1])
+            const sorted = Array.from(map.entries())
+              .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0])))
               .map(([value, count]) => ({ value, count }));
+            return cap ? sorted.slice(0, cap) : sorted;
           };
 
           return sendJson(res, 200, {
@@ -476,7 +494,8 @@ export function devMocksPlugin(): Plugin {
             facets: {
               kind: countAxis("kind", (r) => r.kind),
               policyOutcome: countAxis("policyOutcome", (r) => r.policyOutcome),
-              target: countAxis("target", (r) => r.target),
+              target: countAxis("target", (r) => r.target, 20),
+              reason: countAxis("reason", (r) => r.reason, 20),
             },
           });
         }
