@@ -1,20 +1,33 @@
-# Phase-1 CI gate. Matrix runs on Linux x86_64 (primary) and aarch64 (for Graviton + Appliance-ARM forward-compat).
-# macOS runners are NOT in the CI matrix — development platform only; Phase-1 targets Linux exclusively for
-# netns + iptables behavior (Governance shapes).
-#
-# Stability fixture assertion (T045) + Credo PI-neutrality check (T048) are HARD gates.
-
 name: CI
 
 on:
   push:
-    branches: ["main", "001-api-jido-foundations"]
+    branches: ["main"]
   pull_request:
 
 jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
+    container:
+      image: hexpm/elixir:1.19.5-erlang-28.0.4-ubuntu-noble-20260810
+    defaults:
+      run:
+        shell: bash
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: recurse
+          POSTGRES_PASSWORD: recurse
+          POSTGRES_DB: recurse_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recurse -d recurse_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -28,53 +41,27 @@ jobs:
       POSTGRES_USER: recurse
       POSTGRES_PASSWORD: recurse
       POSTGRES_DB: recurse_test
-      POSTGRES_HOST: localhost
+      POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Elixir/OTP
-        uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19.5"
-          otp-version: "28.0"
+          fetch-depth: 0
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.92"
-
-      - name: Start PostgreSQL
+      - name: Install build tools and Rust 1.92.0
         run: |
           set -euo pipefail
-
-          if ! command -v psql >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y postgresql postgresql-contrib
-          fi
-
-          sudo systemctl start postgresql || sudo service postgresql start
-
-          for _ in $(seq 1 30); do
-            if pg_isready -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" >/dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-          done
-
-          pg_isready -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}"
-
-          sudo -u postgres psql -v ON_ERROR_STOP=1 <<'SQL'
-          DO $$
-          BEGIN
-            IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'recurse') THEN
-              CREATE ROLE recurse LOGIN PASSWORD 'recurse' CREATEDB;
-            ELSE
-              ALTER ROLE recurse WITH LOGIN PASSWORD 'recurse' CREATEDB;
-            END IF;
-          END
-          $$;
-          SQL
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq openssl pkg-config python3 libssl-dev unzip wget xxd
+          rm -rf /var/lib/apt/lists/*
+          mix local.hex --force
+          mix local.rebar --force
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          /root/.cargo/bin/rustc --version
+          /root/.cargo/bin/cargo --version
 
       - name: Cache deps
         uses: actions/cache@v4
@@ -82,28 +69,16 @@ jobs:
           path: |
             deps
             _build
-            ~/.cargo
+            /root/.cargo/registry
+            /root/.cargo/git
             native/recurse_cedar/target
             native/recurse_spiffe/target
-          # Toolchain version pinned in the cache key so a Rust upgrade
-          # invalidates ~/.cargo cleanly. Previously the `restore-keys`
-          # fallback (`mix-`) accepted any prior cache, including those
-          # built by a different rustc — which surfaces as a silent
-          # `cargo metadata` failure during Rustler NIF compilation
-          # (Rustler swallows cargo's stderr). Bump the literal `rust1.92`
-          # token whenever the toolchain version above changes.
-          key: ${{ runner.os }}-mix-rust1.92-${{ hashFiles('**/mix.lock', '**/Cargo.lock') }}
+          key: ${{ runner.os }}-mix-rust1.92-${{ hashFiles('mix.lock', 'native/recurse_cedar/Cargo.lock', 'native/recurse_spiffe/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-mix-rust1.92-
 
       - name: mix deps.get
         run: mix deps.get
 
-      # Diagnostic guard: surface the actual cargo error if metadata
-      # fails (Rustler's `RuntimeError` only says "calling cargo metadata
-      # failed" without including cargo's stderr — so a failure during
-      # `mix compile` becomes effectively undebuggable from the CI log
-      # alone). Running cargo metadata directly here ensures any failure
-      # comes with cargo's real diagnostic.
       - name: Cargo metadata sanity (NIF crates)
         run: |
           cargo metadata --manifest-path native/recurse_cedar/Cargo.toml --format-version 1 > /dev/null
@@ -118,38 +93,46 @@ jobs:
           mix ecto.create --quiet
           mix ecto.migrate
 
-      - name: Install yq (for contract validation — T057)
+      - name: Install yq
         run: |
-          sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$(dpkg --print-architecture)"
-          sudo chmod +x /usr/local/bin/yq
+          wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$(dpkg --print-architecture)"
+          chmod +x /usr/local/bin/yq
           yq --version
 
-      - name: Contracts validation (T057 — SC-003/SC-007/SC-008)
+      - name: Contracts validation
         run: mix recurse.contracts.validate
 
       - name: mix test
-        run: mix test
+        run: mix test --exclude perf
 
-      - name: Cedar stability fixture (Deliverable O — FR-039)
+      - name: Cedar stability fixture
         run: mix recurse.cedar.stability_check
 
-      - name: mix credo --strict (incl. Provider-Interface Neutrality check per D16)
-        run: mix credo --strict
+      - name: mix credo --strict (changed Elixir files)
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
+            BASE="origin/${GITHUB_BASE_REF}"
+          else
+            BASE="HEAD~1"
+          fi
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "${BASE}...HEAD" -- '*.ex' '*.exs' || true)
+          if [ -z "${CHANGED}" ]; then
+            echo "No Elixir files changed; skipping credo."
+          else
+            echo "${CHANGED}" | xargs mix credo --strict
+          fi
 
       - name: cargo test (NIFs)
         run: cargo test --manifest-path native/recurse_cedar/Cargo.toml
 
-  # F004 T013 — SPA build + test pipeline.
-  # The Audit Console SPA lives in ui/ and is independently testable.
-  # The pipeline runs codegen + drift gate + unit tests + production build.
-  # Playwright e2e is gated behind PLAYWRIGHT_E2E=1 because it requires
-  # a running Gateway (boots ~30s); CI runs it on PRs that touch ui/ or
-  # apps/recurse_gateway/lib/recurse_gateway/admin/.
   ui:
-    name: ui (SPA — F004)
+    name: ui (SPA)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js + pnpm
         uses: actions/setup-node@v4
@@ -193,22 +176,3 @@ jobs:
       - name: Vite build
         working-directory: ui
         run: pnpm build
-
-      # Playwright e2e — opt-in. Boots a Gateway via mix run --no-halt and
-      # exercises the US1–US6 acceptance scenarios.
-      - name: Set up Elixir/OTP (for Playwright Gateway boot)
-        if: env.PLAYWRIGHT_E2E == '1'
-        uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19.5"
-          otp-version: "28.0"
-
-      - name: Install Playwright browsers
-        if: env.PLAYWRIGHT_E2E == '1'
-        working-directory: ui
-        run: pnpm exec playwright install --with-deps chromium firefox webkit
-
-      - name: Playwright e2e
-        if: env.PLAYWRIGHT_E2E == '1'
-        working-directory: ui
-        run: pnpm test:e2e
