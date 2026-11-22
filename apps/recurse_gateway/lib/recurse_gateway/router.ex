@@ -760,10 +760,7 @@ defmodule Recurse.Gateway.Router do
   #
   # Two read-only admin-console surfaces (cookie-only) for the static
   # registry catalog and one bearer-authenticated agent-facing endpoint
-  # for hosted MCP tool dispatch. The DEMO endpoint accepts a synthetic
-  # `Bearer demo-mcp-token-*` token in addition to the real RFC 8693
-  # token-exchanged JWT path; full broker wire-up is a follow-up MR
-  # (surfaced in this MR's reflect).
+  # for hosted MCP tool dispatch, which verifies the caller's token.
   #
   # Every tool dispatch — allow OR deny — emits an `:mcp_tool_call`
   # attestation. Quarantined registry entries are policy-denied at the
@@ -791,9 +788,7 @@ defmodule Recurse.Gateway.Router do
     &Recurse.Gateway.Admin.McpRegistryHandler.update/1
   )
 
-  # MCP tool dispatch — bearer-authenticated. Auth happens INSIDE the
-  # handler (not via RouteMacros) because the demo accepts a synthetic
-  # `demo-mcp-token-*` bearer alongside the production JWT path.
+  # MCP tool dispatch — bearer only; the handler verifies the token.
   post "/v1/mcp/:server/tools/:tool" do
     Recurse.Gateway.DataPlane.McpServerHandler.handle(conn)
   end

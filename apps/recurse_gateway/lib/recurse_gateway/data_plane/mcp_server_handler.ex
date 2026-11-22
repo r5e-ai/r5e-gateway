@@ -10,12 +10,10 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandler do
 
   Phase-1 ships a deliberate subset of the MCP HTTP transport spec:
 
-    1. Token authentication: production accepts an `Authorization: Bearer
-       <jwt>` minted via the Recurse broker's RFC 8693 token-exchange
-       (the agent's SPIFFE-bound JWT is exchanged for a Gateway-audience
-       JWT). The demo additionally accepts a STUB `Bearer demo-mcp-token-*`
-       synthetic token labeled in code (the brief explicitly permits this
-       — full RFC 8693 wire-up is a follow-up MR).
+    1. Token authentication: the caller presents `Authorization: Bearer
+       <jwt>`, a token for this gateway minted by the broker's token
+       exchange. It is verified like any other bearer the gateway
+       accepts.
     2. Three demo tools, all backed by the existing audit-plane shape:
          - `r5e.audit.list_receipts(filters)`
          - `r5e.audit.verify_receipt(run_id)`
@@ -67,10 +65,9 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandler do
   require Logger
 
   alias Recurse.Gateway.Admin.BrowserAuth.UiReceipts
+  alias Recurse.Gateway.Identity.IdentityContextBuilder
   alias Recurse.Gateway.McpRegistry.Loader
   alias Recurse.Gateway.ProviderRegistry
-
-  @demo_token_prefix "demo-mcp-token-"
 
   @supported_tools %{
     "r5e.audit.list_receipts" => :list_receipts,
@@ -94,18 +91,32 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandler do
       dispatch(conn, request_id, entry, tool, args, principal_subject)
     else
       {:error, :missing_authorization} ->
-        send_error(conn, 401, "missing_authorization", "Missing or malformed Authorization header.")
+        send_error(
+          conn,
+          401,
+          "missing_authorization",
+          "Missing or malformed Authorization header."
+        )
 
       {:error, :invalid_token} ->
         send_error(conn, 401, "invalid_token", "Bearer token rejected by validator.")
 
       {:error, {:registry_miss, id}} ->
-        send_error(conn, 404, "mcp_server_not_found", "No MCP server registered with id #{inspect(id)}.")
+        send_error(
+          conn,
+          404,
+          "mcp_server_not_found",
+          "No MCP server registered with id #{inspect(id)}."
+        )
 
       {:error, {:unsupported_tool, tool}} ->
-        send_error(conn, 404, "tool_not_found",
+        send_error(
+          conn,
+          404,
+          "tool_not_found",
           "Tool #{inspect(tool)} is not implemented by this MCP server. " <>
-            "Supported: #{Enum.join(Map.keys(@supported_tools), ", ")}")
+            "Supported: #{Enum.join(Map.keys(@supported_tools), ", ")}"
+        )
 
       {:error, {:bad_request, reason}} ->
         send_error(conn, 400, "bad_request", reason)
@@ -117,51 +128,36 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandler do
   end
 
   # ---------------------------------------------------------------------------
-  # Auth — minimal stub: production wires through real JWT validator.
+  # Who is calling
   # ---------------------------------------------------------------------------
 
-  # Accepts EITHER:
-  #   1. `Bearer demo-mcp-token-<id>` — synthetic dev/demo token. Resolves
-  #      to a service-account principal `mcp-agent-<id>`.
-  #   2. `Bearer <jwt>` — real production token (RFC 8693 token-exchanged
-  #      JWT minted by the broker). Validation TODO — for the demo MR,
-  #      we accept any non-empty bearer that is NOT the demo prefix and
-  #      mark the principal as `mcp-agent-real-bearer` until the broker
-  #      wire-up MR lands.
-  #
-  # Production hardening: replace `validate_real_bearer/1` with a call
-  # through `Recurse.Gateway.Identity.JwtValidator.validate/2`.
+  # The caller presents a bearer token, and it is verified the way every
+  # other route of this gateway verifies one: signature, issuer,
+  # audience, expiry. Nothing else is accepted.
   defp authenticate(conn) do
     case Plug.Conn.get_req_header(conn, "authorization") do
-      [header] when is_binary(header) ->
-        normalize_bearer(header)
-
-      _ ->
-        {:error, :missing_authorization}
+      [header] when is_binary(header) -> verified(conn, header)
+      _ -> {:error, :missing_authorization}
     end
   end
 
-  defp normalize_bearer("Bearer " <> token), do: validate_token(String.trim(token))
-  defp normalize_bearer("bearer " <> token), do: validate_token(String.trim(token))
-  defp normalize_bearer(_), do: {:error, :missing_authorization}
+  defp verified(conn, header) do
+    if String.match?(header, ~r/\A[Bb]earer \S/) do
+      opts = Application.get_env(:recurse_gateway, :jwt_validator_opts, [])
 
-  defp validate_token(@demo_token_prefix <> id) when byte_size(id) > 0 do
-    {:ok, "mcp-agent-" <> id}
+      case IdentityContextBuilder.build(conn.req_headers, ProviderRegistry.tenant_id(), opts) do
+        {:ok, %{principal: principal}} -> {:ok, named(principal)}
+        {:error, _reason} -> {:error, :invalid_token}
+      end
+    else
+      {:error, :missing_authorization}
+    end
   end
 
-  defp validate_token(token) when byte_size(token) > 0 do
-    # Stub for non-demo bearers — until the broker wire-up MR lands,
-    # any non-empty bearer that is NOT a demo token is accepted as
-    # real-but-unverified. A production deployment MUST replace this
-    # branch with `JwtValidator.validate/2`.
-    Logger.info(fn ->
-      "mcp_server: real-bearer stub accepted token=<redacted, len=#{byte_size(token)}>"
-    end)
-
-    {:ok, "mcp-agent-real-bearer"}
+  defp named(principal) do
+    Map.get(principal, :subject) || Map.get(principal, :account_id) ||
+      Map.get(principal, :agent_id) || "unnamed"
   end
-
-  defp validate_token(_), do: {:error, :invalid_token}
 
   # ---------------------------------------------------------------------------
   # Registry lookup + tool dispatch
@@ -207,8 +203,7 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandler do
         :quarantined ->
           {"deny",
            "MCP server #{inspect(entry.id)} is quarantined (trust_tier=quarantined). " <>
-             "Tool calls are policy-denied per registry policy_constraints.",
-           nil}
+             "Tool calls are policy-denied per registry policy_constraints.", nil}
 
         _ ->
           synthesize_tool_result(tool, args)
@@ -266,7 +261,8 @@ defmodule Recurse.Gateway.DataPlane.McpServerHandler do
         %{
           "run_id" => "demo-run-" <> Integer.to_string(i),
           "event_kind" => event_kind || "tool_call",
-          "timestamp" => "2026-04-30T00:00:#{:io_lib.format("~2..0B", [i]) |> IO.iodata_to_binary()}Z",
+          "timestamp" =>
+            "2026-04-30T00:00:#{:io_lib.format("~2..0B", [i]) |> IO.iodata_to_binary()}Z",
           "policy_decision" => "allow",
           "tenant_id" => ProviderRegistry.tenant_id()
         }
