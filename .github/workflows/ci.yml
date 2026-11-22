@@ -73,8 +73,8 @@ jobs:
             /root/.cargo/git
             native/recurse_cedar/target
             native/recurse_spiffe/target
-          key: ${{ runner.os }}-mix-rust1.92-${{ hashFiles('mix.lock', 'native/recurse_cedar/Cargo.lock', 'native/recurse_spiffe/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-mix-rust1.92-
+          key: ${{ matrix.os }}-mix-rust1.92-${{ hashFiles('mix.lock', 'native/recurse_cedar/Cargo.lock', 'native/recurse_spiffe/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-mix-rust1.92-
 
       - name: mix deps.get
         run: mix deps.get
