@@ -25,14 +25,32 @@ test.describe("v2 Admin Console (Provenance v2 + CedarToolUseGate)", () => {
     });
     page.on("pageerror", (e) => consoleErrors.push(e.message));
 
-    // 1. Dashboard loads real signed Provenance v2 snapshot + server facets & histogram
+    // 1. Dashboard loads on Activity default view, with unclipped Sign out, Reason column, and Y-axis histogram
     await page.goto("/admin/dashboard", { waitUntil: "networkidle" });
     await expect(page.getByTestId("evidence-table")).toBeVisible();
     await expect(page.getByTestId("evidence-histogram")).toBeVisible();
-    await expect(page.getByTestId("histogram-source-badge")).toContainText(
-      "server histogram",
-    );
+    await expect(page.getByTestId("histogram-y-scale")).toBeVisible();
+    await expect(page.getByTestId("col-header-reason")).toBeVisible();
     await expect(page.getByTestId("topbar-signout")).toBeInViewport();
+    await expect(page.getByTestId("view-mode-activity")).toBeVisible();
+
+    // 1b. Filtering by Deny keeps summary strip scoped to filtered view AND survives opening/closing RecordDetail
+    await page.getByTestId("filter-outcome-deny").click();
+    await expect(page).toHaveURL(/policyOutcome=deny/);
+    await expect(page.getByTestId("stat-total")).toContainText("2");
+    await page.getByTestId("evidence-row-PolicyDecision").first().click();
+    await expect(page.getByTestId("record-detail-drawer")).toBeVisible();
+    await expect(page.getByTestId("tab-panel-summary")).toBeVisible();
+    await expect(page).toHaveURL(/policyOutcome=deny/);
+    await page.getByTestId("close-drawer-btn").click();
+    await expect(page.getByTestId("record-detail-drawer")).toHaveCount(0);
+    await expect(page).toHaveURL(/policyOutcome=deny/);
+    await page.getByTestId("clear-filters-btn").click();
+
+    // Switch to All records to verify multi-kind toggle works
+    await page.getByTestId("view-mode-all").click();
+    await expect(page).toHaveURL(/view=all/);
+    await page.getByTestId("view-mode-activity").click();
 
     // 2. Column Picker: show hidden Session column, hide Ref, reorder Actor left
     await page.getByTestId("column-picker-button").click();

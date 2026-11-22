@@ -61,10 +61,12 @@ forbid(
 };
 `;
 
+const IS_DEV_MOCKS = import.meta.env?.VITE_DEV_MOCKS === "1";
+
 const MODES: ReadonlyArray<{ key: Mode; label: string }> = [
-  { key: "simulate", label: "Mode 1: Simulate" },
-  { key: "replay", label: "Mode 2: Replay" },
-  { key: "draft", label: "Mode 3: Draft & Blast Radius" },
+  { key: "simulate", label: "Simulate" },
+  { key: "replay", label: "Replay Record" },
+  { key: "draft", label: "Draft & Impact" },
 ];
 
 export default function PolicySimulator(): JSX.Element {
@@ -84,22 +86,23 @@ export default function PolicySimulator(): JSX.Element {
   const draftFromRecord = useDraftFromRecord();
   const blastRadius = useBlastRadius();
 
-  const [cedarSource, setCedarSource] = useState<string>(DEFAULT_CEDAR);
+  const [cedarSource, setCedarSource] = useState<string>(IS_DEV_MOCKS ? DEFAULT_CEDAR : "");
+  const [userEditedCedar, setUserEditedCedar] = useState<boolean>(false);
   const [copiedBanner, setCopiedBanner] = useState<boolean>(false);
 
-  // Mode 1: Simulate inputs
-  const [simPrincipalId, setSimPrincipalId] = useState("alice@r5e.dev");
+  // Simulate inputs (pre-filled only in local dev-mock preview; blank with placeholders on live deployments)
+  const [simPrincipalId, setSimPrincipalId] = useState(IS_DEV_MOCKS ? "alice@r5e.dev" : "");
   const [simPrincipalKind, setSimPrincipalKind] = useState<
     "obo_human" | "service_account" | "autonomous"
   >("obo_human");
-  const [simGroups, setSimGroups] = useState("eng,platform");
-  const [simTool, setSimTool] = useState("shell");
-  const [simModel, setSimModel] = useState("claude-sonnet-4-5");
-  const [simTenant, setSimTenant] = useState("r5e-dev");
-  const [simUpstream, setSimUpstream] = useState("api.anthropic.com");
-  const [simTokens, setSimTokens] = useState("1200");
+  const [simGroups, setSimGroups] = useState(IS_DEV_MOCKS ? "eng,platform" : "");
+  const [simTool, setSimTool] = useState(IS_DEV_MOCKS ? "shell" : "");
+  const [simModel, setSimModel] = useState(IS_DEV_MOCKS ? "claude-sonnet-4-5" : "");
+  const [simTenant, setSimTenant] = useState(IS_DEV_MOCKS ? "r5e-dev" : "");
+  const [simUpstream, setSimUpstream] = useState(IS_DEV_MOCKS ? "api.anthropic.com" : "");
+  const [simTokens, setSimTokens] = useState(IS_DEV_MOCKS ? "1200" : "");
   const [simArgsJson, setSimArgsJson] = useState(
-    '{\n  "command": "rm -rf /tmp/build"\n}',
+    IS_DEV_MOCKS ? '{\n  "command": "rm -rf /tmp/build"\n}' : "",
   );
   const [simResult, setSimResult] = useState<ToolUseSimulateResponse | null>(null);
   const [simError, setSimError] = useState<string | null>(null);
@@ -123,6 +126,13 @@ export default function PolicySimulator(): JSX.Element {
   const [scopeTool, setScopeTool] = useState("shell");
   const [conditions, setConditions] = useState<PolicyDraftConditionMetadata[]>([]);
   const [draftSavedNotice, setDraftSavedNotice] = useState<string | null>(null);
+
+  // Start from the deployment's active policy once loaded (unless the operator already edited it)
+  useEffect(() => {
+    if (!userEditedCedar && activePolicyQuery.data?.source) {
+      setCedarSource(activePolicyQuery.data.source);
+    }
+  }, [activePolicyQuery.data?.source, userEditedCedar]);
 
   useEffect(() => {
     if (incomingRef) {
@@ -411,8 +421,7 @@ ${cedarEffect}(
             <span>activated {activePolicyQuery.data.activatedAt}</span>
           </div>
           <span className="text-[11px]">
-            Cedar 4.9.1 • <code className="font-mono">Action::&quot;invoke_tool&quot;</code> •
-            live HTTP activation deferred
+            Cedar 4.9.1 • <code className="font-mono">Action::&quot;invoke_tool&quot;</code>
           </span>
         </div>
       ) : activePolicyQuery.isError &&
@@ -430,7 +439,7 @@ ${cedarEffect}(
         <section className="flex flex-col gap-2 lg:col-span-6">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-r5e-muted">
-              01 Policy as Code (Cedar 4.9.1)
+              Policy (Cedar)
             </h2>
             {mode === "draft" && (
               <button
@@ -450,7 +459,13 @@ ${cedarEffect}(
             </p>
           )}
           <div className="min-h-[380px] flex-1">
-            <CedarEditorBoundary value={cedarSource} onChange={setCedarSource}>
+            <CedarEditorBoundary
+              value={cedarSource}
+              onChange={(v) => {
+                setUserEditedCedar(true);
+                setCedarSource(v);
+              }}
+            >
               <Suspense
                 fallback={
                   <div className="flex h-[380px] items-center justify-center rounded border border-r5e-border bg-r5e-surface text-xs text-r5e-muted">
@@ -460,7 +475,10 @@ ${cedarEffect}(
               >
                 <CedarEditor
                   value={cedarSource}
-                  onChange={setCedarSource}
+                  onChange={(v) => {
+                    setUserEditedCedar(true);
+                    setCedarSource(v);
+                  }}
                   validationEndpoint={apiPaths.policies.simulate}
                 />
               </Suspense>
@@ -475,8 +493,11 @@ ${cedarEffect}(
               className="flex flex-col gap-3 rounded-lg border border-r5e-border bg-r5e-surface p-4"
             >
               <div className="flex items-center justify-between">
-                <h2 className="text-xs font-semibold uppercase tracking-wider text-r5e-muted">
-                  CedarToolUseGate Sandbox Input
+                <h2
+                  className="text-xs font-semibold uppercase tracking-wider text-r5e-muted"
+                  title="Simulated tool invocation evaluated against the Cedar policy"
+                >
+                  Test Input
                 </h2>
                 <button
                   type="button"
@@ -497,8 +518,9 @@ ${cedarEffect}(
                     type="text"
                     value={simPrincipalId}
                     onChange={(e) => setSimPrincipalId(e.target.value)}
+                    placeholder="user@example.com"
                     data-testid="sim-principal-id"
-                    className="rounded border border-r5e-border bg-r5e-bg px-2.5 py-1.5 font-mono text-r5e-text"
+                    className="rounded border border-r5e-border bg-r5e-bg px-2.5 py-1.5 font-mono text-r5e-text placeholder:text-r5e-text/40"
                   />
                 </label>
                 <label className="flex flex-col gap-1">
@@ -523,8 +545,9 @@ ${cedarEffect}(
                     type="text"
                     value={simTool}
                     onChange={(e) => setSimTool(e.target.value)}
+                    placeholder="shell"
                     data-testid="sim-tool-input"
-                    className="rounded border border-r5e-border bg-r5e-bg px-2.5 py-1.5 font-mono text-r5e-text"
+                    className="rounded border border-r5e-border bg-r5e-bg px-2.5 py-1.5 font-mono text-r5e-text placeholder:text-r5e-text/40"
                   />
                 </label>
                 <label className="flex flex-col gap-1">

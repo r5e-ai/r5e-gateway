@@ -1,23 +1,15 @@
-// Dashboard — Provenance v2 Policy Checks & Evidence Table (`/admin/dashboard`).
-//
-// Features:
-//   - Server-side filters (`kind`, `policyOutcome`, `target`, `q`, `actor`, `session`, `since`, `until`)
-//   - Disjunctive server facets (`GET /v1/evidence/facets`) with graceful fallback to loaded rows
-//   - Stacked interactive time-brush histogram (`GET /v1/evidence/histogram`) with drag-to-zoom
-//   - Resizable, reorderable, show/hide Evidence Table columns persisted in localStorage
-//   - High-contrast dark-mode typography and horizontal scroll container
+// Dashboard — Audit Evidence table, facets, and interactive time-brush histogram
+// (`/admin/dashboard`).
 
-import { Radio, Search, ShieldCheck, ShieldX } from "lucide-react";
-import { useCallback, useMemo, useRef, useState } from "react";
-import { Outlet, useNavigate, useSearchParams } from "react-router-dom";
+import { Check, Copy, Radio, Search, ShieldCheck, ShieldX } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Outlet, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
-import { BulkActionBar } from "~/components/evidence/BulkActionBar";
 import { ColumnPicker } from "~/components/evidence/ColumnPicker";
 import { EvidenceHistogram } from "~/components/evidence/EvidenceHistogram";
 import { Pill } from "~/components/shared/Pill";
 import { TopBar } from "~/components/shared/TopBar";
 import { EmptyState, ErrorState, Skeleton } from "~/components/shared/states";
-import { useAuth } from "~/hooks/useAuth";
 import {
   useEvidenceFacets,
   useEvidenceHistogram,
@@ -41,41 +33,65 @@ import {
   type EvidenceColumnPrefs,
 } from "~/lib/evidenceColumns";
 import {
+  ACTIVITY_KIND_PARAM,
   decodeEvidencePayload,
-  formatActorShort,
+  formatIdentityDisplay,
+  formatTimestamp,
   policyEvaluationOf,
   policyOutcomeOf,
+  reasonOf,
+  serverTargetOf,
   shortKindName,
-  targetDetailOf,
   truncateRef,
   type EvidenceRecordEntry,
   type PolicyOutcome,
+  type TimeDisplayMode,
 } from "~/lib/evidenceTypes";
 import { recordDetailPath } from "~/lib/routes";
+
+const TIME_MODE_STORAGE_KEY = "r5e.v2.timeMode";
+
+function loadTimeMode(): TimeDisplayMode {
+  if (typeof window === "undefined") return "local";
+  try {
+    return window.localStorage?.getItem(TIME_MODE_STORAGE_KEY) === "utc"
+      ? "utc"
+      : "local";
+  } catch {
+    return "local";
+  }
+}
 
 export default function Dashboard(): JSX.Element {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
-  const auth = useAuth();
-  const role = auth.status === "authenticated" ? auth.role : "tenant_auditor";
+  const location = useLocation();
 
-  const [selectedRefs, setSelectedRefs] = useState<string[]>([]);
   const [liveTailEnabled, setLiveTailEnabled] = useState<boolean>(false);
   const [customKindInput, setCustomKindInput] = useState<string>(
     searchParams.get("kind") ?? "",
   );
+  const [showOtherKindInput, setShowOtherKindInput] = useState<boolean>(false);
   const [searchInput, setSearchInput] = useState<string>(
     searchParams.get("q") ?? "",
   );
   const [columnPrefs, setColumnPrefs] = useState<EvidenceColumnPrefs>(() =>
     loadColumnPrefs(),
   );
+  const [timeMode, setTimeMode] = useState<TimeDisplayMode>(() => loadTimeMode());
   const [dragColId, setDragColId] = useState<EvidenceColumnId | null>(null);
+  const [copiedActorRef, setCopiedActorRef] = useState<string | null>(null);
   const resizeStateRef = useRef<{
     id: EvidenceColumnId;
     startX: number;
     startWidth: number;
   } | null>(null);
+
+  // View mode: Activity (default) vs All records vs explicit single kind
+  const explicitKind = searchParams.get("kind") || undefined;
+  const viewParam = searchParams.get("view");
+  const isAllRecordsView = !explicitKind && viewParam === "all";
+  const isActivityView = !explicitKind && viewParam !== "all";
 
   const filter: EvidenceFilter = useMemo(() => {
     const rawOutcome = searchParams.get("policyOutcome");
@@ -84,16 +100,17 @@ export default function Dashboard(): JSX.Element {
         ? rawOutcome
         : undefined;
     return {
-      kind: searchParams.get("kind") || undefined,
+      kind: explicitKind ?? (isActivityView ? ACTIVITY_KIND_PARAM : undefined),
       policyOutcome,
       target: searchParams.get("target") || undefined,
+      reason: searchParams.get("reason") || undefined,
       q: searchParams.get("q") || undefined,
       actor: searchParams.get("actor") || undefined,
       session: searchParams.get("session") || undefined,
       since: searchParams.get("since") || undefined,
       until: searchParams.get("until") || undefined,
     };
-  }, [searchParams]);
+  }, [searchParams, explicitKind, isActivityView]);
 
   const deploymentQuery = useDeployment();
   const recordsQuery = useEvidenceRecords(filter);
@@ -106,7 +123,7 @@ export default function Dashboard(): JSX.Element {
   const tail = useEvidenceTail(
     liveTailEnabled,
     {
-      kind: filter.kind,
+      kind: explicitKind,
       session: filter.session,
       actor: filter.actor,
     },
@@ -130,27 +147,43 @@ export default function Dashboard(): JSX.Element {
         const policy = policyEvaluationOf(payload);
         const outcome: PolicyOutcome | null =
           entry.policyOutcome ?? policyOutcomeOf(payload);
-        const detail = targetDetailOf(payload);
-        const targetPrimary = entry.target || detail.primary;
-        const targetSecondary =
-          entry.target && detail.primary !== entry.target
-            ? detail.secondary ?? detail.primary
-            : detail.secondary;
+        const target =
+          entry.target !== undefined ? entry.target : serverTargetOf(payload);
+        const reason =
+          entry.reason !== undefined ? entry.reason : reasonOf(payload);
         return {
           entry,
           payload,
           policy,
           outcome,
-          targetPrimary,
-          targetSecondary,
+          target,
+          reason,
         };
       }),
     [rawRows],
   );
 
-  // Derive a default histogram window from loaded rows when URL has no explicit since/until
-  const fallbackWindow = useMemo(() => {
-    if (decodedRows.length === 0) return {};
+  // Keep a pinned baseline time window when "All" is active so filtering by
+  // outcome/kind/target/reason doesn't collapse the histogram's X-axis span.
+  const [baselineWindow, setBaselineWindow] = useState<{
+    since?: string;
+    until?: string;
+  }>({});
+  const hasNarrowingFilter = Boolean(
+    filter.policyOutcome ||
+      explicitKind ||
+      filter.target ||
+      filter.reason ||
+      filter.q ||
+      filter.actor ||
+      filter.session,
+  );
+
+  useEffect(() => {
+    if (decodedRows.length === 0) return;
+    if (hasNarrowingFilter && baselineWindow.since && baselineWindow.until) {
+      return;
+    }
     let minMs = Infinity;
     let maxMs = -Infinity;
     for (const r of decodedRows) {
@@ -160,15 +193,18 @@ export default function Dashboard(): JSX.Element {
         if (ms > maxMs) maxMs = ms;
       }
     }
-    if (!Number.isFinite(minMs) || !Number.isFinite(maxMs)) return {};
+    if (!Number.isFinite(minMs) || !Number.isFinite(maxMs)) return;
     const paddedMax = Math.max(maxMs + 1000, minMs + 60_000);
-    return {
-      since: new Date(minMs).toISOString(),
-      until: new Date(paddedMax).toISOString(),
-    };
-  }, [decodedRows]);
+    const nextSince = new Date(minMs).toISOString();
+    const nextUntil = new Date(paddedMax).toISOString();
+    setBaselineWindow((prev) =>
+      prev.since === nextSince && prev.until === nextUntil
+        ? prev
+        : { since: nextSince, until: nextUntil },
+    );
+  }, [decodedRows, hasNarrowingFilter, baselineWindow.since, baselineWindow.until]);
 
-  const histogramQuery = useEvidenceHistogram(filter, fallbackWindow, 36);
+  const histogramQuery = useEvidenceHistogram(filter, baselineWindow, 36);
 
   const serverFacets = facetsQuery.data;
   const usingServerFacets = Boolean(serverFacets);
@@ -206,8 +242,8 @@ export default function Dashboard(): JSX.Element {
     }
     const counts = new Map<string, number>();
     for (const r of decodedRows) {
-      if (r.targetPrimary && r.targetPrimary !== "—") {
-        counts.set(r.targetPrimary, (counts.get(r.targetPrimary) ?? 0) + 1);
+      if (r.target) {
+        counts.set(r.target, (counts.get(r.target) ?? 0) + 1);
       }
     }
     return Array.from(counts.entries())
@@ -215,8 +251,48 @@ export default function Dashboard(): JSX.Element {
       .slice(0, 12);
   }, [serverFacets, decodedRows]);
 
+  const reasonFacetRows = useMemo(() => {
+    if (serverFacets?.facets?.reason) {
+      return serverFacets.facets.reason.slice(0, 12).map((b) => [b.value, b.count] as const);
+    }
+    const counts = new Map<string, number>();
+    for (const r of decodedRows) {
+      if (r.reason) {
+        counts.set(r.reason, (counts.get(r.reason) ?? 0) + 1);
+      }
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12);
+  }, [serverFacets, decodedRows]);
+
+  // Top summary strip reflects ONE consistent scope: the current filtered view.
   const stats = useMemo(() => {
     const total = serverFacets ? serverFacets.total : decodedRows.length;
+    if (filter.policyOutcome === "allow") {
+      return {
+        total,
+        policyChecks: outcomeCounts.allow,
+        allowed: outcomeCounts.allow,
+        denied: 0,
+      };
+    }
+    if (filter.policyOutcome === "deny") {
+      return {
+        total,
+        policyChecks: outcomeCounts.deny,
+        allowed: 0,
+        denied: outcomeCounts.deny,
+      };
+    }
+    if (filter.policyOutcome === "error") {
+      return {
+        total,
+        policyChecks: outcomeCounts.error,
+        allowed: 0,
+        denied: outcomeCounts.error,
+      };
+    }
     const allowed = outcomeCounts.allow;
     const denied = outcomeCounts.deny + outcomeCounts.error;
     return {
@@ -225,7 +301,7 @@ export default function Dashboard(): JSX.Element {
       allowed,
       denied,
     };
-  }, [serverFacets, decodedRows.length, outcomeCounts]);
+  }, [serverFacets, decodedRows.length, outcomeCounts, filter.policyOutcome]);
 
   const visibleColumns = useMemo(
     () => columnPrefs.order.filter((id) => columnPrefs.visible[id]),
@@ -234,7 +310,6 @@ export default function Dashboard(): JSX.Element {
 
   const totalTableWidth = useMemo(
     () =>
-      40 +
       visibleColumns.reduce(
         (sum, id) => sum + (columnPrefs.widths[id] ?? COLUMN_DEF_BY_ID[id].defaultWidth),
         0,
@@ -242,12 +317,14 @@ export default function Dashboard(): JSX.Element {
     [visibleColumns, columnPrefs.widths],
   );
 
-  const firstSelectedSession = useMemo(() => {
-    const first = selectedRefs[0];
-    if (!first) return null;
-    const found = decodedRows.find((r) => r.entry.ref === first);
-    return found?.entry.session ?? found?.payload?.session ?? null;
-  }, [selectedRefs, decodedRows]);
+  function toggleTimeMode(next: TimeDisplayMode): void {
+    setTimeMode(next);
+    try {
+      window.localStorage?.setItem(TIME_MODE_STORAGE_KEY, next);
+    } catch {
+      // ignore storage failures
+    }
+  }
 
   function updatePrefs(updater: (prev: EvidenceColumnPrefs) => EvidenceColumnPrefs): void {
     setColumnPrefs((prev) => {
@@ -277,6 +354,52 @@ export default function Dashboard(): JSX.Element {
 
   function handleResetColumns(): void {
     updatePrefs(() => defaultColumnPrefs());
+  }
+
+  function autoFitColumn(id: EvidenceColumnId): void {
+    const def = COLUMN_DEF_BY_ID[id];
+    let maxChars = def.label.length + 2;
+    for (const row of decodedRows) {
+      let text = "";
+      switch (id) {
+        case "captured":
+          text = formatTimestamp(row.entry.capturedAt, timeMode).display;
+          break;
+        case "kind":
+          text = shortKindName(row.entry.kind);
+          break;
+        case "policy":
+          text = row.outcome ?? "—";
+          break;
+        case "target":
+          text = row.target ?? "—";
+          break;
+        case "reason":
+          text = row.reason ?? "—";
+          break;
+        case "actor":
+          text = formatIdentityDisplay(row.entry.actor ?? row.payload?.actor);
+          break;
+        case "session":
+          text = (row.entry.session ?? row.payload?.session ?? "—").replace(
+            /^urn:r5e:session:/,
+            "",
+          );
+          break;
+        case "ref":
+          text = truncateRef(row.entry.ref, 10);
+          break;
+        case "streamSeq":
+          text = `${row.entry.stream.replace(/^urn:r5e:stream:/, "")} #${row.entry.seq}`;
+          break;
+      }
+      if (text.length > maxChars) maxChars = text.length;
+    }
+    const fitted = Math.max(def.minWidth, Math.min(520, Math.round(maxChars * 7.5 + 34)));
+    updatePrefs((prev) => ({
+      ...prev,
+      widths: { ...prev.widths, [id]: fitted },
+    }));
   }
 
   function startResize(id: EvidenceColumnId, clientX: number): void {
@@ -311,6 +434,21 @@ export default function Dashboard(): JSX.Element {
         const next = new URLSearchParams(prev);
         if (!value) next.delete(key);
         else next.set(key, value);
+        if (key === "kind" && value) next.delete("view");
+        return next;
+      },
+      { replace: true },
+    );
+  }
+
+  function selectViewMode(mode: "activity" | "all"): void {
+    setCustomKindInput("");
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("kind");
+        if (mode === "all") next.set("view", "all");
+        else next.delete("view");
         return next;
       },
       { replace: true },
@@ -331,24 +469,11 @@ export default function Dashboard(): JSX.Element {
     );
   }
 
-  function toggleRow(ref: string): void {
-    setSelectedRefs((prev) =>
-      prev.includes(ref) ? prev.filter((r) => r !== ref) : [...prev, ref],
-    );
-  }
-
-  function toggleAll(): void {
-    if (selectedRefs.length === decodedRows.length) {
-      setSelectedRefs([]);
-    } else {
-      setSelectedRefs(decodedRows.map((r) => r.entry.ref));
-    }
-  }
-
   const hasActiveFilter = Boolean(
-    filter.kind ||
+    explicitKind ||
       filter.policyOutcome ||
       filter.target ||
+      filter.reason ||
       filter.q ||
       filter.session ||
       filter.actor ||
@@ -362,53 +487,41 @@ export default function Dashboard(): JSX.Element {
         pageContent={
           <div className="flex min-w-0 items-center gap-3">
             <h1 className="truncate text-sm font-semibold text-r5e-text">
-              Policy Checks &amp; Evidence
+              Audit Evidence
             </h1>
             {deploymentQuery.data?.chain && (
               <span
+                className="hidden shrink-0 rounded-full border border-r5e-border bg-r5e-bg px-2.5 py-0.5 font-mono text-[11px] text-r5e-text/80 xl:inline"
+                title={`Deployment audit chain anchor: ${deploymentQuery.data.chain}`}
                 data-testid="deployment-chain-badge"
-                className="hidden items-center gap-1.5 rounded-full border border-r5e-border bg-r5e-surface px-2.5 py-0.5 font-mono text-[11px] text-r5e-text/80 xl:inline-flex"
-                title={deploymentQuery.data.chain}
               >
-                chain: {truncateRef(deploymentQuery.data.chain, 10)}
+                Chain anchor: {truncateRef(deploymentQuery.data.chain, 10)}
               </span>
             )}
           </div>
         }
         actions={
           <div className="flex items-center gap-2">
-            {tail.statusDetail && (
-              <span
-                data-testid="live-tail-status-detail"
-                className="hidden text-[11px] text-r5e-warning lg:inline"
-              >
-                {tail.statusDetail}
-              </span>
-            )}
             <button
               type="button"
               data-testid="live-tail-toggle"
               onClick={() => setLiveTailEnabled((v) => !v)}
               className={[
                 "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded border px-2.5 py-1 text-xs font-medium transition-colors",
-                tail.status === "connected"
-                  ? "border-r5e-success/50 bg-r5e-success/15 text-r5e-success"
-                  : liveTailEnabled
-                    ? "border-r5e-warning/50 bg-r5e-warning/10 text-r5e-warning"
-                    : "border-r5e-border bg-r5e-surface text-r5e-text/85 hover:text-r5e-text",
+                liveTailEnabled
+                  ? "border-r5e-success/60 bg-r5e-success/15 text-r5e-success"
+                  : "border-r5e-border bg-r5e-surface text-r5e-text/85 hover:text-r5e-text",
               ].join(" ")}
             >
-              <Radio className="h-3.5 w-3.5" aria-hidden="true" />
+              <Radio className="h-3.5 w-3.5" />
               <span>
-                {tail.status === "connected"
-                  ? "Live tail: on"
-                  : tail.status === "connecting"
-                    ? "Connecting…"
-                    : tail.status === "not_capturing"
-                      ? "Not capturing"
-                      : liveTailEnabled
-                        ? "Reconnecting"
-                        : "Live tail"}
+                {liveTailEnabled
+                  ? tail.status === "connected"
+                    ? "Live tail"
+                    : tail.status === "unavailable"
+                      ? "Live tail unavailable"
+                      : "Reconnecting…"
+                  : "Live tail"}
               </span>
             </button>
           </div>
@@ -416,7 +529,7 @@ export default function Dashboard(): JSX.Element {
       />
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* Left filter rail (high-contrast dark-mode typography) */}
+        {/* Left filter sidebar */}
         <aside
           aria-label="Evidence filters"
           className="flex w-[240px] shrink-0 flex-col gap-5 overflow-y-auto border-r border-r5e-border bg-r5e-surface/60 p-4"
@@ -429,6 +542,7 @@ export default function Dashboard(): JSX.Element {
               Facets unavailable: {facetsQuery.error.message}
             </div>
           )}
+
           {/* Policy Outcome facet */}
           <div>
             <h2 className="text-[11px] font-semibold uppercase tracking-wider text-r5e-text/80">
@@ -462,36 +576,14 @@ export default function Dashboard(): JSX.Element {
             </div>
           </div>
 
-          {/* Open-string full kind path facet */}
+          {/* Record Kind facet */}
           <div>
             <h2 className="text-[11px] font-semibold uppercase tracking-wider text-r5e-text/80">
               Record Kind
             </h2>
-            <form
-              className="mt-2 flex gap-1"
-              onSubmit={(e) => {
-                e.preventDefault();
-                updateParam("kind", customKindInput.trim() || null);
-              }}
-            >
-              <input
-                type="text"
-                value={customKindInput}
-                onChange={(e) => setCustomKindInput(e.target.value)}
-                placeholder="provenance.r5e.io/v2/…"
-                data-testid="open-kind-filter-input"
-                className="min-w-0 flex-1 rounded border border-r5e-border bg-r5e-bg px-2 py-1 font-mono text-[11px] text-r5e-text placeholder:text-r5e-text/55"
-              />
-              <button
-                type="submit"
-                className="rounded border border-r5e-border bg-r5e-surface px-2 py-1 text-[11px] font-medium text-r5e-text hover:bg-r5e-bg"
-              >
-                Go
-              </button>
-            </form>
             <div className="mt-2 flex flex-col gap-1">
               {kindFacetRows.map(([kindPath, count]) => {
-                const active = filter.kind === kindPath;
+                const active = explicitKind === kindPath;
                 return (
                   <button
                     key={kindPath}
@@ -520,6 +612,40 @@ export default function Dashboard(): JSX.Element {
                 );
               })}
             </div>
+
+            {!showOtherKindInput ? (
+              <button
+                type="button"
+                data-testid="other-kind-toggle"
+                onClick={() => setShowOtherKindInput(true)}
+                className="mt-2 text-[11px] text-r5e-text/65 hover:text-r5e-text hover:underline"
+              >
+                Other kind…
+              </button>
+            ) : (
+              <form
+                className="mt-2 flex gap-1"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  updateParam("kind", customKindInput.trim() || null);
+                }}
+              >
+                <input
+                  type="text"
+                  value={customKindInput}
+                  onChange={(e) => setCustomKindInput(e.target.value)}
+                  placeholder="provenance.r5e.io/v2/…"
+                  data-testid="custom-kind-input"
+                  className="min-w-0 flex-1 rounded border border-r5e-border bg-r5e-bg px-2 py-1 font-mono text-[11px] text-r5e-text placeholder:text-r5e-text/50"
+                />
+                <button
+                  type="submit"
+                  className="rounded border border-r5e-border bg-r5e-bg px-2 py-1 text-[11px] font-medium text-r5e-text hover:border-r5e-accent"
+                >
+                  Go
+                </button>
+              </form>
+            )}
           </div>
 
           {/* Target / Tool facet */}
@@ -560,6 +686,42 @@ export default function Dashboard(): JSX.Element {
             </div>
           )}
 
+          {/* Reason facet */}
+          {reasonFacetRows.length > 0 && (
+            <div>
+              <h2 className="text-[11px] font-semibold uppercase tracking-wider text-r5e-text/80">
+                Reason
+              </h2>
+              <div className="mt-2 flex flex-col gap-1">
+                {reasonFacetRows.map(([reasonVal, count]) => {
+                  const active = filter.reason === reasonVal;
+                  return (
+                    <button
+                      key={reasonVal}
+                      type="button"
+                      data-testid={`filter-reason-${reasonVal.slice(0, 32)}`}
+                      onClick={() =>
+                        updateParam("reason", active ? null : reasonVal)
+                      }
+                      title={reasonVal}
+                      className={[
+                        "flex items-center justify-between gap-2 rounded px-2.5 py-1.5 text-left text-xs transition-colors",
+                        active
+                          ? "bg-r5e-accent/25 font-medium text-r5e-text"
+                          : "text-r5e-text/85 hover:bg-r5e-bg hover:text-r5e-text",
+                      ].join(" ")}
+                    >
+                      <span className="truncate text-[11px]">{reasonVal}</span>
+                      <span className="shrink-0 font-mono text-[11px] text-r5e-text/80">
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {hasActiveFilter && (
             <button
               type="button"
@@ -567,7 +729,10 @@ export default function Dashboard(): JSX.Element {
               onClick={() => {
                 setCustomKindInput("");
                 setSearchInput("");
-                setSearchParams({}, { replace: true });
+                setSearchParams(
+                  isAllRecordsView ? { view: "all" } : {},
+                  { replace: true },
+                );
               }}
               className="rounded border border-r5e-border bg-r5e-bg px-2.5 py-1.5 text-xs font-medium text-r5e-text/90 hover:text-r5e-text"
             >
@@ -578,10 +743,58 @@ export default function Dashboard(): JSX.Element {
 
         {/* Main content column */}
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          {/* KPI strip + search + Column Picker */}
+          {/* View toggle + KPI strip + search + Time toggle + Column Picker */}
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-r5e-border bg-r5e-bg px-5 py-3">
-            <div className="flex flex-wrap items-center gap-2.5 text-xs">
-              <StatChip label="Records" value={stats.total} testId="stat-total" />
+            <div
+              className="flex flex-wrap items-center gap-2 text-xs"
+              title={
+                hasActiveFilter
+                  ? "Counts for the current filtered view"
+                  : isActivityView
+                    ? "Counts for agent activity records"
+                    : "Counts for all records"
+              }
+            >
+              {/* Activity vs All records segmented toggle */}
+              <div
+                role="group"
+                aria-label="Record view scope"
+                data-testid="view-scope-toggle"
+                className="inline-flex rounded border border-r5e-border bg-r5e-surface p-0.5"
+              >
+                <button
+                  type="button"
+                  data-testid="view-mode-activity"
+                  onClick={() => selectViewMode("activity")}
+                  className={[
+                    "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                    isActivityView
+                      ? "bg-r5e-accent/25 text-r5e-text"
+                      : "text-r5e-text/75 hover:text-r5e-text",
+                  ].join(" ")}
+                >
+                  Activity
+                </button>
+                <button
+                  type="button"
+                  data-testid="view-mode-all"
+                  onClick={() => selectViewMode("all")}
+                  className={[
+                    "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                    isAllRecordsView
+                      ? "bg-r5e-accent/25 text-r5e-text"
+                      : "text-r5e-text/75 hover:text-r5e-text",
+                  ].join(" ")}
+                >
+                  All records
+                </button>
+              </div>
+
+              <StatChip
+                label={hasActiveFilter ? "Matching" : "Records"}
+                value={stats.total}
+                testId="stat-total"
+              />
               <StatChip label="Policy Checks" value={stats.policyChecks} />
               <StatChip
                 label="Allowed"
@@ -599,7 +812,7 @@ export default function Dashboard(): JSX.Element {
 
             <div className="flex flex-wrap items-center gap-2">
               <form
-                className="relative flex w-64 items-center"
+                className="relative flex w-56 items-center"
                 onSubmit={(e) => {
                   e.preventDefault();
                   updateParam("q", searchInput.trim() || null);
@@ -611,11 +824,45 @@ export default function Dashboard(): JSX.Element {
                   maxLength={200}
                   value={searchInput}
                   onChange={(e) => setSearchInput(e.target.value)}
-                  placeholder="Search actor, session, kind, target…"
+                  placeholder="Search actor, tool, reason…"
                   data-testid="evidence-search-input"
                   className="w-full rounded border border-r5e-border bg-r5e-surface py-1.5 pl-8 pr-3 text-xs text-r5e-text placeholder:text-r5e-text/55"
                 />
               </form>
+
+              <div
+                role="group"
+                aria-label="Timestamp timezone"
+                data-testid="time-mode-toggle"
+                className="inline-flex rounded border border-r5e-border bg-r5e-surface p-0.5 text-[11px]"
+              >
+                <button
+                  type="button"
+                  data-testid="time-mode-local"
+                  onClick={() => toggleTimeMode("local")}
+                  className={[
+                    "rounded px-2 py-1 font-medium transition-colors",
+                    timeMode === "local"
+                      ? "bg-r5e-accent/25 text-r5e-text"
+                      : "text-r5e-text/70 hover:text-r5e-text",
+                  ].join(" ")}
+                >
+                  Local
+                </button>
+                <button
+                  type="button"
+                  data-testid="time-mode-utc"
+                  onClick={() => toggleTimeMode("utc")}
+                  className={[
+                    "rounded px-2 py-1 font-medium transition-colors",
+                    timeMode === "utc"
+                      ? "bg-r5e-accent/25 text-r5e-text"
+                      : "text-r5e-text/70 hover:text-r5e-text",
+                  ].join(" ")}
+                >
+                  UTC
+                </button>
+              </div>
 
               <ColumnPicker
                 prefs={columnPrefs}
@@ -636,6 +883,7 @@ export default function Dashboard(): JSX.Element {
             }))}
             since={filter.since}
             until={filter.until}
+            timeMode={timeMode}
             onSelectRange={updateTimeRange}
           />
 
@@ -650,7 +898,7 @@ export default function Dashboard(): JSX.Element {
             {recordsQuery.isError && (
               <div className="p-5">
                 <ErrorState
-                  title="Failed to load Provenance v2 records"
+                  title="Failed to load evidence records"
                   detail={recordsQuery.error.message}
                   retry={{ onClick: () => void recordsQuery.refetch() }}
                 />
@@ -663,7 +911,7 @@ export default function Dashboard(): JSX.Element {
                 <div className="p-8">
                   <EmptyState
                     title="No matching evidence records"
-                    body="Adjust your kind, policy outcome, time range, or search filter."
+                    body="Adjust your view, kind, policy outcome, time range, or search filter."
                   />
                 </div>
               )}
@@ -675,7 +923,6 @@ export default function Dashboard(): JSX.Element {
                 className="min-w-full table-fixed border-collapse text-left text-xs"
               >
                 <colgroup>
-                  <col style={{ width: 40 }} />
                   {visibleColumns.map((colId) => (
                     <col
                       key={colId}
@@ -689,17 +936,6 @@ export default function Dashboard(): JSX.Element {
                 </colgroup>
                 <thead className="sticky top-0 z-10 border-b border-r5e-border bg-r5e-surface text-[11px] font-semibold uppercase tracking-wider text-r5e-text/85">
                   <tr>
-                    <th className="w-10 px-3 py-2.5">
-                      <input
-                        type="checkbox"
-                        aria-label="Select all records"
-                        checked={
-                          decodedRows.length > 0 &&
-                          selectedRefs.length === decodedRows.length
-                        }
-                        onChange={toggleAll}
-                      />
-                    </th>
                     {visibleColumns.map((colId) => {
                       const def = COLUMN_DEF_BY_ID[colId];
                       return (
@@ -721,7 +957,7 @@ export default function Dashboard(): JSX.Element {
                           }}
                           onDragEnd={() => setDragColId(null)}
                           className="relative select-none truncate px-3 py-2.5 cursor-grab active:cursor-grabbing"
-                          title="Drag to reorder column; drag right edge to resize"
+                          title="Drag to reorder column; drag divider to resize; double-click divider to auto-fit"
                         >
                           <span className="truncate">{def.label}</span>
                           <span
@@ -734,9 +970,16 @@ export default function Dashboard(): JSX.Element {
                               e.stopPropagation();
                               startResize(colId, e.clientX);
                             }}
+                            onDoubleClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              autoFitColumn(colId);
+                            }}
                             onClick={(e) => e.stopPropagation()}
-                            className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-r5e-accent/60"
-                          />
+                            className="group/resize absolute -right-1 top-0 z-10 flex h-full w-2.5 cursor-col-resize items-center justify-center"
+                          >
+                            <span className="h-4 w-px bg-r5e-border transition-all group-hover/resize:h-full group-hover/resize:w-0.5 group-hover/resize:bg-r5e-accent" />
+                          </span>
                         </th>
                       );
                     })}
@@ -744,35 +987,23 @@ export default function Dashboard(): JSX.Element {
                 </thead>
                 <tbody className="divide-y divide-r5e-border/70">
                   {decodedRows.map(
-                    ({
-                      entry,
-                      payload,
-                      policy,
-                      outcome,
-                      targetPrimary,
-                      targetSecondary,
-                    }) => {
-                      const checked = selectedRefs.includes(entry.ref);
+                    ({ entry, payload, policy, outcome, target, reason }) => {
                       const fullActor = entry.actor ?? payload?.actor ?? "";
+                      const actorDisplay = formatIdentityDisplay(fullActor);
                       const fullSession = entry.session ?? payload?.session ?? "";
+                      const ts = formatTimestamp(entry.capturedAt, timeMode);
                       return (
                         <tr
                           key={entry.ref}
                           data-testid={`evidence-row-${shortKindName(entry.kind)}`}
-                          onClick={() => navigate(recordDetailPath(entry.ref))}
+                          onClick={() =>
+                            navigate({
+                              pathname: recordDetailPath(entry.ref),
+                              search: location.search,
+                            })
+                          }
                           className="cursor-pointer transition-colors hover:bg-r5e-surface/90"
                         >
-                          <td
-                            className="px-3 py-2.5"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <input
-                              type="checkbox"
-                              aria-label={`Select ${entry.ref}`}
-                              checked={checked}
-                              onChange={() => toggleRow(entry.ref)}
-                            />
-                          </td>
                           {visibleColumns.map((colId) => {
                             switch (colId) {
                               case "captured":
@@ -780,25 +1011,30 @@ export default function Dashboard(): JSX.Element {
                                   <td
                                     key={colId}
                                     className="truncate whitespace-nowrap px-3 py-2.5 font-mono text-[11px] text-r5e-text/85"
-                                    title={entry.capturedAt}
+                                    title={ts.utc}
                                   >
-                                    {formatShortTime(entry.capturedAt)}
+                                    {ts.display}
                                   </td>
                                 );
                               case "kind":
                                 return (
-                                  <td key={colId} className="truncate whitespace-nowrap px-3 py-2.5">
-                                    <span
-                                      className="rounded border border-r5e-border bg-r5e-surface px-2 py-0.5 font-mono text-[11px] text-r5e-text"
-                                      title={entry.kind}
-                                    >
+                                  <td
+                                    key={colId}
+                                    className="truncate whitespace-nowrap px-3 py-2.5"
+                                    title={entry.kind}
+                                  >
+                                    <span className="rounded border border-r5e-border bg-r5e-surface px-2 py-0.5 font-mono text-[11px] text-r5e-text">
                                       {shortKindName(entry.kind)}
                                     </span>
                                   </td>
                                 );
                               case "policy":
                                 return (
-                                  <td key={colId} className="whitespace-nowrap px-3 py-2.5">
+                                  <td
+                                    key={colId}
+                                    className="whitespace-nowrap px-3 py-2.5"
+                                    title={policy?.reason ?? outcome ?? undefined}
+                                  >
                                     {outcome ? (
                                       <OutcomePill
                                         outcome={outcome}
@@ -813,20 +1049,23 @@ export default function Dashboard(): JSX.Element {
                                 return (
                                   <td
                                     key={colId}
-                                    className="truncate px-3 py-2.5"
-                                    title={
-                                      targetSecondary
-                                        ? `${targetPrimary} — ${targetSecondary}`
-                                        : targetPrimary
-                                    }
+                                    className="truncate px-3 py-2.5 font-mono text-xs text-r5e-text"
+                                    title={target ?? undefined}
                                   >
-                                    <div className="truncate font-mono text-xs text-r5e-text">
-                                      {targetPrimary}
-                                    </div>
-                                    {targetSecondary && (
-                                      <div className="truncate font-mono text-[10px] text-r5e-text/70">
-                                        {targetSecondary}
-                                      </div>
+                                    {target ?? (
+                                      <span className="text-r5e-text/50">—</span>
+                                    )}
+                                  </td>
+                                );
+                              case "reason":
+                                return (
+                                  <td
+                                    key={colId}
+                                    className="truncate px-3 py-2.5 text-xs text-r5e-text/85"
+                                    title={reason ?? undefined}
+                                  >
+                                    {reason ?? (
+                                      <span className="text-r5e-text/50">—</span>
                                     )}
                                   </td>
                                 );
@@ -834,10 +1073,44 @@ export default function Dashboard(): JSX.Element {
                                 return (
                                   <td
                                     key={colId}
-                                    className="truncate px-3 py-2.5 font-mono text-[11px] text-r5e-text/85"
+                                    className="group/actor px-3 py-2.5 font-mono text-[11px] text-r5e-text/85"
                                     title={fullActor || undefined}
                                   >
-                                    {formatActorShort(fullActor)}
+                                    <div className="flex items-center gap-1">
+                                      <span className="min-w-0 flex-1 truncate">
+                                        {actorDisplay}
+                                      </span>
+                                      {fullActor && (
+                                        <button
+                                          type="button"
+                                          aria-label={`Copy full actor identifier ${fullActor}`}
+                                          title={
+                                            copiedActorRef === entry.ref
+                                              ? "Copied"
+                                              : `Copy ${fullActor}`
+                                          }
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void navigator.clipboard?.writeText(fullActor);
+                                            setCopiedActorRef(entry.ref);
+                                            setTimeout(
+                                              () =>
+                                                setCopiedActorRef((cur) =>
+                                                  cur === entry.ref ? null : cur,
+                                                ),
+                                              1_200,
+                                            );
+                                          }}
+                                          className="shrink-0 rounded p-0.5 text-r5e-text/50 opacity-0 transition-opacity hover:bg-r5e-bg hover:text-r5e-text group-hover/actor:opacity-100"
+                                        >
+                                          {copiedActorRef === entry.ref ? (
+                                            <Check className="h-3 w-3 text-r5e-success" />
+                                          ) : (
+                                            <Copy className="h-3 w-3" />
+                                          )}
+                                        </button>
+                                      )}
+                                    </div>
                                   </td>
                                 );
                               case "session":
@@ -895,17 +1168,10 @@ export default function Dashboard(): JSX.Element {
               </div>
             )}
           </div>
-
-          <BulkActionBar
-            selectedRefs={selectedRefs}
-            firstSelectedSession={firstSelectedSession}
-            role={role}
-            onClearSelection={() => setSelectedRefs([])}
-            onOpenDetail={(ref) => navigate(recordDetailPath(ref))}
-          />
         </main>
       </div>
 
+      {/* RecordDetail slide-over drawer */}
       <Outlet />
     </div>
   );
@@ -916,10 +1182,10 @@ function OutcomePill({
   reason,
 }: {
   outcome: PolicyOutcome;
-  reason?: string;
+  reason?: string | null;
 }): JSX.Element {
   return (
-    <span title={reason}>
+    <span title={reason ?? undefined}>
       <Pill
         tone={
           outcome === "allow"
@@ -969,13 +1235,4 @@ function StatChip({
       </span>
     </div>
   );
-}
-
-function formatShortTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    return d.toISOString().replace("T", " ").slice(0, 19) + "Z";
-  } catch {
-    return iso;
-  }
 }

@@ -32,7 +32,7 @@ export function Sidebar(): JSX.Element {
     >
       <div className="flex flex-col gap-1 pb-4" data-testid="sidebar-workspace">
         <Wordmark size="sm" />
-        <span className="text-[12px] text-r5e-muted">/ provenance v2</span>
+        <span className="text-[12px] text-r5e-muted">Audit Console</span>
       </div>
 
       <div className="h-px w-full bg-r5e-border" aria-hidden="true" />

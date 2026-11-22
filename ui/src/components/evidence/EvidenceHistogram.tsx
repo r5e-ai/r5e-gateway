@@ -7,9 +7,12 @@
 
 import { useMemo, useRef, useState } from "react";
 
-import type {
-  EvidenceHistogramResponse,
-  PolicyOutcome,
+import {
+  formatTimestamp,
+  formatUtcTimestamp,
+  type EvidenceHistogramResponse,
+  type PolicyOutcome,
+  type TimeDisplayMode,
 } from "~/lib/evidenceTypes";
 
 export interface LoadedHistogramRow {
@@ -32,6 +35,7 @@ interface Props {
   loadedRows: readonly LoadedHistogramRow[];
   since?: string;
   until?: string;
+  timeMode?: TimeDisplayMode;
   onSelectRange: (since: string | null, until: string | null) => void;
 }
 
@@ -120,11 +124,22 @@ export function buildBucketsFromRows(
   return buckets;
 }
 
-function formatAxisTime(iso: string): string {
+function formatAxisTime(iso: string, mode: TimeDisplayMode): { display: string; utc: string } {
+  const utc = formatUtcTimestamp(iso);
+  if (mode === "utc") return { display: utc.slice(5), utc };
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return { display: iso, utc };
   try {
-    return new Date(iso).toISOString().replace("T", " ").slice(5, 19) + "Z";
+    const display = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(new Date(ms));
+    return { display, utc };
   } catch {
-    return iso;
+    return { display: utc.slice(5), utc };
   }
 }
 
@@ -134,6 +149,7 @@ export function EvidenceHistogram({
   loadedRows,
   since,
   until,
+  timeMode = "local",
   onSelectRange,
 }: Props): JSX.Element {
   const isServerBacked = Boolean(
@@ -223,14 +239,14 @@ export function EvidenceHistogram({
             >
               histogram error: {analyticsError}
             </span>
-          ) : (
+          ) : !isServerBacked ? (
             <span
               data-testid="histogram-source-badge"
               className="rounded border border-r5e-border bg-r5e-bg px-1.5 py-0.5 font-mono text-[10px] text-r5e-text/80"
             >
-              {isServerBacked ? "server histogram" : "showing loaded window"}
+              showing loaded window
             </span>
-          )}
+          ) : null}
           <div className="flex items-center gap-3 text-[11px] text-r5e-text/80">
             <span className="inline-flex items-center gap-1">
               <span className="h-2 w-2 rounded-sm bg-r5e-success" /> Allow
@@ -285,111 +301,143 @@ export function EvidenceHistogram({
         </div>
       ) : (
         <div className="select-none">
-          <div
-            ref={barAreaRef}
-            data-testid="histogram-brush-area"
-            role="region"
-            aria-label="Drag across bars to select a time range"
-            onMouseDown={(e) => {
-              const idx = indexFromClientX(e.clientX);
-              brushStartRef.current = idx;
-              brushEndRef.current = idx;
-              setBrushStartIdx(idx);
-              setBrushEndIdx(idx);
-            }}
-            onMouseMove={(e) => {
-              const idx = indexFromClientX(e.clientX);
-              setHoveredIdx(idx);
-              if (brushStartRef.current !== null) {
-                brushEndRef.current = idx;
-                setBrushEndIdx(idx);
-              }
-            }}
-            onMouseUp={(e) => {
-              if (brushStartRef.current !== null) {
-                const start = brushStartRef.current;
-                const endIdx = indexFromClientX(e.clientX);
-                brushStartRef.current = null;
-                brushEndRef.current = null;
-                setBrushStartIdx(null);
-                setBrushEndIdx(null);
-                commitBrush(start, endIdx);
-              }
-            }}
-            onMouseLeave={() => {
-              setHoveredIdx(null);
-              if (brushStartRef.current !== null && brushEndRef.current !== null) {
-                const start = brushStartRef.current;
-                const endIdx = brushEndRef.current;
-                brushStartRef.current = null;
-                brushEndRef.current = null;
-                setBrushStartIdx(null);
-                setBrushEndIdx(null);
-                commitBrush(start, endIdx);
-              }
-            }}
-            className="relative flex h-14 cursor-crosshair items-end gap-0.5 rounded border border-r5e-border bg-r5e-bg/80 px-1.5 pt-1.5"
-          >
-            {buckets.map((b, i) => {
-              const heightPct =
-                b.total > 0 ? Math.max(8, Math.round((b.total / maxTotal) * 100)) : 0;
-              const allowPct = b.total > 0 ? (b.allow / b.total) * 100 : 0;
-              const denyPct = b.total > 0 ? (b.deny / b.total) * 100 : 0;
-              const otherPct = b.total > 0 ? Math.max(0, 100 - allowPct - denyPct) : 0;
-              const inBrush = selLo !== null && selHi !== null && i >= selLo && i <= selHi;
-
-              return (
-                <div
-                  key={b.start}
-                  data-testid={`histogram-bar-${i}`}
-                  data-bucket-count={b.total}
-                  title={`${formatAxisTime(b.start)} — allow:${b.allow}, deny/error:${b.deny}, other:${b.other}`}
-                  className={[
-                    "flex h-full flex-1 flex-col justify-end rounded-t-sm transition-colors",
-                    inBrush ? "bg-r5e-accent/25" : hoveredIdx === i ? "bg-r5e-surface" : "",
-                  ].join(" ")}
-                >
-                  {b.total > 0 && (
-                    <div
-                      className="flex w-full flex-col overflow-hidden rounded-t-sm"
-                      style={{ height: `${heightPct}%` }}
-                    >
-                      {b.deny > 0 && (
-                        <div
-                          className="w-full bg-r5e-danger"
-                          style={{ height: `${denyPct}%`, minHeight: "2px" }}
-                        />
-                      )}
-                      {b.allow > 0 && (
-                        <div
-                          className="w-full bg-r5e-success"
-                          style={{ height: `${allowPct}%`, minHeight: "2px" }}
-                        />
-                      )}
-                      {b.other > 0 && (
-                        <div
-                          className="w-full bg-r5e-accent/80"
-                          style={{ height: `${otherPct}%`, minHeight: "2px" }}
-                        />
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          <div className="mt-1 flex items-center justify-between gap-2 font-mono text-[10px] text-r5e-text/75">
-            <span className="shrink-0">{formatAxisTime(buckets[0]!.start)}</span>
-            <span
-              data-testid="histogram-hover-readout"
-              className="truncate text-r5e-text/80"
+          <div className="flex items-stretch gap-1.5">
+            {/* Light Y-axis count scale */}
+            <div
+              aria-hidden="true"
+              data-testid="histogram-y-scale"
+              className="flex w-7 shrink-0 flex-col justify-between py-0.5 text-right font-mono text-[10px] leading-none text-r5e-text/60"
             >
-              {hovered
-                ? `${formatAxisTime(hovered.start)} — allow:${hovered.allow} deny:${hovered.deny} other:${hovered.other}`
-                : "Drag across bars to filter time range"}
-            </span>
-            <span className="shrink-0">{formatAxisTime(buckets[buckets.length - 1]!.end)}</span>
+              <span>{maxTotal}</span>
+              <span>0</span>
+            </div>
+
+            <div
+              ref={barAreaRef}
+              data-testid="histogram-brush-area"
+              role="region"
+              aria-label="Drag across bars to select a time range"
+              onMouseDown={(e) => {
+                const idx = indexFromClientX(e.clientX);
+                brushStartRef.current = idx;
+                brushEndRef.current = idx;
+                setBrushStartIdx(idx);
+                setBrushEndIdx(idx);
+              }}
+              onMouseMove={(e) => {
+                const idx = indexFromClientX(e.clientX);
+                setHoveredIdx(idx);
+                if (brushStartRef.current !== null) {
+                  brushEndRef.current = idx;
+                  setBrushEndIdx(idx);
+                }
+              }}
+              onMouseUp={(e) => {
+                if (brushStartRef.current !== null) {
+                  const start = brushStartRef.current;
+                  const endIdx = indexFromClientX(e.clientX);
+                  brushStartRef.current = null;
+                  brushEndRef.current = null;
+                  setBrushStartIdx(null);
+                  setBrushEndIdx(null);
+                  commitBrush(start, endIdx);
+                }
+              }}
+              onMouseLeave={() => {
+                setHoveredIdx(null);
+                if (brushStartRef.current !== null && brushEndRef.current !== null) {
+                  const start = brushStartRef.current;
+                  const endIdx = brushEndRef.current;
+                  brushStartRef.current = null;
+                  brushEndRef.current = null;
+                  setBrushStartIdx(null);
+                  setBrushEndIdx(null);
+                  commitBrush(start, endIdx);
+                }
+              }}
+              className={[
+                "relative flex h-14 min-w-0 flex-1 cursor-crosshair items-end gap-0.5 rounded border px-1.5 pt-1.5",
+                since || until
+                  ? "border-r5e-accent/50 bg-r5e-accent/10"
+                  : "border-r5e-border bg-r5e-bg/80",
+              ].join(" ")}
+            >
+              {buckets.map((b, i) => {
+                const heightPct =
+                  b.total > 0 ? Math.max(8, Math.round((b.total / maxTotal) * 100)) : 0;
+                const allowPct = b.total > 0 ? (b.allow / b.total) * 100 : 0;
+                const denyPct = b.total > 0 ? (b.deny / b.total) * 100 : 0;
+                const otherPct = b.total > 0 ? Math.max(0, 100 - allowPct - denyPct) : 0;
+                const inBrush = selLo !== null && selHi !== null && i >= selLo && i <= selHi;
+                const ts = formatTimestamp(b.start, timeMode);
+
+                return (
+                  <div
+                    key={b.start}
+                    data-testid={`histogram-bar-${i}`}
+                    data-bucket-count={b.total}
+                    title={`${ts.display} (${ts.utc}) — total:${b.total} (allow:${b.allow}, deny/error:${b.deny}, other:${b.other})`}
+                    className={[
+                      "flex h-full flex-1 flex-col items-center justify-end rounded-t-sm transition-colors",
+                      inBrush ? "bg-r5e-accent/25" : hoveredIdx === i ? "bg-r5e-surface" : "",
+                    ].join(" ")}
+                  >
+                    {b.total > 0 && (
+                      <div
+                        className="flex w-full max-w-[20px] flex-col overflow-hidden rounded-t-sm"
+                        style={{ height: `${heightPct}%` }}
+                      >
+                        {b.deny > 0 && (
+                          <div
+                            className="w-full bg-r5e-danger"
+                            style={{ height: `${denyPct}%`, minHeight: "2px" }}
+                          />
+                        )}
+                        {b.allow > 0 && (
+                          <div
+                            className="w-full bg-r5e-success"
+                            style={{ height: `${allowPct}%`, minHeight: "2px" }}
+                          />
+                        )}
+                        {b.other > 0 && (
+                          <div
+                            className="w-full bg-r5e-accent/80"
+                            style={{ height: `${otherPct}%`, minHeight: "2px" }}
+                          />
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
+          {(() => {
+            const leftAxis = formatAxisTime(buckets[0]!.start, timeMode);
+            const rightAxis = formatAxisTime(buckets[buckets.length - 1]!.end, timeMode);
+            const hoveredAxis = hovered ? formatAxisTime(hovered.start, timeMode) : null;
+            return (
+              <div className="mt-1 flex items-center justify-between gap-2 pl-8 font-mono text-[10px] text-r5e-text/75">
+                <span className="shrink-0" title={leftAxis.utc}>
+                  {leftAxis.display}
+                </span>
+                <span
+                  data-testid="histogram-hover-readout"
+                  className="truncate text-r5e-text/80"
+                  title={hoveredAxis?.utc}
+                >
+                  {hovered && hoveredAxis
+                    ? `${hoveredAxis.display} — ${hovered.total} records (allow:${hovered.allow} deny/err:${hovered.deny} other:${hovered.other})`
+                    : since || until
+                      ? "Showing selected range — drag again to refine"
+                      : "Drag across bars to filter time range"}
+                </span>
+                <span className="shrink-0" title={rightAxis.utc}>
+                  {rightAxis.display}
+                </span>
+              </div>
+            );
+          })()}
         </div>
       )}
     </section>

@@ -6,6 +6,7 @@ export type EvidenceColumnId =
   | "kind"
   | "policy"
   | "target"
+  | "reason"
   | "actor"
   | "session"
   | "ref"
@@ -20,14 +21,15 @@ export interface EvidenceColumnDef {
 }
 
 export const EVIDENCE_COLUMNS: ReadonlyArray<EvidenceColumnDef> = [
-  { id: "captured", label: "Captured", defaultWidth: 156, minWidth: 120, defaultVisible: true },
-  { id: "kind", label: "Kind", defaultWidth: 132, minWidth: 100, defaultVisible: true },
-  { id: "policy", label: "Policy", defaultWidth: 82, minWidth: 72, defaultVisible: true },
-  { id: "target", label: "Target / Tool", defaultWidth: 210, minWidth: 140, defaultVisible: true },
-  { id: "actor", label: "Actor", defaultWidth: 165, minWidth: 110, defaultVisible: true },
-  { id: "session", label: "Session", defaultWidth: 200, minWidth: 120, defaultVisible: false },
-  { id: "ref", label: "Record Ref", defaultWidth: 165, minWidth: 130, defaultVisible: true },
-  { id: "streamSeq", label: "Stream / Seq", defaultWidth: 180, minWidth: 120, defaultVisible: false },
+  { id: "captured", label: "Captured", defaultWidth: 140, minWidth: 110, defaultVisible: true },
+  { id: "kind", label: "Kind", defaultWidth: 124, minWidth: 96, defaultVisible: true },
+  { id: "policy", label: "Policy", defaultWidth: 78, minWidth: 68, defaultVisible: true },
+  { id: "target", label: "Target / Tool", defaultWidth: 160, minWidth: 110, defaultVisible: true },
+  { id: "reason", label: "Reason", defaultWidth: 180, minWidth: 110, defaultVisible: true },
+  { id: "actor", label: "Actor", defaultWidth: 145, minWidth: 100, defaultVisible: true },
+  { id: "session", label: "Session", defaultWidth: 190, minWidth: 120, defaultVisible: false },
+  { id: "ref", label: "Record Ref", defaultWidth: 140, minWidth: 115, defaultVisible: true },
+  { id: "streamSeq", label: "Stream / Seq", defaultWidth: 175, minWidth: 120, defaultVisible: false },
 ];
 
 export const COLUMN_DEF_BY_ID: Record<EvidenceColumnId, EvidenceColumnDef> =
@@ -42,7 +44,7 @@ export interface EvidenceColumnPrefs {
   widths: Record<EvidenceColumnId, number>;
 }
 
-export const EVIDENCE_COLUMNS_STORAGE_KEY = "r5e.v2.evidence.columns.v1";
+export const EVIDENCE_COLUMNS_STORAGE_KEY = "r5e.v2.evidence.columns.v2";
 
 export function defaultColumnPrefs(): EvidenceColumnPrefs {
   const order = EVIDENCE_COLUMNS.map((c) => c.id);
