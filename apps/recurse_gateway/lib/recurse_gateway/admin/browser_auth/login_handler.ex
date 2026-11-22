@@ -143,7 +143,11 @@ defmodule Recurse.Gateway.Admin.BrowserAuth.LoginHandler do
 
     case validate_return_to(return_to) do
       :ok ->
-        build_and_redirect_to_idp(fetched, return_to, config)
+        # A node with no identity provider set has nowhere to send the
+        # browser. That is a setting to make, not a fault of the node.
+        if provider_set?(config),
+          do: build_and_redirect_to_idp(fetched, return_to, config),
+          else: send_error(fetched, 503, "login_not_configured")
 
       :error ->
         emit_login(config, %{outcome: "invalid_return_to"})
@@ -156,6 +160,9 @@ defmodule Recurse.Gateway.Admin.BrowserAuth.LoginHandler do
   defp emit_login(config, meta) do
     UiReceipts.emit(:ui_login, Map.put(meta, :auth_provider, config.auth_provider))
   end
+
+  defp provider_set?(config),
+    do: Enum.all?([config.authorize_url, config.client_id, config.redirect_uri], &is_binary/1)
 
   defp validate_return_to(path) when is_binary(path) do
     cond do
