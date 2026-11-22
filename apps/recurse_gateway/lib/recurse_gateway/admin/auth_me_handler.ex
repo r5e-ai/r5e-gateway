@@ -131,17 +131,24 @@ defmodule Recurse.Gateway.Admin.AuthMeHandler do
   defp render(conn, session) do
     fallback = read_principal_from_bearer(conn)
 
-    %{
+    shown(fallback, %{
       "principal_subject" =>
         Map.get(session, :principal_subject) || Map.get(fallback, :principal_subject) || "",
-      "recurse_role" =>
-        Map.get(session, :recurse_role) || Map.get(fallback, :recurse_role) || "",
+      "recurse_role" => Map.get(session, :recurse_role) || Map.get(fallback, :recurse_role) || "",
       "tenant_id" => Map.fetch!(session, :tenant_id),
       "browser_session_id" => Map.fetch!(session, :browser_session_id),
       "session_expires_at" => to_iso8601(Map.fetch!(session, :session_expires_at)),
       "session_idle_timeout_at" => to_iso8601(Map.fetch!(session, :session_idle_timeout_at))
-    }
+    })
   end
+
+  # What to call the person on screen, when their identity provider gave
+  # a name or address that is not just their identifier again.
+  defp shown(%{display_name: name, principal_subject: subject}, body)
+       when is_binary(name) and name != "" and name != subject,
+       do: Map.put(body, "display_name", name)
+
+  defp shown(_principal, body), do: body
 
   # Best-effort: peek the bearer JWT's `principal` claim WITHOUT
   # signature verification. The cookie envelope is already verified
@@ -164,7 +171,8 @@ defmodule Recurse.Gateway.Admin.AuthMeHandler do
          {:ok, %{"principal" => principal}} when is_map(principal) <- JSON.decode(bytes) do
       %{
         principal_subject: Map.get(principal, "subject"),
-        recurse_role: Map.get(principal, "recurse_role")
+        recurse_role: Map.get(principal, "recurse_role"),
+        display_name: Map.get(principal, "display_name")
       }
     else
       _ -> %{}

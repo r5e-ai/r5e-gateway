@@ -163,7 +163,7 @@
   "schemas": [
     {"name": "attestation", "uri": "https://gateway.example.com/v1/schemas/attestation.json", "version": "0.1.0-placeholder"},
     {"name": "audit_receipts_list_response", "uri": "https://gateway.example.com/v1/schemas/audit_receipts_list_response.json", "version": "1.0.0"},
-    {"name": "auth_me", "uri": "https://gateway.example.com/v1/schemas/auth_me.json", "version": "1.0.0"},
+    {"name": "auth_me", "uri": "https://gateway.example.com/v1/schemas/auth_me.json", "version": "1.1.0"},
     {"name": "blast_radius_summary", "uri": "https://gateway.example.com/v1/schemas/blast_radius_summary.json", "version": "0.1.0-placeholder"},
     {"name": "chat_conversation", "uri": "https://gateway.example.com/v1/schemas/chat_conversation.json", "version": "0.1.0-placeholder"},
     {"name": "chat_message", "uri": "https://gateway.example.com/v1/schemas/chat_message.json", "version": "0.1.0-placeholder"},
