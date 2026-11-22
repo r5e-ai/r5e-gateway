@@ -10,6 +10,8 @@ export const apiPaths = {
   deployment: "/v1/deployment",
   evidence: {
     records: "/v1/evidence/records",
+    histogram: "/v1/evidence/histogram",
+    facets: "/v1/evidence/facets",
     recordDetail: (ref: string) =>
       `/v1/evidence/records/${encodeURIComponent(ref)}`,
     recordContent: (recordRef: string, bytesRef: string) =>

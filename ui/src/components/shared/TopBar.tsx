@@ -49,25 +49,25 @@ export function TopBar({ pageContent, actions }: TopBarProps = {}): JSX.Element 
   return (
     <header
       data-testid="global-topbar"
-      className="flex h-14 shrink-0 items-center justify-between border-b border-r5e-border bg-r5e-bg px-6 font-sans"
+      className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-r5e-border bg-r5e-bg px-5 font-sans"
     >
       <div
         data-testid="topbar-page-content"
-        className="flex min-w-0 flex-1 items-center gap-3"
+        className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden"
       >
         {pageContent}
       </div>
 
-      <div className="flex shrink-0 items-center gap-3">
+      <div className="flex shrink-0 items-center gap-2.5">
         {actions && (
-          <div data-testid="topbar-actions" className="flex items-center gap-2">
+          <div data-testid="topbar-actions" className="flex shrink-0 items-center gap-2">
             {actions}
           </div>
         )}
         {role && (
           <span
             data-testid="topbar-role-pill"
-            className="rounded-full bg-r5e-accent/20 px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-r5e-accent"
+            className="shrink-0 whitespace-nowrap rounded-full bg-r5e-accent/25 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-r5e-text"
           >
             {role.replace("_", " ")}
           </span>
@@ -75,7 +75,8 @@ export function TopBar({ pageContent, actions }: TopBarProps = {}): JSX.Element 
         {principal && (
           <span
             data-testid="topbar-principal"
-            className="font-mono text-xs text-r5e-muted"
+            title={principal}
+            className="max-w-[180px] truncate font-mono text-xs text-r5e-text/85"
           >
             {principal}
           </span>
@@ -84,7 +85,7 @@ export function TopBar({ pageContent, actions }: TopBarProps = {}): JSX.Element 
           type="button"
           data-testid="topbar-signout"
           onClick={handleSignOut}
-          className="text-xs text-r5e-muted hover:text-r5e-text"
+          className="shrink-0 whitespace-nowrap rounded px-2 py-1 text-xs font-medium text-r5e-text/85 hover:bg-r5e-surface hover:text-r5e-text"
         >
           Sign out
         </button>

@@ -60,6 +60,8 @@ interface IndexedRecord {
   capturedAt: string;
   actor: string | null;
   session: string | null;
+  policyOutcome: "allow" | "deny" | "error" | null;
+  target: string | null;
   envelope: SignedEnvelope;
   _decoded: Record<string, unknown>;
 }
@@ -67,12 +69,45 @@ interface IndexedRecord {
 const RAW_SNAPSHOT: RawBundle = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8")) as RawBundle;
 const BLOB_BY_REF = new Map(RAW_SNAPSHOT.blobs.map((b) => [b.ref, b]));
 
+function extractRowMeta(decoded: Record<string, unknown>): {
+  policyOutcome: "allow" | "deny" | "error" | null;
+  target: string | null;
+} {
+  const body = (decoded.body ?? {}) as Record<string, unknown>;
+  const pol = (body.policy ?? body.evaluation) as Record<string, unknown> | undefined;
+  const rawOutcome = pol?.outcome;
+  const policyOutcome =
+    rawOutcome === "allow" || rawOutcome === "deny" || rawOutcome === "error"
+      ? rawOutcome
+      : null;
+
+  const details =
+    body.details && typeof body.details === "object"
+      ? (body.details as Record<string, unknown>)
+      : null;
+  const target =
+    typeof body.tool === "string"
+      ? body.tool
+      : typeof details?.tool === "string"
+        ? details.tool
+        : typeof details?.action === "string"
+          ? details.action
+          : typeof details?.target === "string"
+            ? details.target
+            : typeof body.model === "string"
+              ? body.model
+              : null;
+
+  return { policyOutcome, target };
+}
+
 const SNAPSHOT_RECORDS: IndexedRecord[] = RAW_SNAPSHOT.records.map((r) => {
   const decoded = JSON.parse(
     Buffer.from(r.envelope.payload, "base64").toString("utf8"),
   ) as Record<string, unknown>;
   const apiVersion = String(decoded.apiVersion ?? "provenance.r5e.io/v2");
   const bareKind = String(decoded.kind ?? "Unknown");
+  const { policyOutcome, target } = extractRowMeta(decoded);
   return {
     ref: r.ref,
     stream: String(decoded.stream ?? ""),
@@ -81,6 +116,8 @@ const SNAPSHOT_RECORDS: IndexedRecord[] = RAW_SNAPSHOT.records.map((r) => {
     capturedAt: String(decoded.capturedAt ?? ""),
     actor: typeof decoded.actor === "string" ? decoded.actor : null,
     session: typeof decoded.session === "string" ? decoded.session : null,
+    policyOutcome,
+    target,
     envelope: r.envelope,
     _decoded: decoded,
   };
@@ -181,8 +218,57 @@ function toListRow(r: IndexedRecord) {
     capturedAt: r.capturedAt,
     actor: r.actor,
     session: r.session,
+    policyOutcome: r.policyOutcome,
+    target: r.target,
     envelope: r.envelope,
   };
+}
+
+function matchesSharedFilters(
+  r: IndexedRecord,
+  params: URLSearchParams,
+  ignore?: "kind" | "policyOutcome" | "target",
+): boolean {
+  const kind = ignore === "kind" ? "" : params.get("kind")?.trim() ?? "";
+  const policyOutcome =
+    ignore === "policyOutcome" ? "" : params.get("policyOutcome")?.trim() ?? "";
+  const target = ignore === "target" ? "" : params.get("target")?.trim() ?? "";
+  const actor = params.get("actor")?.trim() ?? "";
+  const session = params.get("session")?.trim() ?? "";
+  const since = params.get("since")?.trim() ?? "";
+  const until = params.get("until")?.trim() ?? "";
+  const q = params.get("q")?.trim().toLowerCase() ?? "";
+
+  if (kind && r.kind !== kind) return false;
+  if (policyOutcome && r.policyOutcome !== policyOutcome) return false;
+  if (target && r.target !== target) return false;
+  if (actor && r.actor !== actor) return false;
+  if (session && r.session !== session) return false;
+  if (since) {
+    const sinceMs = Date.parse(since);
+    const capMs = Date.parse(r.capturedAt);
+    if (Number.isFinite(sinceMs) && Number.isFinite(capMs)) {
+      if (capMs < sinceMs) return false;
+    } else if (r.capturedAt < since) {
+      return false;
+    }
+  }
+  if (until) {
+    const untilMs = Date.parse(until);
+    const capMs = Date.parse(r.capturedAt);
+    if (Number.isFinite(untilMs) && Number.isFinite(capMs)) {
+      if (capMs >= untilMs) return false;
+    } else if (r.capturedAt >= until) {
+      return false;
+    }
+  }
+  if (q) {
+    const hay = [r.actor ?? "", r.session ?? "", r.kind, r.target ?? "", r.ref]
+      .join(" ")
+      .toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -304,7 +390,9 @@ export function devMocksPlugin(): Plugin {
         // Auth
         if (method === "GET" && pathname === "/v1/auth/me") {
           return sendJson(res, 200, {
-            principal_subject: "operator@r5e.dev",
+            principal_subject: "user_01KR1ZGCJHV0AZ5793SQWNAGST",
+            display_name: "operator@r5e.dev",
+            email: "operator@r5e.dev",
             recurse_role: "platform_operator",
             tenant_id: "r5e-dev",
             browser_session_id: "dev-mock-session",
@@ -326,6 +414,9 @@ export function devMocksPlugin(): Plugin {
         if (method === "GET" && pathname === "/v1/evidence/records") {
           const allowedParams = new Set([
             "kind",
+            "policyOutcome",
+            "target",
+            "q",
             "actor",
             "session",
             "since",
@@ -341,24 +432,14 @@ export function devMocksPlugin(): Plugin {
               });
             }
           }
-          const kindFilter = url.searchParams.get("kind")?.trim() ?? "";
-          const actorFilter = url.searchParams.get("actor")?.trim() ?? "";
-          const sessionFilter = url.searchParams.get("session")?.trim() ?? "";
-          const since = url.searchParams.get("since")?.trim() ?? "";
-          const until = url.searchParams.get("until")?.trim() ?? "";
           const limit = Math.min(
             200,
             Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50),
           );
 
-          const filtered = SNAPSHOT_RECORDS.filter((r) => {
-            if (kindFilter && r.kind !== kindFilter) return false;
-            if (actorFilter && r.actor !== actorFilter) return false;
-            if (sessionFilter && r.session !== sessionFilter) return false;
-            if (since && r.capturedAt < since) return false;
-            if (until && r.capturedAt > until) return false;
-            return true;
-          }).sort((a, b) => {
+          const filtered = SNAPSHOT_RECORDS.filter((r) =>
+            matchesSharedFilters(r, url.searchParams),
+          ).sort((a, b) => {
             if (a.capturedAt !== b.capturedAt) return a.capturedAt < b.capturedAt ? 1 : -1;
             return a.ref < b.ref ? 1 : -1;
           });
@@ -366,6 +447,86 @@ export function devMocksPlugin(): Plugin {
           return sendJson(res, 200, {
             records: filtered.slice(0, limit).map(toListRow),
             cursor: null,
+          });
+        }
+
+        // GET /v1/evidence/facets (disjunctive counts)
+        if (method === "GET" && pathname === "/v1/evidence/facets") {
+          const total = SNAPSHOT_RECORDS.filter((r) =>
+            matchesSharedFilters(r, url.searchParams),
+          ).length;
+
+          const countAxis = (
+            axis: "kind" | "policyOutcome" | "target",
+            extract: (r: IndexedRecord) => string | null,
+          ) => {
+            const map = new Map<string, number>();
+            for (const r of SNAPSHOT_RECORDS) {
+              if (!matchesSharedFilters(r, url.searchParams, axis)) continue;
+              const v = extract(r);
+              if (v) map.set(v, (map.get(v) ?? 0) + 1);
+            }
+            return Array.from(map.entries())
+              .sort((a, b) => b[1] - a[1])
+              .map(([value, count]) => ({ value, count }));
+          };
+
+          return sendJson(res, 200, {
+            total,
+            facets: {
+              kind: countAxis("kind", (r) => r.kind),
+              policyOutcome: countAxis("policyOutcome", (r) => r.policyOutcome),
+              target: countAxis("target", (r) => r.target),
+            },
+          });
+        }
+
+        // GET /v1/evidence/histogram (`since` & `until` required; `buckets` default 60 max 240)
+        if (method === "GET" && pathname === "/v1/evidence/histogram") {
+          const sinceStr = url.searchParams.get("since")?.trim() ?? "";
+          const untilStr = url.searchParams.get("until")?.trim() ?? "";
+          const sinceMs = Date.parse(sinceStr);
+          const untilMs = Date.parse(untilStr);
+          if (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs) || untilMs <= sinceMs) {
+            return sendJson(res, 400, {
+              error: "ERR_BAD_REQUEST",
+              message: "since and until RFC 3339 timestamps are required with until > since",
+            });
+          }
+          const bucketCount = Math.min(
+            240,
+            Math.max(1, Number.parseInt(url.searchParams.get("buckets") ?? "60", 10) || 60),
+          );
+          const spanMs = untilMs - sinceMs;
+          const bucketMs = Math.max(1, spanMs / bucketCount);
+          const bucketSeconds = bucketMs / 1000;
+
+          const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+            start: new Date(sinceMs + i * bucketMs).toISOString(),
+            count: 0,
+            byOutcome: {} as Record<string, number>,
+          }));
+
+          for (const r of SNAPSHOT_RECORDS) {
+            if (!matchesSharedFilters(r, url.searchParams)) continue;
+            const ms = Date.parse(r.capturedAt);
+            if (!Number.isFinite(ms) || ms < sinceMs || ms >= untilMs) continue;
+            const idx = Math.max(
+              0,
+              Math.min(bucketCount - 1, Math.floor((ms - sinceMs) / bucketMs)),
+            );
+            const b = buckets[idx]!;
+            b.count += 1;
+            if (r.policyOutcome) {
+              b.byOutcome[r.policyOutcome] = (b.byOutcome[r.policyOutcome] ?? 0) + 1;
+            }
+          }
+
+          return sendJson(res, 200, {
+            since: sinceStr,
+            until: untilStr,
+            bucketSeconds,
+            buckets,
           });
         }
 

@@ -16,7 +16,7 @@ const DEFAULT_VERIFY_BIN = resolve(
 const HAS_VERIFIER = existsSync(process.env.R5E_VERIFY_RS_BIN || DEFAULT_VERIFY_BIN);
 
 test.describe("v2 Admin Console (Provenance v2 + CedarToolUseGate)", () => {
-  test("Dashboard -> RecordDetail (Content + Verify) -> Policy Simulator (Simulate, Replay, Draft & Blast Radius)", async ({
+  test("Dashboard (Histogram brush + Column resize/reorder/picker) -> RecordDetail (Content + Verify) -> Policy Simulator", async ({
     page,
   }) => {
     const consoleErrors: string[] = [];
@@ -25,12 +25,70 @@ test.describe("v2 Admin Console (Provenance v2 + CedarToolUseGate)", () => {
     });
     page.on("pageerror", (e) => consoleErrors.push(e.message));
 
-    // 1. Dashboard loads real signed Provenance v2 snapshot records
+    // 1. Dashboard loads real signed Provenance v2 snapshot + server facets & histogram
     await page.goto("/admin/dashboard", { waitUntil: "networkidle" });
     await expect(page.getByTestId("evidence-table")).toBeVisible();
-    await expect(page.getByTestId("deployment-chain-badge")).toContainText("b1c6b5aa");
+    await expect(page.getByTestId("evidence-histogram")).toBeVisible();
+    await expect(page.getByTestId("histogram-source-badge")).toContainText(
+      "server histogram",
+    );
+    await expect(page.getByTestId("topbar-signout")).toBeInViewport();
 
-    // 2. Open a ToolCall record -> fetch content blob -> run verifier
+    // 2. Column Picker: show hidden Session column, hide Ref, reorder Actor left
+    await page.getByTestId("column-picker-button").click();
+    await expect(page.getByTestId("column-picker-popover")).toBeVisible();
+    await page.getByTestId("column-toggle-session").check();
+    await expect(page.getByTestId("col-header-session")).toBeVisible();
+    await page.getByTestId("column-toggle-ref").uncheck();
+    await expect(page.getByTestId("col-header-ref")).toHaveCount(0);
+    await page.getByTestId("column-move-left-actor").click();
+    await page.getByTestId("column-picker-reset").click();
+    await expect(page.getByTestId("col-header-ref")).toBeVisible();
+    await page.keyboard.press("Escape");
+
+    // 3. Column Resize: drag right border of Target header
+    const targetHeader = page.getByTestId("col-header-target");
+    const beforeBox = await targetHeader.boundingBox();
+    const resizer = page.getByTestId("col-resize-target");
+    const resizerBox = await resizer.boundingBox();
+    expect(beforeBox).not.toBeNull();
+    expect(resizerBox).not.toBeNull();
+    await page.mouse.move(resizerBox!.x + 2, resizerBox!.y + resizerBox!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(resizerBox!.x + 62, resizerBox!.y + resizerBox!.height / 2);
+    await page.mouse.up();
+    const afterBox = await targetHeader.boundingBox();
+    expect(afterBox!.width).toBeGreaterThan(beforeBox!.width + 20);
+
+    // 4. Histogram time-brush selection sets since & until, matches facets total, then Clear resets
+    const sumHistogramCounts = async () =>
+      page.evaluate(() => {
+        const bars = Array.from(document.querySelectorAll<HTMLElement>("[data-bucket-count]"));
+        return bars.reduce((sum, el) => sum + Number(el.dataset.bucketCount || 0), 0);
+      });
+    const statTotal = async () => {
+      const text = await page.getByTestId("stat-total").textContent();
+      return Number((text ?? "").replace(/[^0-9]/g, ""));
+    };
+    expect(await sumHistogramCounts()).toBe(await statTotal());
+
+    const brushArea = page.getByTestId("histogram-brush-area");
+    const brushBox = await brushArea.boundingBox();
+    expect(brushBox).not.toBeNull();
+    await page.mouse.move(brushBox!.x + brushBox!.width * 0.6, brushBox!.y + 20);
+    await page.mouse.down();
+    await page.mouse.move(brushBox!.x + brushBox!.width * 0.99, brushBox!.y + 20);
+    await page.mouse.up();
+    await expect(page.getByTestId("clear-time-range-btn")).toBeVisible();
+    expect(page.url()).toContain("since=");
+    expect(page.url()).toContain("until=");
+    await expect
+      .poll(async () => (await sumHistogramCounts()) === (await statTotal()))
+      .toBe(true);
+    await page.getByTestId("clear-time-range-btn").click();
+    await expect(page.getByTestId("clear-time-range-btn")).toHaveCount(0);
+
+    // 5. Open a ToolCall record -> fetch content blob -> run verifier
     const toolCallRow = page.getByTestId("evidence-row-ToolCall").first();
     await expect(toolCallRow).toBeVisible();
     await toolCallRow.click();
@@ -48,14 +106,14 @@ test.describe("v2 Admin Console (Provenance v2 + CedarToolUseGate)", () => {
       await expect(page.getByTestId("verify-ok-count")).toHaveText(/^ok:\s*[1-9]\d*$/i);
     }
 
-    // 3. Navigate to Policy Simulator -> Mode 1 Simulate (Cedar 4.9.1 WASM)
+    // 6. Navigate to Policy Simulator -> Mode 1 Simulate (Cedar 4.9.1 WASM)
     await page.getByTestId("close-drawer-btn").click();
     await page.getByTestId("sidebar-link-policy-simulator").click();
     await expect(page.getByTestId("active-policy-banner")).toBeVisible();
     await page.getByTestId("run-simulate-btn").click();
     await expect(page.getByTestId("simulate-verdict-pill")).toHaveText("deny");
 
-    // 4. Mode 3 Draft & Blast Radius
+    // 7. Mode 3 Draft & Blast Radius
     await page.getByTestId("mode-tab-draft").click();
     await page.getByTestId("run-blast-radius-btn").click();
     await expect(page.getByTestId("blast-cell-noChange")).toBeVisible();
