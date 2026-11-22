@@ -652,11 +652,11 @@ end
 #                                  encrypted before it is stored and a session's
 #                                  content can be erased by destroying its key.
 #                                  Without it, content is stored unencrypted.
-#   R5E_EVIDENCE_SUBJECT_PATTERN   regular expression. A session whose owner (who
-#                                  a call was made for, or else who made it)
-#                                  matches gets its key locked under a key of
-#                                  that owner's, so disposing of the owner as a
-#                                  scope disposes of all their sessions at once.
+#   R5E_EVIDENCE_SUBJECT_PATTERN   regular expression, anchored (\A…\z). A session
+#                                  whose owner (who its records say they were
+#                                  made for) matches gets its key locked under a
+#                                  key of that owner's, so disposing of the owner
+#                                  as a scope disposes of all their sessions.
 #                                  Needs content encryption. Unset, every
 #                                  session's key is locked on its own.
 #   R5E_EVIDENCE_START_CHAIN       "true" has the node begin its own chain at

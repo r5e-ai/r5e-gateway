@@ -143,11 +143,12 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
     end
   end
 
-  defp capture(session) do
+  defp capture(session, on_behalf_of \\ nil) do
     {:ok, receipt} =
       Pipeline.capture(Runtime.pipeline(), %{
         kind_path: "provenance.r5e.io/v2/ToolCall",
         actor: "urn:r5e:principal:test:alice",
+        on_behalf_of: on_behalf_of,
         session: session,
         attachments: [%{name: "args", bytes: @args}],
         blobs: [@policy],
@@ -511,19 +512,78 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
     @tag subjects: "^urn:r5e:principal:test:"
     test "disposing of a person disposes of every session of theirs, in one record", ctx do
       [%{ref: ref} | _] = ctx.receipts
-      other = capture(recorded(ctx.session <> "-later"))
-      assert content(ref, Ref.bytes(@args)).resp_body == @args
+      # The sessions made before anyone was named as their owner are
+      # locked on their own, and stand in the way until disposed of.
+      student = "urn:r5e:principal:test:student-#{System.unique_integer([:positive])}"
+      [one, two] = for n <- 1..2, do: capture(recorded("#{ctx.session}-s#{n}"), student)
+      {:ok, _} = Runtime.seal()
+      assert content(one.ref, Ref.bytes(@args)).resp_body == @args
 
-      disposed = dispose("urn:r5e:principal:test:alice")
+      disposed = dispose(student)
       assert disposed.status == 201
       assert %{"outcome" => "disposed"} = body(disposed)
 
-      for gone <- [ref, other.ref] do
+      for gone <- [one.ref, two.ref] do
         assert content(gone, Ref.bytes(@args)).status == 410
       end
 
-      assert dispose("urn:r5e:principal:test:alice").status == 409
-      assert dispose(recorded(ctx.session)).status == 409
+      # Nobody else's content went with it.
+      assert content(ref, Ref.bytes(@args)).resp_body == @args
+      assert dispose(student).status == 409
+      assert dispose(recorded("#{ctx.session}-s1")).status == 409
+    end
+
+    @tag :encrypted
+    @tag subjects: "^urn:r5e:principal:test:"
+    test "a hold on a person keeps each of their sessions, and one on a session keeps the person",
+         ctx do
+      student = "urn:r5e:principal:test:student-#{System.unique_integer([:positive])}"
+      [one, two] = for n <- 1..2, do: recorded("#{ctx.session}-h#{n}")
+      [first, _second] = for session <- [one, two], do: capture(session, student)
+      {:ok, _} = Runtime.seal()
+
+      hold = fn scope ->
+        ApiHandler.hold(
+          request(:post, "/v1/evidence/retention/holds",
+            body: %{"scope" => scope, "reason" => "litigation"},
+            role: "platform_operator"
+          )
+        )
+      end
+
+      assert hold.(student).status == 201
+      refused = dispose(one)
+      assert refused.status == 409
+      assert %{"error" => "under_hold"} = body(refused)
+      assert dispose(student).status == 409
+
+      other = "urn:r5e:principal:test:student-#{System.unique_integer([:positive])}"
+      kept = recorded("#{ctx.session}-h3")
+      capture(kept, other)
+      {:ok, _} = Runtime.seal()
+      assert hold.(kept).status == 201
+      assert %{"error" => "under_hold"} = body(dispose(other))
+
+      assert content(first.ref, Ref.bytes(@args)).resp_body == @args
+    end
+
+    @tag :encrypted
+    @tag subjects: "^urn:r5e:principal:test:"
+    test "a person is not disposed of while a session of theirs is out of reach", ctx do
+      student = "urn:r5e:principal:test:student-#{System.unique_integer([:positive])}"
+      early = recorded("#{ctx.session}-early")
+      # Its first content names no owner, so its key is locked on its own.
+      capture(early)
+      late = capture(early, student)
+      {:ok, _} = Runtime.seal()
+
+      refused = dispose(student)
+      assert refused.status == 409
+      assert %{"error" => "session_not_under_owner", "about" => ^early} = body(refused)
+      assert content(late.ref, Ref.bytes(@args)).resp_body == @args
+
+      assert dispose(early).status == 201
+      assert content(late.ref, Ref.bytes(@args)).status == 410
     end
   end
 

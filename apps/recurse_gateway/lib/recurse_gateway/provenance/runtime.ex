@@ -365,7 +365,8 @@ defmodule Recurse.Gateway.Provenance.Runtime do
   end
 
   # Which session owners get a key of their own, as a pattern the
-  # owner's identity must match. The deployment says what its subjects
+  # owner's identity must match. It matches anywhere in the identity
+  # unless it is anchored, so a deployment writes `\\A…\\z`. The deployment says what its subjects
   # look like (a school: its student pseudonyms); the gateway does not
   # know what a student is. A pattern needs a key service to mean
   # anything, and a pattern that does not compile stops the node.
@@ -373,6 +374,9 @@ defmodule Recurse.Gateway.Provenance.Runtime do
     case Application.get_env(:recurse_gateway, :evidence_subject_pattern) do
       nil ->
         handle
+
+      "" ->
+        raise "R5E_EVIDENCE_SUBJECT_PATTERN is empty, which would match every owner"
 
       pattern when is_binary(pattern) and is_map_key(handle, :keys) ->
         case Regex.compile(pattern) do

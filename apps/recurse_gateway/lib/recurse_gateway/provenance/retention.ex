@@ -373,7 +373,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
          :ok <- may_record(info, @disposal),
          {:ok, ended} <- holds_over(info, scope, at),
          :ok <- module.disposal_allowed(handle, scope, at),
-         :ok <- key_left(module, handle, scope),
+         :ok <- key_left(module, handle, scope, at),
          {:ok, receipt} <- record(info, @disposal, body, on_behalf_of, at) do
       # Holds that touched this scope and have ended, by a release that
       # counts or by running out, give up their locks now, so that what
@@ -424,8 +424,13 @@ defmodule Recurse.Gateway.Provenance.Retention do
   def dispose(_request, _on_behalf_of), do: {:error, :malformed_request}
 
   # A disposal destroys a key. With none left there is nothing it can do.
-  defp key_left(module, handle, scope) do
-    case module.live_scopes(handle, [scope]) do
+  defp key_left(module, handle, scope, at) do
+    live =
+      if function_exported?(module, :live_scopes, 3),
+        do: module.live_scopes(handle, [scope], at),
+        else: module.live_scopes(handle, [scope])
+
+    case live do
       [] -> {:error, :nothing_to_dispose}
       _live -> :ok
     end
@@ -441,9 +446,10 @@ defmodule Recurse.Gateway.Provenance.Retention do
     counting = counting(info, entries)
     holds = for %{evidence: %{"kind" => @hold}} = entry <- entries, do: entry
 
-    # A subject's disposal takes its sessions with it, so a hold on any
-    # of them stands in the way as one on the subject would.
-    scopes = [scope | sessions_under(module, handle, scope)]
+    # An owner's disposal takes their sessions with it, so a hold on any
+    # of them stands in the way as one on the owner would; and a hold on
+    # an owner stands in the way of disposing of one of their sessions.
+    scopes = [scope | related(module, handle, scope)]
 
     in_scope =
       if Enum.any?(holds, &is_list(&1.evidence["body"]["targets"])) do
@@ -479,9 +485,12 @@ defmodule Recurse.Gateway.Provenance.Retention do
     end
   end
 
-  defp sessions_under(module, handle, scope) do
+  # Not rescued: if the store cannot say which scopes are related, the
+  # disposal fails here, before anything is recorded, rather than going
+  # ahead as if there were none.
+  defp related(module, handle, scope) do
     if function_exported?(module, :scopes_under, 2),
-      do: module.scopes_under(handle, scope),
+      do: module.scopes_under(handle, scope) ++ module.owners_of(handle, scope),
       else: []
   end
 

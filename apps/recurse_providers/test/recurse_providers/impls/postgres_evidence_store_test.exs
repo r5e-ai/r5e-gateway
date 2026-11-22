@@ -525,16 +525,17 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
       student = "urn:r5e:student:test:#{n}"
       [one, two, service] = for s <- 1..3, do: "urn:r5e:session:test:subject-#{s}-#{n}"
       [first, second, third] = for s <- 1..3, do: "said in session #{s} of #{n}"
+      key = "subject:" <> student
 
       assert :ok = Store.put_content(handle, Ref.bytes(first), first, {one, student})
       assert :ok = Store.put_content(handle, Ref.bytes(second), second, {two, student})
       # An owner that is not a subject of this deployment: locked as before.
       assert :ok = Store.put_content(handle, Ref.bytes(third), third, {service, @actor})
 
-      assert %{rows: [[^one, ^student], [^two, ^student], [^service, nil], [^student, nil]]} =
+      assert %{rows: [[^key, nil], [^one, ^key], [^two, ^key], [^service, nil]]} =
                Repo.query!(
                  "SELECT scope, under FROM evidence_content_keys WHERE scope = ANY($1) ORDER BY scope",
-                 [[student, one, two, service]]
+                 [[key, one, two, service]]
                )
 
       assert {:ok, ^first} = Store.get_content(handle, Ref.bytes(first), one)
@@ -548,6 +549,8 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
       assert :error = Store.get_content(handle, Ref.bytes(second), two)
       assert {:ok, ^third} = Store.get_content(handle, Ref.bytes(third), service)
       assert [service] == Store.live_scopes(handle, [student, one, two, service])
+      assert Store.content_disposed?(handle, Ref.bytes(first), one)
+      refute Store.content_disposed?(handle, Ref.bytes(third), service)
       assert :already = Store.dispose_content(handle, student, disposal(2))
 
       # The same person and session recording again are kept under new keys.
@@ -555,6 +558,18 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
       assert :ok = Store.put_content(handle, Ref.bytes(again), again, {one, student})
       assert {:ok, ^again} = Store.get_content(handle, Ref.bytes(again), one)
       assert :error = Store.get_content(handle, Ref.bytes(first), one)
+      refute Store.content_disposed?(handle, Ref.bytes(again), one)
+
+      # A disposal dated before a session began leaves that session alone,
+      # and a person with nothing left to make unreadable is not live.
+      before = %{
+        ref: Ref.evidence("before #{n}"),
+        at: DateTime.add(DateTime.utc_now(), -60, :second)
+      }
+
+      assert [] == Store.live_scopes(handle, [student], before.at)
+      assert :none = Store.dispose_content(handle, student, before)
+      assert {:ok, ^again} = Store.get_content(handle, Ref.bytes(again), one)
     end
 
     test "a subject is not disposed of while a record of one of its sessions must be kept",
@@ -578,8 +593,16 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
 
       :ok = Pipeline.flush(pipeline)
 
-      assert %{rows: [[^student]]} =
+      key = "subject:" <> student
+
+      assert %{rows: [[^key]]} =
                Repo.query!("SELECT under FROM evidence_content_keys WHERE scope = $1", [session])
+
+      # The session existed when the disposal is dated, and its record did not allow it yet.
+      Repo.query!(
+        "UPDATE evidence_content_keys SET created_at = now() - interval '2 minutes' WHERE scope = $1",
+        [session]
+      )
 
       early = %{
         ref: Ref.evidence("early #{n}"),
