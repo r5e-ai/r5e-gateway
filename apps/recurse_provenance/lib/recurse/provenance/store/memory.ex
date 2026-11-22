@@ -146,6 +146,47 @@ defmodule Recurse.Provenance.Store.Memory do
   end
 
   @impl true
+  def list(store, %{stream_prefix: prefix, limit: limit} = asked) do
+    Agent.get(store, fn s ->
+      {:ok,
+       s.records
+       |> Map.values()
+       |> Enum.filter(&(String.starts_with?(&1.stream, prefix) and listed?(&1, asked)))
+       |> Enum.sort_by(&{captured_at(&1), &1.ref}, &later?/2)
+       |> Enum.take(limit)}
+    end)
+  end
+
+  defp listed?(entry, asked) do
+    at = captured_at(entry)
+
+    Enum.all?(asked, fn
+      {:kind_path, kind} -> entry.kind_path == kind
+      {:session, session} -> entry.evidence["session"] == session
+      {:actor, actor} -> entry.evidence["actor"] == actor
+      {:since, since} -> DateTime.compare(at, since) != :lt
+      {:until, until} -> DateTime.compare(at, until) == :lt
+      {:before, position} -> later?(position, {at, entry.ref}) and position != {at, entry.ref}
+      {_, _} -> true
+    end)
+  end
+
+  defp captured_at(%{evidence: %{"capturedAt" => stated}}) do
+    {:ok, at, 0} = DateTime.from_iso8601(stated)
+    at
+  end
+
+  # Whether the first position comes at or after the second: later
+  # capture time, then the greater reference.
+  defp later?({at, ref}, {other_at, other_ref}) do
+    case DateTime.compare(at, other_at) do
+      :gt -> true
+      :lt -> false
+      :eq -> ref >= other_ref
+    end
+  end
+
+  @impl true
   def by_kind(store, kind_path, stream_prefix) do
     Agent.get(store, fn s ->
       {:ok,

@@ -56,7 +56,7 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
       name
     end
 
-    %{signer: signer, profile: profile, start: start, dir: dir}
+    %{signer: signer, profile: profile, start: start, dir: dir, prefix: prefix}
   end
 
   defp tool_call(overrides \\ %{}) do
@@ -143,6 +143,78 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
     {:ok, _} = Pipeline.seal(pipeline, stream, "spiffe://example.test/workload/sealer")
     :ok = Pipeline.flush(pipeline)
     assert {:ok, []} = Store.unsealed_firsts(Repo, stream)
+  end
+
+  test "records are listed newest first, a page at a time, and narrowed by what is asked", ctx do
+    {store, handle} = {Store, Repo}
+    pipeline = ctx.start.({Store, Repo})
+    other_actor = "spiffe://example.test/workload/other"
+
+    for overrides <- [
+          %{session: "urn:r5e:session:test:list-a"},
+          %{session: "urn:r5e:session:test:list-a", actor: other_actor},
+          %{session: "urn:r5e:session:test:list-b"},
+          %{session: "urn:r5e:session:test:list-b", actor: other_actor},
+          %{session: "urn:r5e:session:test:list-b"}
+        ] do
+      {:ok, _} = Pipeline.capture(pipeline, tool_call(overrides))
+    end
+
+    :ok = Pipeline.flush(pipeline)
+
+    asked = %{stream_prefix: ctx.prefix, limit: 100}
+    assert {:ok, [_, _, _, _, _] = all} = store.list(handle, asked)
+
+    position = fn entry ->
+      {:ok, at, 0} = DateTime.from_iso8601(entry.evidence["capturedAt"])
+      {at, entry.ref}
+    end
+
+    newest_first =
+      Enum.sort(all, fn a, b ->
+        {at, ref} = position.(a)
+        {other_at, other_ref} = position.(b)
+        DateTime.compare(at, other_at) == :gt or (at == other_at and ref >= other_ref)
+      end)
+
+    refs = Enum.map(newest_first, & &1.ref)
+    assert Enum.map(all, & &1.ref) == refs
+
+    # Three pages of two: nothing repeated, nothing missed.
+    assert {:ok, [first, second]} = store.list(handle, %{asked | limit: 2})
+
+    assert {:ok, [third, fourth]} =
+             store.list(handle, Map.merge(asked, %{limit: 2, before: position.(second)}))
+
+    assert {:ok, [fifth]} =
+             store.list(handle, Map.merge(asked, %{limit: 2, before: position.(fourth)}))
+
+    assert Enum.map([first, second, third, fourth, fifth], & &1.ref) == refs
+    assert {:ok, []} = store.list(handle, Map.put(asked, :before, position.(fifth)))
+
+    assert {:ok, [_, _, _] = of_session} =
+             store.list(handle, Map.put(asked, :session, "urn:r5e:session:test:list-b"))
+
+    assert Enum.all?(of_session, &(&1.evidence["session"] == "urn:r5e:session:test:list-b"))
+
+    assert {:ok,
+            [%{evidence: %{"actor" => ^other_actor}}, %{evidence: %{"actor" => ^other_actor}}]} =
+             store.list(handle, Map.put(asked, :actor, other_actor))
+
+    assert {:ok, [_, _, _, _, _]} =
+             store.list(handle, Map.put(asked, :kind_path, @base <> "/ToolCall"))
+
+    assert {:ok, []} = store.list(handle, Map.put(asked, :kind_path, @base <> "/ToolResult"))
+
+    # `since` includes its moment and `until` excludes its own.
+    {middle, _} = position.(third)
+    assert {:ok, since} = store.list(handle, Map.put(asked, :since, middle))
+    assert {:ok, until} = store.list(handle, Map.put(asked, :until, middle))
+    assert third.ref in Enum.map(since, & &1.ref)
+    refute third.ref in Enum.map(until, & &1.ref)
+    assert Enum.sort(Enum.map(since ++ until, & &1.ref)) == Enum.sort(refs)
+
+    assert {:ok, []} = store.list(handle, %{asked | stream_prefix: ctx.prefix <> "elsewhere:"})
   end
 
   test "records and content rows cannot be changed or removed", ctx do

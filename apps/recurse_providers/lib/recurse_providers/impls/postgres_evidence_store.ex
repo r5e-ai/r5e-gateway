@@ -212,6 +212,60 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   end
 
   @impl true
+  def list(handle, %{stream_prefix: prefix, limit: limit} = asked) do
+    rows =
+      from(r in "evidence_records",
+        where: fragment("starts_with(?, ?)", r.stream, ^prefix),
+        order_by: [desc: r.captured_at, desc: r.ref],
+        limit: ^limit,
+        select: ^fields()
+      )
+      |> narrowed(asked)
+      |> repo(handle).all()
+
+    {:ok, Enum.map(rows, &elem(entry(&1), 1))}
+  rescue
+    error -> {:error, error}
+  end
+
+  defp narrowed(query, asked) do
+    Enum.reduce(asked, query, fn
+      {:kind_path, kind}, query ->
+        where(query, [r], r.kind_path == ^kind)
+
+      {:session, session}, query ->
+        where(query, [r], r.session == ^session)
+
+      {:actor, actor}, query ->
+        where(query, [r], r.actor == ^actor)
+
+      {:since, since}, query ->
+        where(query, [r], r.captured_at >= type(^since, :utc_datetime_usec))
+
+      {:until, until}, query ->
+        where(query, [r], r.captured_at < type(^until, :utc_datetime_usec))
+
+      # One comparison over the pair, so the index that orders the
+      # listing also finds where to resume it.
+      {:before, {at, ref}}, query ->
+        where(
+          query,
+          [r],
+          fragment(
+            "(?, ?) < (?, ?)",
+            r.captured_at,
+            r.ref,
+            type(^at, :utc_datetime_usec),
+            ^ref
+          )
+        )
+
+      {_, _}, query ->
+        query
+    end)
+  end
+
+  @impl true
   def by_kind(handle, kind_path, stream_prefix) do
     rows =
       from(r in "evidence_records",
