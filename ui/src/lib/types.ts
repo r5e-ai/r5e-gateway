@@ -30,9 +30,9 @@
 //   - apps/recurse_gateway/priv/schemas/session_timeline.json
 //   - apps/recurse_gateway/priv/schemas/verify_response.json
 //
-// Schema-set checksum (sha256): 8989f039030341722a8ad9c8f016e9b13c8c63d1a9e94825f246b02bb675c55a
+// Schema-set checksum (sha256): d0d545afb8c64ec341d24fbdb8ece7d013f3f5fd200da2491ea4b6962c0511ed
 
-export const SCHEMAS_CHECKSUM = "8989f039030341722a8ad9c8f016e9b13c8c63d1a9e94825f246b02bb675c55a" as const;
+export const SCHEMAS_CHECKSUM = "d0d545afb8c64ec341d24fbdb8ece7d013f3f5fd200da2491ea4b6962c0511ed" as const;
 
 /**
  * F004 placeholder schema for attestation. Full shape lands in the implementation phase that owns this entity (see contracts/audit_api_extensions.md). DO NOT consume this skeleton in production code without verifying the published version's x-version is stable.
@@ -175,6 +175,10 @@ export interface AuthMe {
    * Stable principal identifier (e.g., 'alice@corp', 'auth0|...'), straight from the JWT 'sub' / principal.subject claim.
    */
   principal_subject: string;
+  /**
+   * What to call the signed-in person on screen: the name or address their identity provider gave. Absent when the provider gave none; show principal_subject then.
+   */
+  display_name?: string;
   /**
    * Console role the principal carries for this session. Single role per session in F004.
    */
