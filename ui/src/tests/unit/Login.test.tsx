@@ -115,6 +115,28 @@ describe("Login (F8)", () => {
     expect(banner).toHaveTextContent(/server_error/i);
   });
 
+  it("renders a clear message when /admin/login/start returns 503 login_not_configured", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "login_not_configured" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    renderWithSearch("");
+    const cta = screen.getByTestId("login-sso-button");
+    fireEvent.click(cta, { button: 0 });
+
+    const banner = await screen.findByTestId("login-error");
+    expect(banner).toHaveTextContent("Sign-in is not configured on this node.");
+  });
+
+  it("renders a clear message when ?error=login_not_configured is present", () => {
+    renderWithSearch("?error=login_not_configured");
+    const banner = screen.getByTestId("login-error");
+    expect(banner).toHaveTextContent("Sign-in is not configured on this node.");
+  });
+
   it("renders the footer with version + workspace breadcrumbs", () => {
     renderWithSearch("");
     const footer = screen.getByTestId("login-footer");

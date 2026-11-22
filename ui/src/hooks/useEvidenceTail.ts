@@ -1,7 +1,9 @@
 // useEvidenceTail — WebSocket hook for `GET /v1/evidence/tail`.
 //
 // Connects with optional `kind`, `session`, and `actor` query-string filters,
-// handles `{"type":"record","record":...}` and `{"type":"ping"}` frames, and
+// handles `{"type":"record","record":...}` and `{"type":"ping"}` frames,
+// reconnects with bounded exponential backoff (1s -> 2s -> 4s -> 8s) on
+// transient drops, stops on terminal errors (400/401/403/404/503), and
 // exposes `mergeEvidenceRows` for subscribe-then-fetch deduplication by `ref`.
 
 import { useEffect, useRef, useState } from "react";
@@ -24,6 +26,69 @@ export interface EvidenceTailFilters {
 }
 
 const MAX_TAIL_BUFFER = 500;
+export const BACKOFF_BASE_MS = 1_000;
+export const BACKOFF_MAX_MS = 8_000;
+
+export function nextBackoffDelayMs(attempt: number): number {
+  return Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, attempt));
+}
+
+export interface ProbeOutcome {
+  status: LiveTailStatus;
+  detail: string;
+  shouldReconnect: boolean;
+}
+
+/**
+ * Interpret an HTTP probe response from `GET /v1/evidence/tail` after a
+ * WebSocket drop. A healthy node answers a non-WS GET with `426`, which
+ * indicates a transient connection loss rather than a misconfigured route.
+ */
+export function classifyTailProbeResponse(
+  httpStatus: number,
+  body?: { error?: string; message?: string } | null,
+): ProbeOutcome {
+  if (httpStatus === 503 || body?.error === "ERR_NOT_CAPTURING") {
+    return {
+      status: "not_capturing",
+      detail: "Gateway node is not currently capturing live evidence (503).",
+      shouldReconnect: false,
+    };
+  }
+  if (httpStatus === 401 || httpStatus === 403) {
+    return {
+      status: "error",
+      detail: `Not authorized to stream live evidence (${httpStatus}).`,
+      shouldReconnect: false,
+    };
+  }
+  if (httpStatus === 404) {
+    return {
+      status: "unavailable",
+      detail: "Live-tail stream not found (404).",
+      shouldReconnect: false,
+    };
+  }
+  if (httpStatus === 400) {
+    return {
+      status: "error",
+      detail: body?.message ?? "Invalid live-tail filter (400).",
+      shouldReconnect: false,
+    };
+  }
+  if (httpStatus === 426) {
+    return {
+      status: "unavailable",
+      detail: "Connection lost — reconnecting…",
+      shouldReconnect: true,
+    };
+  }
+  return {
+    status: "unavailable",
+    detail: "Connection lost — reconnecting…",
+    shouldReconnect: true,
+  };
+}
 
 /**
  * Deduplicate live-tail records against fetched list rows by `ref`, keeping
@@ -78,97 +143,117 @@ export function useEvidenceTail(
 
     let cancelled = false;
     let ws: WebSocket | null = null;
-    setStatus("connecting");
-    setStatusDetail(null);
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    let probeInFlight = false;
+
     setLiveRecords([]);
 
-    const wsUrl = buildWsUrl(filters);
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch {
-      setStatus("unavailable");
-      setStatusDetail("WebSocket unavailable in this environment.");
-      return;
+    function scheduleReconnect(): void {
+      if (cancelled || reconnectTimer !== null) return;
+      const delay = nextBackoffDelayMs(attempt);
+      attempt += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!cancelled) connect();
+      }, delay);
     }
 
-    ws.onopen = () => {
-      if (cancelled) return;
-      setStatus("connected");
-      setStatusDetail(null);
-      // Subscribe-then-fetch: trigger a fresh list fetch once subscribed so no
-      // records between initial HTTP fetch and WS open are missed.
-      onConnectedRef.current?.();
-    };
-
-    ws.onmessage = (evt) => {
-      if (cancelled || typeof evt.data !== "string") return;
-      let frame: LiveTailFrame | { type?: string; error?: string; message?: string };
-      try {
-        frame = JSON.parse(evt.data) as LiveTailFrame;
-      } catch {
-        return;
-      }
-      if (frame.type === "ping") {
-        ws?.send(JSON.stringify({ type: "pong" }));
-        return;
-      }
-      if (frame.type === "record" && "record" in frame && frame.record?.ref) {
-        const rec = frame.record;
-        setLiveRecords((prev) => {
-          if (prev.some((r) => r.ref === rec.ref)) return prev;
-          return [rec, ...prev].slice(0, MAX_TAIL_BUFFER);
-        });
-      }
-    };
-
-    ws.onerror = () => {
-      if (cancelled) return;
-      // Probe handshake error via HTTP to distinguish 503 ERR_NOT_CAPTURING,
-      // 426 Upgrade Required, 404, and 400 cleanly.
+    function probeAndMaybeReconnect(): void {
+      if (cancelled || probeInFlight) return;
+      probeInFlight = true;
       const httpPath = apiPaths.liveTail(filters);
       void fetch(httpPath, { credentials: "include" })
         .then(async (resp) => {
+          probeInFlight = false;
           if (cancelled) return;
           const body = (await resp.json().catch(() => null)) as {
             error?: string;
             message?: string;
           } | null;
-          if (resp.status === 503 || body?.error === "ERR_NOT_CAPTURING") {
-            setStatus("not_capturing");
-            setStatusDetail("Gateway node is not currently capturing live evidence (503).");
-          } else if (resp.status === 404) {
-            setStatus("unavailable");
-            setStatusDetail("Live-tail stream not found (404).");
-          } else if (resp.status === 400) {
-            setStatus("error");
-            setStatusDetail(body?.message ?? "Invalid live-tail filter (400).");
-          } else if (resp.status === 426) {
-            setStatus("unavailable");
-            setStatusDetail("WebSocket upgrade required (426).");
-          } else {
-            setStatus("unavailable");
-            setStatusDetail("Live-tail connection unavailable.");
+          const outcome = classifyTailProbeResponse(resp.status, body);
+          setStatus(outcome.status);
+          setStatusDetail(outcome.detail);
+          if (outcome.shouldReconnect) {
+            scheduleReconnect();
           }
         })
         .catch(() => {
-          if (!cancelled) {
-            setStatus("unavailable");
-            setStatusDetail("Live-tail connection unavailable.");
-          }
+          probeInFlight = false;
+          if (cancelled) return;
+          setStatus("unavailable");
+          setStatusDetail("Connection lost — reconnecting…");
+          scheduleReconnect();
         });
-    };
+    }
 
-    ws.onclose = (evt) => {
+    function connect(): void {
       if (cancelled) return;
-      if (evt.code === 1000) {
-        setStatus("off");
-      } else {
-        setStatus((cur) => (cur === "connected" || cur === "connecting" ? "unavailable" : cur));
+      setStatus("connecting");
+
+      const wsUrl = buildWsUrl(filters);
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        setStatus("unavailable");
+        setStatusDetail("WebSocket unavailable in this environment.");
+        return;
       }
-    };
+
+      ws.onopen = () => {
+        if (cancelled) return;
+        attempt = 0;
+        setStatus("connected");
+        setStatusDetail(null);
+        // Subscribe-then-fetch: refresh list once subscribed so no records
+        // between HTTP list fetch and WS open are missed.
+        onConnectedRef.current?.();
+      };
+
+      ws.onmessage = (evt) => {
+        if (cancelled || typeof evt.data !== "string") return;
+        let frame: LiveTailFrame | { type?: string };
+        try {
+          frame = JSON.parse(evt.data) as LiveTailFrame;
+        } catch {
+          return;
+        }
+        if (frame.type === "ping") {
+          ws?.send(JSON.stringify({ type: "pong" }));
+          return;
+        }
+        if (frame.type === "record" && "record" in frame && frame.record?.ref) {
+          const rec = frame.record;
+          setLiveRecords((prev) => {
+            if (prev.some((r) => r.ref === rec.ref)) return prev;
+            return [rec, ...prev].slice(0, MAX_TAIL_BUFFER);
+          });
+        }
+      };
+
+      ws.onerror = () => {
+        if (cancelled) return;
+        probeAndMaybeReconnect();
+      };
+
+      ws.onclose = (evt) => {
+        if (cancelled) return;
+        if (evt.code === 1000) {
+          setStatus("off");
+          return;
+        }
+        probeAndMaybeReconnect();
+      };
+    }
+
+    connect();
 
     return () => {
       cancelled = true;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       ws?.close(1000);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
