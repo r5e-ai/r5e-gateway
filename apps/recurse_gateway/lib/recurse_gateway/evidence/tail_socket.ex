@@ -150,6 +150,7 @@ defmodule Recurse.Gateway.Evidence.TailSocket do
       "ref" => entry.ref,
       "policyOutcome" => labels["policyOutcome"],
       "target" => labels["target"],
+      "reason" => labels["reason"],
       "stream" => entry.stream,
       "seq" => entry.seq,
       "kind" => entry.kind_path,

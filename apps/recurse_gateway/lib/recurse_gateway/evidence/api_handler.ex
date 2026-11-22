@@ -116,7 +116,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   @default_limit 50
   @max_limit 200
-  @filter_params ~w(kind session actor since until policyOutcome target q)
+  @filter_params ~w(kind session actor since until policyOutcome target reason q)
   @listing_params @filter_params ++ ~w(limit cursor)
   @default_buckets 60
   @max_buckets 240
@@ -298,8 +298,23 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end
   end
 
-  defp asked({"kind", kind}, {:ok, acc}) when kind != "",
-    do: {:cont, {:ok, Map.put(acc, :kind_path, kind)}}
+  # One kind, or several separated by commas: a reader's own grouping
+  # of kinds, such as "what agents did", is theirs to name.
+  defp asked({"kind", kind}, {:ok, acc}) when kind != "" do
+    case String.split(kind, ",", trim: true) do
+      [one] ->
+        {:cont, {:ok, Map.put(acc, :kind_path, one)}}
+
+      [_ | _] = several when length(several) <= 50 ->
+        {:cont, {:ok, Map.put(acc, :kind_paths, several)}}
+
+      _ ->
+        {:halt, {:bad, "kind is one kind, or up to 50 separated by commas"}}
+    end
+  end
+
+  defp asked({"reason", reason}, {:ok, acc}) when reason != "",
+    do: {:cont, {:ok, Map.put(acc, :reason, reason)}}
 
   defp asked({"actor", actor}, {:ok, acc}) when actor != "",
     do: {:cont, {:ok, Map.put(acc, :actor, actor)}}
