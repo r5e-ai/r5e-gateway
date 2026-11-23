@@ -42,6 +42,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
   @ticket_context "r5e.hold-release-ticket/v1"
   @ticket_seconds 300
   @hold_scope "urn:r5e:hold:"
+  @default_auto_hold_kinds ["education.r5e.io/v1/SafeguardingFlag"]
 
   @type error ::
           :malformed_request
@@ -53,12 +54,55 @@ defmodule Recurse.Gateway.Provenance.Retention do
           | :nothing_to_dispose
           | :store_unavailable
           | {:under_hold, String.t()}
+          | {:safeguarding_hold_pending, String.t()}
           | {:never_disposed_of | :kept_until | :profile_not_held, String.t()}
           | atom()
 
   @doc "This deployment's retention stream."
   @spec stream(String.t()) :: String.t()
   def stream(deployment), do: "urn:r5e:stream:#{deployment}:retention"
+
+  @doc """
+  Parse a comma-separated `R5E_EVIDENCE_AUTO_HOLD_KINDS` value into a
+  deduplicated list of record kind paths (`namespace/version/Kind`).
+
+  When `nil` (env var unset), defaults to `#{inspect(@default_auto_hold_kinds)}`.
+  An explicit empty string (`""`) disables automatic holds.
+  """
+  @spec parse_auto_hold_kinds(String.t() | nil) :: [String.t()]
+  def parse_auto_hold_kinds(nil), do: @default_auto_hold_kinds
+
+  def parse_auto_hold_kinds(raw) when is_binary(raw) do
+    raw
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  @doc """
+  Return the configured record kind paths that automatically trigger an
+  indefinite gateway-signed `RetentionHold` upon admission.
+
+  Standing note: any party holding an active badge permitted to submit one of
+  these kinds can trigger an indefinite `RetentionHold` on its own sessions,
+  blocking owner/FERPA disposal until the two-step counselor/retention release
+  completes. That is intentional so flagged evidence cannot be erased before
+  review.
+  """
+  @spec auto_hold_kinds() :: [String.t()]
+  def auto_hold_kinds do
+    case Application.fetch_env(:recurse_gateway, :evidence_auto_hold_kinds) do
+      {:ok, kinds} when is_list(kinds) ->
+        kinds
+        |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+        |> Enum.map(&String.trim/1)
+        |> Enum.uniq()
+
+      _ ->
+        @default_auto_hold_kinds
+    end
+  end
 
   # -- holds ----------------------------------------------------------------
 
@@ -404,6 +448,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
     with true <- body["action"] in ["deleted", "expired"] || {:error, :malformed_request},
          :ok <- may_record(info, @disposal),
          {:ok, ended} <- holds_over(info, scope, at),
+         :ok <- no_pending_auto_holds(info, scope),
          :ok <- module.disposal_allowed(handle, scope, at),
          :ok <- key_left(module, handle, scope),
          {:ok, receipt} <- record(info, @disposal, body, on_behalf_of, at) do
@@ -600,6 +645,95 @@ defmodule Recurse.Gateway.Provenance.Retention do
       _ -> []
     end
   end
+
+  # Fail closed if an admitted record of a configured auto-hold kind exists for
+  # `scope` without a matching counselor-released hold. Closes both hold
+  # placement failures and any race window between admission and hold flush.
+  defp no_pending_auto_holds(info, scope) do
+    case auto_hold_kinds() do
+      [] ->
+        :ok
+
+      kinds ->
+        with {:ok, triggers} <- auto_hold_triggers(info, scope, kinds) do
+          verify_auto_hold_triggers(info, scope, triggers)
+        end
+    end
+  end
+
+  defp auto_hold_triggers(%{store: {module, handle}, deployment: deployment}, scope, kinds) do
+    prefix = "urn:r5e:stream:#{deployment}:"
+
+    Enum.reduce_while(kinds, {:ok, []}, fn kind, {:ok, acc} ->
+      case module.by_kind(handle, kind, prefix) do
+        {:ok, entries} ->
+          matched = Enum.filter(entries, &trigger_for_scope?(&1.evidence, scope))
+          {:cont, {:ok, acc ++ matched}}
+
+        {:error, _reason} ->
+          {:halt, {:error, :store_unavailable}}
+      end
+    end)
+  end
+
+  defp trigger_for_scope?(evidence, scope) do
+    evidence["session"] == scope or
+      Evidence.content_scope(evidence) == scope or
+      get_in(evidence, ["body", "session"]) == scope
+  end
+
+  defp verify_auto_hold_triggers(_info, _scope, []), do: :ok
+
+  defp verify_auto_hold_triggers(info, scope, triggers) do
+    entries = entries(info)
+    counting = counting(info, entries)
+
+    holds =
+      for %{evidence: %{"kind" => @hold, "body" => %{"scope" => ^scope}}} = entry <- entries,
+          do: entry
+
+    releases = release_times(entries, counting)
+
+    case Enum.find(triggers, &(not trigger_covered?(&1, holds, releases))) do
+      nil -> :ok
+      %{ref: ref} -> {:error, {:safeguarding_hold_pending, ref}}
+    end
+  end
+
+  defp release_times(entries, counting) do
+    for %{ref: ref, evidence: %{"kind" => @release, "capturedAt" => text, "body" => body}} <-
+          entries,
+        counts?(counting, ref),
+        {:ok, at, _} <- [DateTime.from_iso8601(text)],
+        into: %{} do
+      {body["hold"], at}
+    end
+  end
+
+  defp trigger_covered?(trigger, holds, releases) do
+    trigger_at = parse_captured_at(trigger.evidence["capturedAt"])
+    Enum.any?(holds, &hold_satisfies_trigger?(&1, trigger.ref, trigger_at, releases))
+  end
+
+  defp hold_satisfies_trigger?(hold, trigger_ref, trigger_at, releases) do
+    case Map.fetch(releases, hold.ref) do
+      {:ok, release_at} ->
+        get_in(hold.evidence, ["body", "details", "triggerRef"]) == trigger_ref or
+          (not is_nil(trigger_at) and DateTime.compare(release_at, trigger_at) != :lt)
+
+      :error ->
+        false
+    end
+  end
+
+  defp parse_captured_at(text) when is_binary(text) do
+    case DateTime.from_iso8601(text) do
+      {:ok, dt, _} -> dt
+      _ -> nil
+    end
+  end
+
+  defp parse_captured_at(_), do: nil
 
   # -- after a restart ---------------------------------------------------------
 

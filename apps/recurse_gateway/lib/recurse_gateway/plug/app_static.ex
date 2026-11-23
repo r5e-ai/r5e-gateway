@@ -50,13 +50,31 @@ defmodule Recurse.Gateway.Plug.AppStatic do
     index_path = Path.join(root, "index.html")
 
     if safe_path?(conn.path_info) and File.regular?(index_path) do
-      serve(conn, static_opts, index_path)
+      if conn.request_path == "/app" do
+        redirect_to_trailing_slash(conn)
+      else
+        serve(conn, static_opts, index_path)
+      end
     else
       not_found(conn)
     end
   end
 
   def call(%Plug.Conn{} = conn, _state), do: not_found(conn)
+
+  # Ensure relative asset URLs (`./assets/...`) inside `index.html` resolve
+  # under `/app/` rather than `/`.
+  defp redirect_to_trailing_slash(%Plug.Conn{query_string: ""} = conn) do
+    conn
+    |> Plug.Conn.put_resp_header("location", "/app/")
+    |> Plug.Conn.send_resp(302, "")
+  end
+
+  defp redirect_to_trailing_slash(%Plug.Conn{query_string: qs} = conn) do
+    conn
+    |> Plug.Conn.put_resp_header("location", "/app/?" <> qs)
+    |> Plug.Conn.send_resp(302, "")
+  end
 
   defp safe_path?(segments) do
     not Enum.any?(segments, fn seg ->

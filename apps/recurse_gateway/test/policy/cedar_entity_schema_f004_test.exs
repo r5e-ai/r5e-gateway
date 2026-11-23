@@ -105,9 +105,10 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
   # taking back a badge.
   @workload_actions ~w(Action::SubmitEvidence Action::RevokeBadge)
 
-  # Self-scoped evidence (1): non-admin authenticated users reading or
-  # exporting strictly their own records and sessions.
-  @self_scoped_actions ~w(Action::ReadOwnEvidence)
+  # Self-scoped evidence (2): non-admin authenticated users reading or
+  # exporting strictly their own records and sessions, and (separately gated)
+  # downloading their own recorded payloads.
+  @self_scoped_actions ~w(Action::ReadOwnEvidence Action::ReadOwnPayload)
 
   @all_actions @f002_actions ++
                  @f004_new_actions ++
@@ -208,12 +209,12 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
     test "schema declares exactly 31 actions" do
       %{"Recurse" => %{"actions" => actions}} = load_schema()
 
-      assert map_size(actions) == 31,
-             "Expected 31 actions (4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 1 self-scoped); got #{map_size(actions)}.\n" <>
+      assert map_size(actions) == 32,
+             "Expected 32 actions (4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 2 self-scoped); got #{map_size(actions)}.\n" <>
                "Declared: #{inspect(Enum.sort(Map.keys(actions)))}"
     end
 
-    test "all 31 expected actions are present" do
+    test "all 32 expected actions are present" do
       %{"Recurse" => %{"actions" => actions}} = load_schema()
 
       missing =
@@ -275,7 +276,7 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
   end
 
   describe "schema source-of-truth guard" do
-    @sha256_pin "56b660d358f2875494fda2dc300eb4da8979bf9ef75b6bd8f098b48ed7ae11b2"
+    @sha256_pin "3730733249aec85c3b0acd6e272c5fa9d21d0ea1f53636534ed076764379e01b"
 
     test "schema file SHA-256 matches the captured F004 pin" do
       actual =

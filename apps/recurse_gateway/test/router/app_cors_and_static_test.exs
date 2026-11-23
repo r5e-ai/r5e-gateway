@@ -227,8 +227,17 @@ defmodule Recurse.Gateway.Router.AppCorsAndStaticTest do
 
       Application.put_env(:recurse_gateway, :app_static_dir, app_dir)
 
-      # Bare /app, /app/, and SPA deep link serve index.html with security headers
-      for path <- ["/app", "/app/", "/app/space/education/safeguarding"] do
+      # Bare /app redirects to /app/ so relative ./assets/* URLs resolve under /app/
+      bare =
+        :get
+        |> Plug.Test.conn("/app")
+        |> Router.call(@router_opts)
+
+      assert bare.status == 302
+      assert Plug.Conn.get_resp_header(bare, "location") == ["/app/"]
+
+      # /app/ and SPA deep links serve index.html with security headers
+      for path <- ["/app/", "/app/space/education/safeguarding"] do
         conn =
           :get
           |> Plug.Test.conn(path)

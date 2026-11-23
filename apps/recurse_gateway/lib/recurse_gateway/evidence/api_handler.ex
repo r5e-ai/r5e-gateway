@@ -106,6 +106,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   @read ~s(Recurse::Action::"ReadReceipts")
   @read_own ~s(Recurse::Action::"ReadOwnEvidence")
+  @read_own_payload ~s(Recurse::Action::"ReadOwnPayload")
   @export ~s(Recurse::Action::"ExportEvidence")
   @payload ~s(Recurse::Action::"ReadPayload")
   @enrol ~s(Recurse::Action::"EnrolWorkload")
@@ -633,31 +634,33 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   @spec submit(Plug.Conn.t()) :: Plug.Conn.t()
   def submit(%Plug.Conn{body_params: request} = conn) do
     serving(conn, @submit, "/v1/evidence/records", fn conn, ctx ->
-      case Admission.submit(request, caller(ctx)) do
-        {:ok, admitted} ->
-          status =
-            if Enum.all?(admitted, &(&1["status"] == "already_admitted")), do: 200, else: 201
-
-          json(conn, status, %{"admitted" => admitted})
-
-        {:error, :malformed_request} ->
-          bad_request(conn, ~s(expected {"records": [{"envelope": {…}}], …}, 1 to 64 records))
-
-        {:error, {reason, about}} when is_atom(reason) and is_map(about) ->
-          json(conn, 409, Map.put(about, "error", Atom.to_string(reason)))
-
-        {:error, reason}
-        when reason in [:not_next_in_stream, :stream_fork_refused, :gateway_has_no_endorsement] ->
-          json(conn, 409, %{"error" => Atom.to_string(reason)})
-
-        {:error, reason} when is_atom(reason) ->
-          json(conn, 422, %{"error" => Atom.to_string(reason)})
-
-        {:error, _other} ->
-          json(conn, 422, %{"error" => "not_recorded"})
-      end
+      submit_answer(conn, Admission.submit(request, caller(ctx)))
     end)
   end
+
+  defp submit_answer(conn, {:ok, admitted}) do
+    status = if Enum.all?(admitted, &(&1["status"] == "already_admitted")), do: 200, else: 201
+    json(conn, status, %{"admitted" => admitted})
+  end
+
+  defp submit_answer(conn, {:error, :malformed_request}),
+    do: bad_request(conn, ~s(expected {"records": [{"envelope": {…}}], …}, 1 to 64 records))
+
+  defp submit_answer(conn, {:error, {reason, about}}) when is_atom(reason) and is_map(about),
+    do: json(conn, 409, Map.put(about, "error", Atom.to_string(reason)))
+
+  defp submit_answer(conn, {:error, :safeguarding_hold_failed}),
+    do: json(conn, 503, %{"error" => "safeguarding_hold_failed"})
+
+  defp submit_answer(conn, {:error, reason})
+       when reason in [:not_next_in_stream, :stream_fork_refused, :gateway_has_no_endorsement],
+       do: json(conn, 409, %{"error" => Atom.to_string(reason)})
+
+  defp submit_answer(conn, {:error, reason}) when is_atom(reason),
+    do: json(conn, 422, %{"error" => Atom.to_string(reason)})
+
+  defp submit_answer(conn, {:error, _other}),
+    do: json(conn, 422, %{"error" => "not_recorded"})
 
   @doc "`POST /v1/authority/badges/revoke`"
   @spec badge_revoke(Plug.Conn.t()) :: Plug.Conn.t()
@@ -1027,12 +1030,19 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   defp carry_for_scope(bundle, {:own, _}),
     do: Carried.carry(bundle, retention: false, security: false)
 
-  # Asking for content needs the right to read payloads too on org-wide reads.
-  # Under `ReadOwnEvidence`, the caller's own record/session ownership gate
-  # authorizes reading their own content.
+  # Asking for content needs the right to read payloads too: `ReadPayload` on
+  # org-wide reads, or `ReadOwnPayload` on self-scoped reads so deployments
+  # (such as schools) can disable raw payload downloads independently of
+  # self-scoped metadata listing.
   defp content_allowed(conn, want_content?, endpoint, scope \\ :all)
   defp content_allowed(_conn, false, _endpoint, _scope), do: :ok
-  defp content_allowed(_conn, true, _endpoint, {:own, _}), do: :ok
+
+  defp content_allowed(conn, true, endpoint, {:own, _}) do
+    case Authz.gate(conn, @read_own_payload, resource(endpoint)) do
+      {:ok, _conn, _ctx, _bundle_ref} -> :ok
+      error -> {:forbidden, error}
+    end
+  end
 
   defp content_allowed(conn, true, endpoint, :all) do
     case Authz.gate(conn, @payload, resource(endpoint)) do

@@ -38,7 +38,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
   @student_sub "student-0042"
   @student_urn "urn:r5e:principal:#{@tenant}:#{@student_sub}"
 
-  setup %{tmp_dir: tmp_dir} do
+  setup %{tmp_dir: tmp_dir} = context do
     owner = Sandbox.start_owner!(Repo, shared: true)
     on_exit(fn -> Sandbox.stop_owner(owner) end)
 
@@ -77,7 +77,11 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     root = Key.generate("ed25519")
     gateway = Key.generate("ed25519")
 
-    endorsed = root_endorsement(root, gateway)
+    custom_kind = Map.get(context, :custom_auto_hold_kind)
+    active_kind = custom_kind || @safeguarding_kind
+    publisher_ns = active_kind |> String.split("/") |> hd()
+
+    endorsed = root_endorsement(root, gateway, active_kind)
 
     chain = %{
       "records" => [%{"ref" => endorsed.ref, "envelope" => endorsed.envelope}],
@@ -86,7 +90,11 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
 
     restore = [
       put_env(:evidence_content_key_file, key_file),
-      put_env(:evidence_publishers, "#{publisher.key_id}=education.r5e.io"),
+      put_env(:evidence_publishers, "#{publisher.key_id}=#{publisher_ns}"),
+      put_env(
+        :evidence_auto_hold_kinds,
+        if(custom_kind, do: [custom_kind], else: [@safeguarding_kind])
+      ),
       put_env(:jwt_validator_opts,
         audience: "recurse-gateway-test",
         issuer: "https://test-broker.example.invalid",
@@ -119,8 +127,8 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
       Enum.each(restore, & &1.())
     end)
 
-    # Publish the education.r5e.io/v1/SafeguardingFlag kind definition.
-    flag_doc = safeguarding_flag_definition()
+    # Publish the configured auto-hold kind definition.
+    flag_doc = safeguarding_flag_definition(active_kind)
 
     {:ok, pub_set} =
       Publication.issue(
@@ -132,17 +140,18 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
       )
 
     assert {:ok, [_]} = Published.admit(pub_set)
-    assert Published.admitted?(@safeguarding_kind, flag_doc.ref)
+    assert Published.admitted?(active_kind, flag_doc.ref)
 
-    # Enrol a detector workload badge covering SafeguardingFlag.
+    # Enrol a detector workload badge covering the active auto-hold kind.
     detector = Key.generate("ed25519")
-    badge = enrol_detector(detector)
+    badge = enrol_detector(detector, active_kind)
 
     %{
       deployment: deployment,
       store: store,
       detector: detector,
       badge: badge,
+      active_kind: active_kind,
       flag_schema_ref: flag_doc.ref
     }
   end
@@ -383,12 +392,226 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
            )
   end
 
+  test "auto-hold failure fails closed on admission (503) and blocks disposal with safeguarding_hold_pending (409)",
+       ctx do
+    {201, %{"session" => session}} =
+      post(&ApiHandler.open_session/1, %{}, "caller", @student_sub)
+
+    call_args = ~s({"prompt":"protected safeguarding transcript"})
+    capture_call(session, call_args)
+    :ok = Runtime.flush()
+
+    {flag, profile_blob, detail_blob} =
+      build_safeguarding_flag(ctx, session, 1, nil, ~s({"summary":"hold-placement-error"}))
+
+    # Simulate a gateway signer outage while placing the automatic RetentionHold.
+    info = Runtime.info()
+    failing_signer = %{info.signer | sign: fn _msg -> {:error, :kms_unavailable} end}
+    :persistent_term.put({Runtime, :info}, %{info | signer: failing_signer})
+
+    # Admission MUST NOT fail open with 201 and instead fails closed with 503 so client retries.
+    {503, %{"error" => "safeguarding_hold_failed"}} =
+      post(
+        &ApiHandler.submit/1,
+        %{
+          "records" => [%{"envelope" => flag.envelope}],
+          "keys" => [wire(ctx.detector)],
+          "blobs" => [profile_blob, detail_blob]
+        },
+        "caller",
+        @student_sub
+      )
+
+    # Restore gateway signer so disposal can attempt to record a PayloadDisposition.
+    :persistent_term.put({Runtime, :info}, info)
+
+    # Confirm no RetentionHold record exists on the retention stream.
+    assert %{"holds" => []} = Retention.list()
+
+    # Belt-and-braces: even without a RetentionHold record, direct scope
+    # disposal MUST fail closed with 409 safeguarding_hold_pending.
+    {409, %{"error" => "safeguarding_hold_pending", "about" => about_ref}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => session, "reason" => "attempt_erasure_after_hold_error"},
+        "platform_operator"
+      )
+
+    assert about_ref == flag.ref
+
+    # Owner/FERPA disposal is also refused with safeguarding_hold_pending.
+    {201, %{"complete" => false, "disposed" => [], "refused" => [refused]}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"owner" => @student_urn, "reason" => "ferpa_erasure_after_hold_error"},
+        "platform_operator"
+      )
+
+    assert refused["session"] == session
+    assert refused["error"]["reason"] == "safeguarding_hold_pending"
+    assert refused["error"]["about"] == flag.ref
+
+    # Encrypted student session content remains intact and decryptable.
+    {store_mod, store_handle} = ctx.store
+    assert {:ok, ^call_args} = store_mod.get_content(store_handle, Ref.bytes(call_args), session)
+  end
+
+  test "admitted SafeguardingFlag without a hold blocks disposal until retry places hold and counselor releases it",
+       ctx do
+    {201, %{"session" => session}} =
+      post(&ApiHandler.open_session/1, %{}, "caller", @student_sub)
+
+    call_args = ~s({"prompt":"race window test"})
+    capture_call(session, call_args)
+    :ok = Runtime.flush()
+
+    {flag, profile_blob, detail_blob} =
+      build_safeguarding_flag(ctx, session, 1, nil, ~s({"summary":"race-window"}))
+
+    # Simulate a crash/window between admission and auto-hold recording.
+    Application.put_env(:recurse_gateway, :evidence_auto_hold_kinds, [])
+
+    {201, %{"admitted" => [%{"ref" => flag_ref}]}} =
+      post(
+        &ApiHandler.submit/1,
+        %{
+          "records" => [%{"envelope" => flag.envelope}],
+          "keys" => [wire(ctx.detector)],
+          "blobs" => [profile_blob, detail_blob]
+        },
+        "caller",
+        @student_sub
+      )
+
+    Application.put_env(:recurse_gateway, :evidence_auto_hold_kinds, [@safeguarding_kind])
+    assert %{"holds" => []} = Retention.list()
+
+    # Disposal is refused with safeguarding_hold_pending until hold+release occur.
+    {409, %{"error" => "safeguarding_hold_pending", "about" => ^flag_ref}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => session, "reason" => "premature_disposal"},
+        "platform_operator"
+      )
+
+    # Idempotent retry of the same flag places the gateway-signed RetentionHold.
+    {200, %{"admitted" => [%{"status" => "already_admitted"}]}} =
+      post(
+        &ApiHandler.submit/1,
+        %{
+          "records" => [%{"envelope" => flag.envelope}],
+          "keys" => [wire(ctx.detector)],
+          "blobs" => [profile_blob, detail_blob]
+        },
+        "caller",
+        @student_sub
+      )
+
+    assert %{"holds" => [%{"ref" => hold_ref, "scope" => ^session}]} = Retention.list()
+
+    {409, %{"error" => "under_hold", "about" => ^hold_ref}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => session, "reason" => "still_held"},
+        "platform_operator"
+      )
+
+    # Counselor completes two-step release -> disposal now succeeds.
+    counselor = Key.generate("ed25519")
+
+    released_by = %{
+      "algorithm" => counselor.algorithm,
+      "bytes" => Base.encode64(counselor.public_key)
+    }
+
+    {200, %{"payload" => payload64, "ticket" => ticket}} =
+      post(
+        &ApiHandler.release_prepare/1,
+        %{
+          "hold" => hold_ref,
+          "reason" => "counselor_review_complete",
+          "releasedBy" => released_by
+        },
+        "platform_operator"
+      )
+
+    {:ok, sig} = counselor.sign.(Envelope.message(Base.decode64!(payload64)))
+
+    {201, %{"hold" => ^hold_ref}} =
+      post(
+        &ApiHandler.release_finalize/1,
+        %{
+          "payload" => payload64,
+          "ticket" => ticket,
+          "signature" => %{"keyid" => counselor.key_id, "sig" => Base.encode64(sig)},
+          "releasedBy" => released_by
+        },
+        "platform_operator"
+      )
+
+    {201, %{"outcome" => "disposed"}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => session, "reason" => "post_release_disposal"},
+        "platform_operator"
+      )
+  end
+
+  @tag custom_auto_hold_kind: "district.example.edu/v1/SafetyAlert"
+  test "R5E_EVIDENCE_AUTO_HOLD_KINDS supports custom district namespace kinds", ctx do
+    assert Retention.parse_auto_hold_kinds(nil) == [@safeguarding_kind]
+    assert Retention.parse_auto_hold_kinds("") == []
+
+    assert Retention.parse_auto_hold_kinds(
+             " district.example.edu/v1/SafetyAlert , education.r5e.io/v1/SafeguardingFlag , "
+           ) == ["district.example.edu/v1/SafetyAlert", "education.r5e.io/v1/SafeguardingFlag"]
+
+    {201, %{"session" => session}} =
+      post(&ApiHandler.open_session/1, %{}, "caller", @student_sub)
+
+    call_args = ~s({"prompt":"district safety check"})
+    capture_call(session, call_args)
+    :ok = Runtime.flush()
+
+    {alert, profile_blob, detail_blob} =
+      build_safeguarding_flag(ctx, session, 1, nil, ~s({"summary":"district-alert"}))
+
+    {201, %{"admitted" => [%{"ref" => alert_ref, "status" => "admitted"}]}} =
+      post(
+        &ApiHandler.submit/1,
+        %{
+          "records" => [%{"envelope" => alert.envelope}],
+          "keys" => [wire(ctx.detector)],
+          "blobs" => [profile_blob, detail_blob]
+        },
+        "caller",
+        @student_sub
+      )
+
+    assert %{"holds" => [%{"ref" => hold_ref, "scope" => ^session}]} = Retention.list()
+
+    {store_mod, store_handle} = ctx.store
+    assert {:ok, hold_entry} = store_mod.fetch(store_handle, hold_ref)
+
+    assert hold_entry.evidence["body"]["details"] == %{
+             "triggerKind" => "district.example.edu/v1/SafetyAlert",
+             "triggerRef" => alert_ref
+           }
+
+    {409, %{"error" => "under_hold", "about" => ^hold_ref}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => session, "reason" => "blocked_by_district_auto_hold"},
+        "platform_operator"
+      )
+  end
+
   # -- helpers ---------------------------------------------------------------
 
-  defp safeguarding_flag_definition do
+  defp safeguarding_flag_definition(kind_path) do
     doc = %{
       "format" => "r5e.kind-definition/v1",
-      "kind" => @safeguarding_kind,
+      "kind" => kind_path,
       "description" => "Student-safety escalation with encrypted details.",
       "substrate" => "event",
       "naming" => %{"mode" => "content"},
@@ -435,10 +658,10 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     }
 
     bytes = Canonical.encode(doc)
-    %{kind_path: @safeguarding_kind, ref: Ref.bytes(bytes), bytes: bytes}
+    %{kind_path: kind_path, ref: Ref.bytes(bytes), bytes: bytes}
   end
 
-  defp enrol_detector(detector) do
+  defp enrol_detector(detector, kind_path) do
     {200, %{"payload" => payload64, "ticket" => ticket}} =
       post(
         &ApiHandler.badge_prepare/1,
@@ -449,7 +672,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
           },
           "holder" => "safeguarding-detector",
           "workload" => "urn:r5e:workload:school-detector",
-          "requestedKinds" => [@safeguarding_kind],
+          "requestedKinds" => [kind_path],
           "requestedTtlSeconds" => 3600
         },
         "caller",
@@ -477,12 +700,13 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
   end
 
   defp build_safeguarding_flag(ctx, session, seq, previous, detail_bytes) do
+    kind_path = ctx.active_kind
     stream = ctx.badge.prefix <> "detector"
     detail_ref = Ref.bytes(detail_bytes)
 
     {:ok, profile} =
       Profile.new(
-        schemas: Map.put(Definitions.schema_refs(), @safeguarding_kind, ctx.flag_schema_ref),
+        schemas: Map.put(Definitions.schema_refs(), kind_path, ctx.flag_schema_ref),
         bindings: [
           %{
             stream_prefix: ctx.badge.prefix,
@@ -501,7 +725,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
 
     evidence =
       Evidence.new(
-        kind_path: @safeguarding_kind,
+        kind_path: kind_path,
         schema_ref: ctx.flag_schema_ref,
         profile_ref: Profile.ref(profile),
         issuer: ctx.detector.key_id,
@@ -550,7 +774,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     receipt
   end
 
-  defp root_endorsement(root, gateway) do
+  defp root_endorsement(root, gateway, flag_kind) do
     evidence =
       Evidence.new(
         kind_path: @base <> "/Endorsement",
@@ -565,7 +789,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
         body: %{
           "subject" => gateway.key_id,
           "kinds" => [
-            @safeguarding_kind,
+            flag_kind,
             @base <> "/ToolCall",
             @base <> "/EpochSeal",
             @base <> "/RetentionHold",

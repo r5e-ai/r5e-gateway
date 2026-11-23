@@ -45,6 +45,10 @@ permit(principal, action == Recurse::Action::"ChatCompletion", resource) when { 
 // (employees, parents, students) may read and export only records where they
 // are the actor or session owner. Enforced in both Cedar and SQL.
 permit(principal, action == Recurse::Action::"ReadOwnEvidence", resource) when { principal has recurse_role && (principal.recurse_role == "caller" || principal.recurse_role == "employee" || principal.recurse_role == "parent" || principal.recurse_role == "student") };
+// Self-scoped content/payload read: separate from ReadOwnEvidence so
+// deployments (such as schools) can permit self-scoped metadata listing while
+// forbidding raw payload downloads for specific roles.
+permit(principal, action == Recurse::Action::"ReadOwnPayload", resource) when { principal has recurse_role && (principal.recurse_role == "caller" || principal.recurse_role == "employee" || principal.recurse_role == "parent" || principal.recurse_role == "student") };
 
 // ----------------------------------------------------------------------------
 // F004 audit-console role-allowlist additions

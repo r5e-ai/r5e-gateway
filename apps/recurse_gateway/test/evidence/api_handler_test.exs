@@ -1187,5 +1187,64 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert export(%{"session" => "any"}, role: "caller", subject: "alice.denied@example.test").status ==
                403
     end
+
+    test "self-scoped content download and content export require ReadOwnPayload separately from ReadOwnEvidence" do
+      student_sub = "student.noload@example.test"
+      student_urn = "urn:r5e:principal:#{@tenant}:#{SessionName.encode(student_sub)}"
+      student_session = SessionName.for(@tenant, student_urn, "study-01")
+      student_args = ~s({"prompt":"algebra help"})
+
+      student_rec = capture_for(student_urn, student_session, student_args)
+      :ok = Runtime.flush()
+
+      # School-style bundle: permits self-scoped metadata (ReadOwnEvidence)
+      # while intentionally omitting ReadOwnPayload.
+      metadata_only_bundle =
+        Path.join(System.tmp_dir!(), "metadata_only_bundle_#{System.unique_integer()}.cedar")
+
+      File.write!(
+        metadata_only_bundle,
+        ~s[permit(principal, action == Recurse::Action::"ReadOwnEvidence", resource) when { principal has recurse_role && principal.recurse_role == "student" };]
+      )
+
+      on_exit(fn -> File.rm(metadata_only_bundle) end)
+
+      start_supervised!(
+        Supervisor.child_spec(
+          {BundleLoader,
+           bundle_path: metadata_only_bundle,
+           entity_schema_path:
+             Path.join([
+               Application.app_dir(:recurse_gateway, "priv"),
+               "cedar",
+               "schema.cedarschema.json"
+             ]),
+           trap_sighup: false,
+           name: nil},
+          id: make_ref()
+        )
+      )
+
+      # Metadata endpoints and metadata-only export succeed under ReadOwnEvidence
+      assert records(%{}, role: "student", subject: student_sub).status == 200
+      assert session(student_session, role: "student", subject: student_sub).status == 200
+      assert record(student_rec.ref, role: "student", subject: student_sub).status == 200
+
+      assert export(%{"session" => student_session, "content" => false},
+               role: "student",
+               subject: student_sub
+             ).status == 200
+
+      # Raw content download and content export are denied without ReadOwnPayload
+      assert content(student_rec.ref, Ref.bytes(student_args),
+               role: "student",
+               subject: student_sub
+             ).status == 403
+
+      assert export(%{"session" => student_session, "content" => true},
+               role: "student",
+               subject: student_sub
+             ).status == 403
+    end
   end
 end

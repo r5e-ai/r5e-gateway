@@ -54,8 +54,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
   @largest_blob 4_194_304
   @largest_profile 65_536
   @ahead_seconds 30
-  @safeguarding_flag_kind "education.r5e.io/v1/SafeguardingFlag"
-  @safeguarding_hold_reason "safeguarding_flag_auto_hold"
+  @auto_hold_reason "safeguarding_flag_auto_hold"
   @hold_retry_attempts 3
 
   # Kinds that say who may do what, how the chain began, what was sealed
@@ -743,47 +742,73 @@ defmodule Recurse.Gateway.Provenance.Admission do
     |> case do
       {:ok, admitted} ->
         :ok = Runtime.flush()
-        place_safeguarding_holds(placed, caller)
-        {:ok, admitted}
+        finalize_auto_holds(placed, caller, admitted)
 
       error ->
         error
     end
   end
 
-  # When a valid `education.r5e.io/v1/SafeguardingFlag` record is admitted for a
-  # session, automatically place an idempotent gateway-signed `RetentionHold` on
-  # that session so no guardian/owner disposal or retention sweep can erase
-  # active safeguarding evidence before counselor review releases the hold.
-  defp place_safeguarding_holds(placed, caller) do
-    placed
-    |> Enum.reduce(%{}, &collect_safeguarding_session(&1, &2, caller))
-    |> Enum.each(fn {session, trigger_ref} ->
-      ensure_safeguarding_hold(session, trigger_ref, @hold_retry_attempts)
+  defp finalize_auto_holds(placed, caller, admitted) do
+    case place_auto_holds(placed, caller) do
+      :ok -> {:ok, admitted}
+      {:error, _reason} -> {:error, :safeguarding_hold_failed}
+    end
+  end
+
+  # When a valid record whose kind is configured in `Retention.auto_hold_kinds/0`
+  # (default `education.r5e.io/v1/SafeguardingFlag`) is admitted for a session,
+  # automatically place an idempotent gateway-signed `RetentionHold` on that
+  # session so no guardian/owner disposal or retention sweep can erase flagged
+  # evidence before counselor review releases the hold. Fails closed if hold
+  # placement errors (client retries, and `Retention.dispose` also refuses
+  # disposal with `safeguarding_hold_pending`).
+  defp place_auto_holds(placed, caller) do
+    case Retention.auto_hold_kinds() do
+      [] ->
+        :ok
+
+      kinds ->
+        placed
+        |> Enum.reduce(%{}, &collect_auto_hold_session(&1, &2, caller, kinds))
+        |> apply_auto_holds()
+    end
+  end
+
+  defp apply_auto_holds(sessions) do
+    Enum.reduce_while(sessions, :ok, fn {session, {kind, trigger_ref}}, :ok ->
+      case ensure_auto_hold(session, kind, trigger_ref, @hold_retry_attempts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
     end)
   end
 
-  defp collect_safeguarding_session({%{evidence: evidence, ref: ref}, _status}, acc, caller) do
-    if Evidence.kind_path(evidence) == @safeguarding_flag_kind do
-      put_safeguarding_session(acc, safeguarding_session(evidence, caller), ref)
+  defp collect_auto_hold_session({%{evidence: evidence, ref: ref}, _status}, acc, caller, kinds) do
+    kind = Evidence.kind_path(evidence)
+
+    if kind in kinds do
+      put_auto_hold_session(acc, auto_hold_session(evidence, caller), kind, ref)
     else
       acc
     end
   end
 
-  defp put_safeguarding_session(acc, nil, _ref), do: acc
-  defp put_safeguarding_session(acc, session, ref), do: Map.put_new(acc, session, ref)
+  defp put_auto_hold_session(acc, nil, _kind, _ref), do: acc
 
-  defp safeguarding_session(%{"session" => session}, _caller)
+  defp put_auto_hold_session(acc, session, kind, ref),
+    do: Map.put_new(acc, session, {kind, ref})
+
+  defp auto_hold_session(%{"session" => session}, _caller)
        when is_binary(session) and session != "",
        do: session
 
-  defp safeguarding_session(%{"body" => %{"session" => candidate}}, caller)
+  defp auto_hold_session(%{"body" => %{"session" => candidate}}, caller)
        when is_binary(candidate) do
     owned_body_session(candidate, caller)
   end
 
-  defp safeguarding_session(_evidence, _caller), do: nil
+  defp auto_hold_session(_evidence, _caller), do: nil
 
   defp owned_body_session(candidate, %{tenant: tenant, principal: principal}) do
     case SessionName.parts(candidate) do
@@ -795,12 +820,12 @@ defmodule Recurse.Gateway.Provenance.Admission do
     end
   end
 
-  defp ensure_safeguarding_hold(session, trigger_ref, attempts_left) do
+  defp ensure_auto_hold(session, trigger_kind, trigger_ref, attempts_left) do
     request = %{
       "scope" => session,
-      "reason" => @safeguarding_hold_reason,
+      "reason" => @auto_hold_reason,
       "details" => %{
-        "triggerKind" => @safeguarding_flag_kind,
+        "triggerKind" => trigger_kind,
         "triggerRef" => trigger_ref
       }
     }
@@ -811,7 +836,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
       {:error, {:hold_recorded_not_applied, ref}} ->
         Logger.warning(
-          "evidence: safeguarding auto-hold #{ref} recorded for #{session} " <>
+          "evidence: auto-hold #{ref} recorded for #{session} (#{trigger_kind}) " <>
             "but key service was unavailable; locks will be reconciled on restart"
         )
 
@@ -819,14 +844,15 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
       {:error, reason}
       when reason in [:stream_fork_refused, :not_next_in_stream] and attempts_left > 1 ->
-        ensure_safeguarding_hold(session, trigger_ref, attempts_left - 1)
+        ensure_auto_hold(session, trigger_kind, trigger_ref, attempts_left - 1)
 
       {:error, reason} ->
         Logger.error(
-          "evidence: safeguarding auto-hold could not be placed for #{session}: #{inspect(reason)}"
+          "evidence: auto-hold could not be placed for #{session} (#{trigger_kind}): " <>
+            inspect(reason)
         )
 
-        :ok
+        {:error, reason}
     end
   end
 
