@@ -502,6 +502,73 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     error -> {:error, error}
   end
 
+  @doc """
+  Session-scoped lookup of records matching `scope` and any kind in `kinds` on
+  streams starting with `stream_prefix`.
+
+  Queries `r.session == scope` via the `(session, captured_at)` index and
+  separately checks sessionless records (`r.session IS NULL`) of those kinds
+  whose decoded `body.session` matches `scope`, avoiding a deployment-wide scan
+  of other sessions' records.
+  """
+  @impl true
+  def by_session_and_kinds(_handle, _scope, [], _stream_prefix), do: {:ok, []}
+
+  def by_session_and_kinds(handle, "stream:" <> stream, kinds, _stream_prefix)
+      when is_list(kinds) do
+    rows =
+      from(r in "evidence_records",
+        where: r.stream == ^stream and is_nil(r.session) and r.kind_path in ^kinds,
+        order_by: [asc: r.stream, asc: r.seq],
+        select: ^fields()
+      )
+      |> repo(handle).all()
+
+    {:ok, Enum.map(rows, &elem(entry(&1), 1))}
+  rescue
+    error -> {:error, error}
+  end
+
+  def by_session_and_kinds(handle, scope, kinds, stream_prefix)
+      when is_binary(scope) and is_list(kinds) and is_binary(stream_prefix) do
+    session_rows =
+      from(r in "evidence_records",
+        where:
+          r.session == ^scope and
+            r.kind_path in ^kinds and
+            fragment("starts_with(?, ?)", r.stream, ^stream_prefix),
+        order_by: [asc: r.stream, asc: r.seq],
+        select: ^fields()
+      )
+      |> repo(handle).all()
+
+    body_rows =
+      from(r in "evidence_records",
+        where:
+          is_nil(r.session) and
+            r.kind_path in ^kinds and
+            fragment("starts_with(?, ?)", r.stream, ^stream_prefix) and
+            fragment(
+              "convert_from(decode(?->>'payload', 'base64'), 'UTF8')::jsonb->'body'->>'session' = ?",
+              r.envelope,
+              ^scope
+            ),
+        order_by: [asc: r.stream, asc: r.seq],
+        select: ^fields()
+      )
+      |> repo(handle).all()
+
+    entries =
+      (session_rows ++ body_rows)
+      |> Enum.uniq_by(& &1.ref)
+      |> Enum.sort_by(&{&1.stream, &1.seq})
+      |> Enum.map(&elem(entry(&1), 1))
+
+    {:ok, entries}
+  rescue
+    error -> {:error, error}
+  end
+
   @impl true
   def seal_covering(handle, stream, seq) do
     from(r in "evidence_records",

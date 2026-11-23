@@ -646,11 +646,16 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   defp submit_answer(conn, {:error, :malformed_request}),
     do: bad_request(conn, ~s(expected {"records": [{"envelope": {…}}], …}, 1 to 64 records))
 
+  defp submit_answer(conn, {:error, {:safeguarding_hold_failed, admitted_refs}}) do
+    json(conn, 503, %{
+      "error" => "safeguarding_hold_failed",
+      "admitted" => admitted_refs,
+      "hold" => "pending"
+    })
+  end
+
   defp submit_answer(conn, {:error, {reason, about}}) when is_atom(reason) and is_map(about),
     do: json(conn, 409, Map.put(about, "error", Atom.to_string(reason)))
-
-  defp submit_answer(conn, {:error, :safeguarding_hold_failed}),
-    do: json(conn, 503, %{"error" => "safeguarding_hold_failed"})
 
   defp submit_answer(conn, {:error, reason})
        when reason in [:not_next_in_stream, :stream_fork_refused, :gateway_has_no_endorsement],

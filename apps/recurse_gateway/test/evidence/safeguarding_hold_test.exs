@@ -204,7 +204,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     # A gateway-signed RetentionHold was placed automatically on flagged_session.
     assert %{"holds" => [hold]} = Retention.list()
     assert hold["scope"] == flagged_session
-    assert hold["reason"] == "safeguarding_flag_auto_hold"
+    assert hold["reason"] == "auto_hold"
     assert hold["releasedBy"] == nil
     hold_ref = hold["ref"]
 
@@ -224,24 +224,28 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
         "platform_operator"
       )
 
-    # Owner-based FERPA disposal refuses the flagged session while disposing of unflagged ones.
+    # Owner-based erasure refuses the flagged session with a neutral reason
+    # (never leaking domain-specific safeguarding details) while disposing of unflagged ones.
     {201,
      %{
        "owner" => @student_urn,
        "complete" => false,
        "disposed" => [%{"session" => ^unflagged_session, "outcome" => "disposed"}],
-       "refused" => [
-         %{
-           "session" => ^flagged_session,
-           "error" => %{"reason" => "under_hold", "about" => ^hold_ref}
-         }
-       ]
+       "refused" =>
+         [
+           %{
+             "session" => ^flagged_session,
+             "error" => %{"reason" => "under_hold", "about" => ^hold_ref}
+           }
+         ] = refused_entries
      }} =
       post(
         &ApiHandler.dispose/1,
         %{"owner" => @student_urn, "reason" => "ferpa erasure request"},
         "platform_operator"
       )
+
+    refute String.contains?(String.downcase(JSON.encode!(refused_entries)), "safeguarding")
 
     # Flagged content is preserved while unflagged content is disposed.
     assert {:ok, ^flagged_args} =
@@ -387,12 +391,12 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
 
     assert Enum.any?(
              holds,
-             &(&1["scope"] == session and &1["reason"] == "safeguarding_flag_auto_hold" and
+             &(&1["scope"] == session and &1["reason"] == "auto_hold" and
                  is_nil(&1["until"]))
            )
   end
 
-  test "auto-hold failure fails closed on admission (503) and blocks disposal with safeguarding_hold_pending (409)",
+  test "auto-hold failure fails closed on admission (503 with admitted refs + pending hold) and blocks disposal with neutral hold_pending (409)",
        ctx do
     {201, %{"session" => session}} =
       post(&ApiHandler.open_session/1, %{}, "caller", @student_sub)
@@ -409,8 +413,16 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     failing_signer = %{info.signer | sign: fn _msg -> {:error, :kms_unavailable} end}
     :persistent_term.put({Runtime, :info}, %{info | signer: failing_signer})
 
-    # Admission MUST NOT fail open with 201 and instead fails closed with 503 so client retries.
-    {503, %{"error" => "safeguarding_hold_failed"}} =
+    # Admission MUST NOT fail open with 201 and instead fails closed with 503,
+    # reporting the durably admitted record refs and hold: "pending" for retry.
+    expected_ref = flag.ref
+
+    {503,
+     %{
+       "error" => "safeguarding_hold_failed",
+       "admitted" => [^expected_ref],
+       "hold" => "pending"
+     }} =
       post(
         &ApiHandler.submit/1,
         %{
@@ -429,8 +441,8 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     assert %{"holds" => []} = Retention.list()
 
     # Belt-and-braces: even without a RetentionHold record, direct scope
-    # disposal MUST fail closed with 409 safeguarding_hold_pending.
-    {409, %{"error" => "safeguarding_hold_pending", "about" => about_ref}} =
+    # disposal MUST fail closed with neutral 409 hold_pending.
+    {409, %{"error" => "hold_pending", "about" => about_ref} = direct_refusal} =
       post(
         &ApiHandler.dispose/1,
         %{"scope" => session, "reason" => "attempt_erasure_after_hold_error"},
@@ -438,8 +450,9 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
       )
 
     assert about_ref == flag.ref
+    refute String.contains?(String.downcase(JSON.encode!(direct_refusal)), "safeguarding")
 
-    # Owner/FERPA disposal is also refused with safeguarding_hold_pending.
+    # Owner disposal is refused with neutral hold_pending (no safeguarding leak).
     {201, %{"complete" => false, "disposed" => [], "refused" => [refused]}} =
       post(
         &ApiHandler.dispose/1,
@@ -448,8 +461,9 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
       )
 
     assert refused["session"] == session
-    assert refused["error"]["reason"] == "safeguarding_hold_pending"
+    assert refused["error"]["reason"] == "hold_pending"
     assert refused["error"]["about"] == flag.ref
+    refute String.contains?(String.downcase(JSON.encode!(refused)), "safeguarding")
 
     # Encrypted student session content remains intact and decryptable.
     {store_mod, store_handle} = ctx.store
@@ -486,8 +500,8 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     Application.put_env(:recurse_gateway, :evidence_auto_hold_kinds, [@safeguarding_kind])
     assert %{"holds" => []} = Retention.list()
 
-    # Disposal is refused with safeguarding_hold_pending until hold+release occur.
-    {409, %{"error" => "safeguarding_hold_pending", "about" => ^flag_ref}} =
+    # Disposal is refused with neutral hold_pending until hold+release occur.
+    {409, %{"error" => "hold_pending", "about" => ^flag_ref}} =
       post(
         &ApiHandler.dispose/1,
         %{"scope" => session, "reason" => "premature_disposal"},
@@ -557,9 +571,45 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
       )
   end
 
+  test "auto-hold is disabled by default when R5E_EVIDENCE_AUTO_HOLD_KINDS is unset", ctx do
+    Application.delete_env(:recurse_gateway, :evidence_auto_hold_kinds)
+    assert Retention.auto_hold_kinds() == []
+    assert Retention.parse_auto_hold_kinds(nil) == []
+
+    {201, %{"session" => session}} =
+      post(&ApiHandler.open_session/1, %{}, "caller", @student_sub)
+
+    capture_call(session, ~s({"prompt":"non-school deployment check"}))
+    :ok = Runtime.flush()
+
+    {flag, profile_blob, detail_blob} =
+      build_safeguarding_flag(ctx, session, 1, nil, ~s({"summary":"default-disabled"}))
+
+    {201, %{"admitted" => [%{"status" => "admitted"}]}} =
+      post(
+        &ApiHandler.submit/1,
+        %{
+          "records" => [%{"envelope" => flag.envelope}],
+          "keys" => [wire(ctx.detector)],
+          "blobs" => [profile_blob, detail_blob]
+        },
+        "caller",
+        @student_sub
+      )
+
+    assert %{"holds" => []} = Retention.list()
+
+    {201, %{"outcome" => "disposed"}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => session, "reason" => "disposal_unblocked_when_auto_hold_disabled"},
+        "platform_operator"
+      )
+  end
+
   @tag custom_auto_hold_kind: "district.example.edu/v1/SafetyAlert"
   test "R5E_EVIDENCE_AUTO_HOLD_KINDS supports custom district namespace kinds", ctx do
-    assert Retention.parse_auto_hold_kinds(nil) == [@safeguarding_kind]
+    assert Retention.parse_auto_hold_kinds(nil) == []
     assert Retention.parse_auto_hold_kinds("") == []
 
     assert Retention.parse_auto_hold_kinds(

@@ -49,10 +49,10 @@ defmodule Recurse.Gateway.LlmProxy.CedarToolUseGate do
   `:cedar_bundle_ref` and a `:gate_context_base` at call-open. For
   each parser-emitted intent they call `evaluate/2` with that base
   plus the intent's `parallel_index`. The proxy records `{intent,
-  decision}` tuples into `state.intents_seen` for downstream use by
-  Sub-3.5 (denial injector) and Sub-3.7 (attestation emitter). For
-  this MR (Sub-3.4), `:deny` decisions log + forward unchanged
-  (Sub-3.5 lands actual suppression); `:error` decisions fail-CLOSED.
+  decision}` tuples into `state.intents_seen` for denial injection and
+  attestation emission. Both `:deny` and `:error` decisions fail-CLOSED:
+  `StreamingProxy` suppresses denied tool calls and injects a synthetic
+  denial via `suppress_and_inject/4`.
 
   ## Failure modes
 
