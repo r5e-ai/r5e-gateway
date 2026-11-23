@@ -106,11 +106,21 @@ test.describe("v2 Admin Console (Provenance v2 + CedarToolUseGate)", () => {
     await page.getByTestId("clear-time-range-btn").click();
     await expect(page.getByTestId("clear-time-range-btn")).toHaveCount(0);
 
-    // 5. Open a ToolCall record -> fetch content blob -> run verifier
+    // 5. Open a ToolCall record -> inspect inline metadata, then explicitly click "Show arguments" to load contentRef JSON -> fetch content blob -> run verifier
     const toolCallRow = page.getByTestId("evidence-row-ToolCall").first();
     await expect(toolCallRow).toBeVisible();
+    await expect(toolCallRow.getByTestId("tool-args-preview")).toBeVisible();
     await toolCallRow.click();
     await expect(page.getByTestId("record-detail-drawer")).toBeVisible();
+    await expect(page.getByTestId("tool-args-card")).toBeVisible();
+    await expect(page.getByTestId("load-tool-args-btn")).toBeVisible();
+    await page.getByTestId("load-tool-args-btn").click();
+    await expect(page.getByTestId("tool-args-table")).toContainText("commandLine");
+    await expect(page.getByTestId("tool-args-table")).toContainText("socratic_hint.py");
+    await page.getByTestId("tool-args-mode-raw").click();
+    await expect(page.getByTestId("tool-args-raw")).toContainText('"commandLine"');
+    await page.getByTestId("tool-args-mode-formatted").click();
+    await expect(page.getByTestId("tool-args-table")).toBeVisible();
 
     await page.getByTestId("detail-tab-content").click();
     await page.getByTestId("fetch-content-btn").click();

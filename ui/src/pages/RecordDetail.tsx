@@ -3,7 +3,7 @@
 // Preserves `location.search` on close so active filters and time ranges on the
 // Evidence list survive opening and closing the drawer.
 
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Check,
   CheckCircle2,
@@ -13,7 +13,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import {
@@ -44,6 +44,11 @@ import {
   type VerifyReportV2,
 } from "~/lib/evidenceTypes";
 import { routes, stripBasename, timelinePath } from "~/lib/routes";
+import {
+  extractInlineToolArgs,
+  parseContentBlobArgs,
+  type ParsedToolArgs,
+} from "~/lib/toolArgs";
 
 type TabKey =
   | "summary"
@@ -109,6 +114,14 @@ export default function RecordDetail(): JSX.Element {
   const [trustedChain, setTrustedChain] = useState<string>(DEFAULT_TRUSTED_CHAIN);
   const [blobContent, setBlobContent] = useState<string | null>(null);
   const [blobDisposed, setBlobDisposed] = useState<boolean>(false);
+  const [argsViewMode, setArgsViewMode] = useState<"formatted" | "raw">("formatted");
+  const [argsRequested, setArgsRequested] = useState<boolean>(false);
+
+  useEffect(() => {
+    setArgsRequested(false);
+    setBlobContent(null);
+    setBlobDisposed(false);
+  }, [decodedRef]);
 
   const query = useEvidenceRecord(decodedRef);
   const deploymentQuery = useDeployment();
@@ -125,13 +138,95 @@ export default function RecordDetail(): JSX.Element {
   }, [payload]);
   const sessionUrn = entry?.session ?? payload?.session ?? null;
   const targetVal = useMemo(
-    () => entry?.target ?? serverTargetOf(payload),
-    [entry?.target, payload],
+    () => (entry && entry.target !== undefined ? entry.target : serverTargetOf(payload)),
+    [entry, payload],
   );
   const reasonVal = useMemo(
-    () => entry?.reason ?? reasonOf(payload),
-    [entry?.reason, payload],
+    () => (entry && entry.reason !== undefined ? entry.reason : reasonOf(payload)),
+    [entry, payload],
   );
+  const shortKind = entry ? shortKindName(entry.kind) : "";
+  const isToolRecord = shortKind === "ToolCall" || shortKind === "ToolResult";
+  const inlineToolArgs = useMemo(() => extractInlineToolArgs(payload), [payload]);
+  const contentSizeBytes =
+    typeof payload?.body?.size === "number" && Number.isFinite(payload.body.size)
+      ? payload.body.size
+      : null;
+  const MAX_INLINE_PARSE_BYTES = 256 * 1024;
+  const contentTooLargeByMeta =
+    contentSizeBytes !== null && contentSizeBytes > MAX_INLINE_PARSE_BYTES;
+
+  // Fetch attached contentRef JSON/text blob ONLY on explicit operator click
+  // (never automatically on drawer open) and enforce a 256 KB inline parse cap.
+  const toolContentQuery = useQuery<
+    | { status: "ok"; text: string }
+    | { status: "too_large"; bytes: number }
+    | { status: "disposed" | "unavailable"; note: string },
+    never
+  >({
+    queryKey: ["record-tool-args-content", entry?.ref, contentRef],
+    enabled: Boolean(
+      argsRequested && isToolRecord && entry?.ref && contentRef && !contentTooLargeByMeta,
+    ),
+    staleTime: 60_000,
+    retry: false,
+    queryFn: async () => {
+      try {
+        const resp = await fetch(
+          apiPaths.evidence.recordContent(entry!.ref, contentRef!),
+          { credentials: "include" },
+        );
+        if (resp.status === 410) {
+          return {
+            status: "disposed",
+            note: "Attached content was erased via PayloadDisposition (HTTP 410).",
+          };
+        }
+        if (resp.status === 403) {
+          return {
+            status: "unavailable",
+            note: "You do not have permission to view attached content.",
+          };
+        }
+        if (resp.status === 404) {
+          return {
+            status: "unavailable",
+            note: "Attached content was not found in the content store.",
+          };
+        }
+        if (!resp.ok) {
+          return {
+            status: "unavailable",
+            note: `Could not load attached content (HTTP ${resp.status}).`,
+          };
+        }
+        const headerLen = Number.parseInt(resp.headers.get("content-length") ?? "", 10);
+        if (Number.isFinite(headerLen) && headerLen > MAX_INLINE_PARSE_BYTES) {
+          return { status: "too_large", bytes: headerLen };
+        }
+        const text = await resp.text();
+        if (new TextEncoder().encode(text).byteLength > MAX_INLINE_PARSE_BYTES) {
+          return { status: "too_large", bytes: new TextEncoder().encode(text).byteLength };
+        }
+        return { status: "ok", text };
+      } catch {
+        return {
+          status: "unavailable",
+          note: "Could not reach the content store to load attached content.",
+        };
+      }
+    },
+  });
+
+  const resolvedToolArgs: ParsedToolArgs = useMemo(() => {
+    if (toolContentQuery.data?.status === "ok") {
+      const parsed = parseContentBlobArgs(toolContentQuery.data.text, contentMediaType);
+      if (parsed.entries.length > 0 || parsed.rawText !== null || parsed.nonJsonNote) {
+        return parsed;
+      }
+    }
+    return inlineToolArgs;
+  }, [toolContentQuery.data, contentMediaType, inlineToolArgs]);
 
   const blobMutation = useMutation<string, Error, { recordRef: string; bytesRef: string }>({
     mutationFn: async ({ recordRef, bytesRef }) => {
@@ -372,6 +467,39 @@ export default function RecordDetail(): JSX.Element {
                 </div>
               )}
             </dl>
+
+            {isToolRecord && (
+              <ToolArgsCard
+                title={shortKind === "ToolResult" ? "Tool Output" : "Tool Arguments"}
+                loadButtonLabel={
+                  shortKind === "ToolResult" ? "Show output" : "Show arguments"
+                }
+                parsed={resolvedToolArgs}
+                hasExternalContent={Boolean(contentRef)}
+                contentLoaded={toolContentQuery.data?.status === "ok"}
+                loading={toolContentQuery.isLoading}
+                tooLargeBytes={
+                  contentTooLargeByMeta
+                    ? contentSizeBytes
+                    : toolContentQuery.data?.status === "too_large"
+                      ? toolContentQuery.data.bytes
+                      : null
+                }
+                downloadUrl={
+                  contentRef ? apiPaths.evidence.recordContent(entry.ref, contentRef) : null
+                }
+                contentNotice={
+                  toolContentQuery.data &&
+                  (toolContentQuery.data.status === "disposed" ||
+                    toolContentQuery.data.status === "unavailable")
+                    ? toolContentQuery.data.note
+                    : null
+                }
+                onRequestLoad={() => setArgsRequested(true)}
+                viewMode={argsViewMode}
+                onViewModeChange={setArgsViewMode}
+              />
+            )}
           </div>
         )}
 
@@ -653,6 +781,227 @@ export default function RecordDetail(): JSX.Element {
         )}
       </div>
     </aside>
+  );
+}
+
+function ToolArgsCard({
+  title,
+  loadButtonLabel,
+  parsed,
+  hasExternalContent,
+  contentLoaded,
+  loading,
+  tooLargeBytes,
+  downloadUrl,
+  contentNotice,
+  onRequestLoad,
+  viewMode,
+  onViewModeChange,
+}: {
+  title: string;
+  loadButtonLabel: string;
+  parsed: ParsedToolArgs;
+  hasExternalContent: boolean;
+  contentLoaded: boolean;
+  loading: boolean;
+  tooLargeBytes: number | null;
+  downloadUrl: string | null;
+  contentNotice: string | null;
+  onRequestLoad: () => void;
+  viewMode: "formatted" | "raw";
+  onViewModeChange: (mode: "formatted" | "raw") => void;
+}): JSX.Element {
+  const sourceLabel =
+    parsed.source === "content"
+      ? "attached content"
+      : parsed.source === "inline"
+        ? "inline"
+        : parsed.source === "details"
+          ? "metadata"
+          : null;
+  const rawDisplay = parsed.rawJson ?? parsed.rawText;
+
+  return (
+    <section
+      data-testid="tool-args-card"
+      aria-label={title}
+      className="flex flex-col gap-3 rounded-lg border border-r5e-border bg-r5e-surface p-4 text-xs"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-r5e-text/80">
+            {title}
+          </h3>
+          {sourceLabel && (
+            <span className="rounded border border-r5e-border bg-r5e-bg px-1.5 py-0.5 font-mono text-[10px] text-r5e-text/70">
+              {sourceLabel}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          {hasExternalContent && !contentLoaded && !loading && !tooLargeBytes && (
+            <button
+              type="button"
+              data-testid="load-tool-args-btn"
+              onClick={onRequestLoad}
+              className="rounded border border-r5e-accent bg-r5e-accent/15 px-2.5 py-1 text-[11px] font-medium text-r5e-accent hover:bg-r5e-accent/25"
+            >
+              {loadButtonLabel}
+            </button>
+          )}
+
+          {rawDisplay !== null && (
+            <div
+              role="group"
+              aria-label="Argument display mode"
+              className="inline-flex rounded border border-r5e-border bg-r5e-bg p-0.5 text-[11px]"
+            >
+              <button
+                type="button"
+                data-testid="tool-args-mode-formatted"
+                onClick={() => onViewModeChange("formatted")}
+                className={[
+                  "rounded px-2 py-0.5 font-medium transition-colors",
+                  viewMode === "formatted"
+                    ? "bg-r5e-accent/25 text-r5e-text"
+                    : "text-r5e-text/70 hover:text-r5e-text",
+                ].join(" ")}
+              >
+                Formatted
+              </button>
+              <button
+                type="button"
+                data-testid="tool-args-mode-raw"
+                onClick={() => onViewModeChange("raw")}
+                className={[
+                  "rounded px-2 py-0.5 font-medium transition-colors",
+                  viewMode === "raw"
+                    ? "bg-r5e-accent/25 text-r5e-text"
+                    : "text-r5e-text/70 hover:text-r5e-text",
+                ].join(" ")}
+              >
+                Raw JSON
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {loading && (
+        <p className="text-xs text-r5e-text/70" data-testid="tool-args-loading">
+          Loading attached content…
+        </p>
+      )}
+
+      {tooLargeBytes !== null && (
+        <div
+          role="note"
+          data-testid="tool-args-too-large"
+          className="flex flex-wrap items-center justify-between gap-2 rounded border border-r5e-border bg-r5e-bg px-3 py-2 text-xs text-r5e-text/85"
+        >
+          <span>
+            Attached content is {Math.round(tooLargeBytes / 1024)} KB (exceeds 256 KB inline
+            limit).
+          </span>
+          {downloadUrl && (
+            <a
+              href={downloadUrl}
+              download
+              className="rounded border border-r5e-accent bg-r5e-accent/15 px-2.5 py-1 text-[11px] font-medium text-r5e-accent hover:bg-r5e-accent/25"
+            >
+              Download content
+            </a>
+          )}
+        </div>
+      )}
+
+      {contentNotice && (
+        <div
+          role="note"
+          data-testid="tool-args-notice"
+          className="rounded border border-r5e-warning/40 bg-r5e-warning/10 px-3 py-2 text-xs text-r5e-warning"
+        >
+          {contentNotice}
+        </div>
+      )}
+
+      {parsed.nonJsonNote && (
+        <p className="text-xs text-r5e-text/75" data-testid="tool-args-non-json-note">
+          {parsed.nonJsonNote}
+        </p>
+      )}
+
+      {viewMode === "raw" && rawDisplay !== null ? (
+        <div className="relative">
+          <div className="absolute right-2 top-2">
+            <CopyButton value={rawDisplay} label="Copy raw JSON arguments" />
+          </div>
+          <pre
+            data-testid="tool-args-raw"
+            className="max-h-72 overflow-auto rounded border border-r5e-border bg-r5e-bg p-3 pr-9 font-mono text-[11px] text-r5e-text"
+          >
+            {rawDisplay}
+          </pre>
+        </div>
+      ) : parsed.entries.length > 0 ? (
+        <div
+          data-testid="tool-args-table"
+          className="overflow-hidden rounded border border-r5e-border bg-r5e-bg/70"
+        >
+          <table className="w-full table-fixed border-collapse text-left text-xs">
+            <tbody className="divide-y divide-r5e-border/60">
+              {parsed.entries.map((item) => (
+                <tr key={item.key} className="align-top">
+                  <th
+                    scope="row"
+                    className="w-36 break-all px-3 py-2 font-mono text-[11px] font-medium text-r5e-text/75"
+                  >
+                    {item.key}
+                  </th>
+                  <td className="px-3 py-2">
+                    <div className="flex items-start justify-between gap-2">
+                      {item.isComplex ? (
+                        <pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[11px] text-r5e-text">
+                          {item.display}
+                        </pre>
+                      ) : (
+                        <span
+                          className={[
+                            "min-w-0 flex-1 break-all font-mono text-[11px]",
+                            typeof item.value === "number" ||
+                            typeof item.value === "boolean"
+                              ? "text-r5e-accent"
+                              : "text-r5e-text",
+                          ].join(" ")}
+                        >
+                          {item.display}
+                        </span>
+                      )}
+                      {item.rawCopy && (
+                        <CopyButton
+                          value={item.rawCopy}
+                          label={`Copy ${item.key} value`}
+                        />
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : parsed.rawText ? (
+        <pre
+          data-testid="tool-args-raw"
+          className="max-h-60 overflow-auto rounded border border-r5e-border bg-r5e-bg p-3 font-mono text-[11px] text-r5e-text"
+        >
+          {parsed.rawText}
+        </pre>
+      ) : !loading && !contentNotice && !parsed.nonJsonNote ? (
+        <p className="text-xs text-r5e-text/70">No arguments recorded for this call.</p>
+      ) : null}
+    </section>
   );
 }
 
