@@ -256,6 +256,10 @@ permit(principal, action == Recurse::Action::"ExportEvidence", resource) when { 
 permit(principal, action == Recurse::Action::"ReadPayload", resource) when { principal has recurse_role && principal.recurse_role == "tenant_auditor" };
 // caller: F002 data plane only.
 permit(principal, action == Recurse::Action::"ChatCompletion", resource) when { principal has recurse_role && principal.recurse_role == "caller" };
+// Self-scoped evidence read and export: non-admin authenticated users
+// (employees, parents, students) may read and export only their own records
+// and sessions. Enforced in both Cedar and the SQL query filter.
+permit(principal, action == Recurse::Action::"ReadOwnEvidence", resource) when { principal has recurse_role && (principal.recurse_role == "caller" || principal.recurse_role == "employee" || principal.recurse_role == "parent" || principal.recurse_role == "student") };
 
 // tenant_auditor: read-only audit + forensic console surface (F004).
 permit (

@@ -36,7 +36,15 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
   require Logger
 
-  alias Recurse.Gateway.Provenance.{Carried, Claim, OfflineBadges, Runtime, SessionName}
+  alias Recurse.Gateway.Provenance.{
+    Carried,
+    Claim,
+    OfflineBadges,
+    Retention,
+    Runtime,
+    SessionName
+  }
+
   alias Recurse.Provenance.{Body, Definitions, Envelope, Evidence, Export, Key, Pipeline}
   alias Recurse.Provenance.{Profile, Publication, Ref}
   alias Recurse.Provenance.Retention, as: Rules
@@ -46,6 +54,9 @@ defmodule Recurse.Gateway.Provenance.Admission do
   @largest_blob 4_194_304
   @largest_profile 65_536
   @ahead_seconds 30
+  @safeguarding_flag_kind "education.r5e.io/v1/SafeguardingFlag"
+  @safeguarding_hold_reason "safeguarding_flag_auto_hold"
+  @hold_retry_attempts 3
 
   # Kinds that say who may do what, how the chain began, what was sealed
   # or what became of content. No workload writes these, whatever its
@@ -159,7 +170,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
             }}}
 
         nil ->
-          write(info, placed, keys, profiles, blobs, badges)
+          write(info, placed, keys, profiles, blobs, badges, caller)
       end
     end
   end
@@ -665,7 +676,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
   # -- writing ----------------------------------------------------------------------------
 
-  defp write(%{store: {module, handle}}, placed, keys, profiles, blobs, badges) do
+  defp write(%{store: {module, handle}}, placed, keys, profiles, blobs, badges, caller) do
     Enum.reduce_while(placed, {:ok, []}, fn {%{evidence: evidence} = record, status},
                                             {:ok, acc} ->
       scope = Evidence.content_scope(evidence)
@@ -732,10 +743,90 @@ defmodule Recurse.Gateway.Provenance.Admission do
     |> case do
       {:ok, admitted} ->
         :ok = Runtime.flush()
+        place_safeguarding_holds(placed, caller)
         {:ok, admitted}
 
       error ->
         error
+    end
+  end
+
+  # When a valid `education.r5e.io/v1/SafeguardingFlag` record is admitted for a
+  # session, automatically place an idempotent gateway-signed `RetentionHold` on
+  # that session so no guardian/owner disposal or retention sweep can erase
+  # active safeguarding evidence before counselor review releases the hold.
+  defp place_safeguarding_holds(placed, caller) do
+    placed
+    |> Enum.reduce(%{}, &collect_safeguarding_session(&1, &2, caller))
+    |> Enum.each(fn {session, trigger_ref} ->
+      ensure_safeguarding_hold(session, trigger_ref, @hold_retry_attempts)
+    end)
+  end
+
+  defp collect_safeguarding_session({%{evidence: evidence, ref: ref}, _status}, acc, caller) do
+    if Evidence.kind_path(evidence) == @safeguarding_flag_kind do
+      put_safeguarding_session(acc, safeguarding_session(evidence, caller), ref)
+    else
+      acc
+    end
+  end
+
+  defp put_safeguarding_session(acc, nil, _ref), do: acc
+  defp put_safeguarding_session(acc, session, ref), do: Map.put_new(acc, session, ref)
+
+  defp safeguarding_session(%{"session" => session}, _caller)
+       when is_binary(session) and session != "",
+       do: session
+
+  defp safeguarding_session(%{"body" => %{"session" => candidate}}, caller)
+       when is_binary(candidate) do
+    owned_body_session(candidate, caller)
+  end
+
+  defp safeguarding_session(_evidence, _caller), do: nil
+
+  defp owned_body_session(candidate, %{tenant: tenant, principal: principal}) do
+    case SessionName.parts(candidate) do
+      {:ok, %{tenant: ^tenant}} ->
+        if SessionName.owned_by?(candidate, principal), do: candidate
+
+      _ ->
+        nil
+    end
+  end
+
+  defp ensure_safeguarding_hold(session, trigger_ref, attempts_left) do
+    request = %{
+      "scope" => session,
+      "reason" => @safeguarding_hold_reason,
+      "details" => %{
+        "triggerKind" => @safeguarding_flag_kind,
+        "triggerRef" => trigger_ref
+      }
+    }
+
+    case Retention.ensure_hold(request, nil) do
+      {:ok, _held} ->
+        :ok
+
+      {:error, {:hold_recorded_not_applied, ref}} ->
+        Logger.warning(
+          "evidence: safeguarding auto-hold #{ref} recorded for #{session} " <>
+            "but key service was unavailable; locks will be reconciled on restart"
+        )
+
+        :ok
+
+      {:error, reason}
+      when reason in [:stream_fork_refused, :not_next_in_stream] and attempts_left > 1 ->
+        ensure_safeguarding_hold(session, trigger_ref, attempts_left - 1)
+
+      {:error, reason} ->
+        Logger.error(
+          "evidence: safeguarding auto-hold could not be placed for #{session}: #{inspect(reason)}"
+        )
+
+        :ok
     end
   end
 

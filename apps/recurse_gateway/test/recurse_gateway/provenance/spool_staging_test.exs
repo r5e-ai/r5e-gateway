@@ -23,8 +23,9 @@ defmodule Recurse.Gateway.Provenance.SpoolStagingTest do
   @actor "urn:r5e:principal:01TENANT:alice%40example.test"
 
   setup %{tmp_dir: tmp_dir} do
-    :ok = Sandbox.checkout(Repo)
-    Sandbox.mode(Repo, {:shared, self()})
+    owner = Sandbox.start_owner!(Repo, shared: true)
+
+    on_exit(fn -> Sandbox.stop_owner(owner) end)
 
     {:ok, fake} = FakeKeyService.start_link()
     handle = %{repo: Repo, keys: {FakeKeyService, fake}}
@@ -41,16 +42,6 @@ defmodule Recurse.Gateway.Provenance.SpoolStagingTest do
   end
 
   defp start_runtime(ctx, spool_opts \\ []) do
-    # A restart within a test stops processes that may be in the middle of
-    # a query (the retention reconciler runs at start), which takes the
-    # sandbox connection with it. Check out again if so, and share it.
-    case Sandbox.checkout(Repo) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
-
-    Sandbox.mode(Repo, {:shared, self()})
-
     start_supervised!(
       {Runtime,
        deployment: ctx.deployment,
@@ -63,12 +54,39 @@ defmodule Recurse.Gateway.Provenance.SpoolStagingTest do
       id: Runtime
     )
 
+    # Wait for the one-shot startup retention reconciler task to complete its
+    # initial Repo query before returning so a subsequent `stop_runtime/0`
+    # never kills a sandbox borrower mid-query and tears down shared ownership.
+    await_reconciler()
+
     Runtime.info()
   end
 
   defp stop_runtime do
+    await_reconciler()
     :ok = stop_supervised(Runtime)
     :persistent_term.erase({Runtime, :info})
+  end
+
+  defp await_reconciler do
+    case Process.whereis(Runtime) do
+      nil ->
+        :ok
+
+      pid ->
+        for {:reconcile_retention, child, _, _} <- Supervisor.which_children(pid),
+            is_pid(child) do
+          ref = Process.monitor(child)
+
+          receive do
+            {:DOWN, ^ref, :process, ^child, _} -> :ok
+          after
+            5_000 -> flunk("retention reconciler did not finish within 5s")
+          end
+        end
+
+        :ok
+    end
   end
 
   defp spooled(text, piece \\ 4096) do

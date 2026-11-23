@@ -84,4 +84,12 @@ defmodule Recurse.Gateway.Config.RuntimeExsParseTest do
 
     refute source =~ ~s|jwks_url: env.("BROWSER_OIDC_JWKS_URL") \|\| broker_jwks_url|
   end
+
+  test "R5E_APP_CORS_ORIGINS is wired, defaults empty, and strips wildcards" do
+    source = File.read!(@runtime_exs)
+
+    assert source =~ ~s|env.("R5E_APP_CORS_ORIGINS")|
+    assert source =~ ~s|config :recurse_gateway, app_cors_origins: app_cors_origins|
+    assert source =~ ~s|&(&1 == "" or &1 == "*")|
+  end
 end

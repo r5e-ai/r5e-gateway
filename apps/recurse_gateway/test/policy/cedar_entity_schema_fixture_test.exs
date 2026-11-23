@@ -11,7 +11,7 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaFixtureTest do
   use ExUnit.Case, async: true
 
   @schema_path Path.expand("../../priv/cedar/schema.cedarschema.json", __DIR__)
-  @expected_sha256 "5be72724d3894bb32849d5012c4912b1f2021e17d24656197fd0d974aaeac02b"
+  @expected_sha256 "56b660d358f2875494fda2dc300eb4da8979bf9ef75b6bd8f098b48ed7ae11b2"
 
   test "Cedar entity schema file hash is stable" do
     actual =

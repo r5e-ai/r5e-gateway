@@ -159,6 +159,7 @@ defmodule Recurse.Gateway.Router do
   # ---------------------------------------------------------------------------
 
   plug(Plug.RequestId)
+  plug(Recurse.Gateway.Plug.AppCors)
 
   # Parse JSON bodies up front so `POST /v1/chat/completions` sees
   # `conn.body_params`. `pass: ["*/*"]` lets the health / 501 routes skip
@@ -183,7 +184,8 @@ defmodule Recurse.Gateway.Router do
     "/readyz",
     "/metrics",
     "/.well-known",
-    "/admin"
+    "/admin",
+    "/app"
   ]
 
   defp claimed(conn, _opts) do
@@ -879,6 +881,11 @@ defmodule Recurse.Gateway.Router do
       ]
     ]
   )
+
+  # Unified r5e App static assets & SPA fallback (`/app` and `/app/*`).
+  # Serves `priv/static/app/` when `priv/static/app/index.html` exists;
+  # otherwise responds with a clean JSON 404.
+  forward("/app", to: Recurse.Gateway.Plug.AppStatic)
 
   # ---------------------------------------------------------------------------
   # Root convenience — bare `/` redirects to the SPA login screen so a

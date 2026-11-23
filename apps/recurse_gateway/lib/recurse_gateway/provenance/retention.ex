@@ -124,6 +124,42 @@ defmodule Recurse.Gateway.Provenance.Retention do
 
   def hold(_request, _on_behalf_of), do: {:error, :malformed_request}
 
+  @doc """
+  Ensure an active (unreleased, unexpired) hold covers `scope`.
+
+  If an active hold on `scope` is already recorded on the retention stream
+  (matching indefinitely when `request` carries no `until`), re-applies its
+  lock so any newly arrived content is covered and returns
+  `{:ok, %{"hold" => ref, "seq" => seq, "already_held" => true}}` without
+  appending a duplicate `RetentionHold`. Otherwise records and seals a new
+  gateway-signed `RetentionHold`.
+  """
+  @spec ensure_hold(map(), String.t() | nil) :: {:ok, map()} | {:error, error()}
+  def ensure_hold(%{"scope" => scope, "reason" => _} = request, on_behalf_of)
+      when is_binary(scope) do
+    info = Runtime.info()
+    at = DateTime.utc_now()
+    entries = entries(info)
+    counting = counting(info, entries)
+    indefinite? = is_nil(request["until"])
+
+    existing =
+      Enum.find(active_holds(entries, counting, at), fn %{evidence: %{"body" => body}} ->
+        body["scope"] == scope and (not indefinite? or is_nil(body["until"]))
+      end)
+
+    case existing do
+      %{ref: ref, seq: seq, evidence: %{"body" => body}} ->
+        _ = lock(info, ref, body)
+        {:ok, %{"hold" => ref, "seq" => seq, "already_held" => true}}
+
+      nil ->
+        hold(request, on_behalf_of)
+    end
+  end
+
+  def ensure_hold(_request, _on_behalf_of), do: {:error, :malformed_request}
+
   defp lock(%{store: {module, handle}}, ref, %{"scope" => scope}) when is_binary(scope),
     do: module.hold_content(handle, ref, {:scope, scope})
 

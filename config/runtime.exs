@@ -743,3 +743,19 @@ config :recurse_gateway,
 config :recurse_gateway,
   retain_payloads?: env_bool.("R5E_RETAIN_PAYLOADS", false),
   retain_payloads_max_bytes: env_int.("R5E_RETAIN_PAYLOADS_MAX_BYTES", "8388608")
+
+# ---------------------------------------------------------------------------
+# Unified r5e App CORS allowlist — opt-in via R5E_APP_CORS_ORIGINS.
+#
+# Comma-separated exact origins (e.g. "tauri://localhost,http://localhost:5173").
+# Defaults safely to empty (`[]`, CORS disabled) unless explicitly configured.
+# Wildcard `"*"` entries are stripped because credentials are enabled.
+# ---------------------------------------------------------------------------
+app_cors_origins =
+  (env.("R5E_APP_CORS_ORIGINS") || "")
+  |> String.split(",", trim: true)
+  |> Enum.map(&String.trim/1)
+  |> Enum.reject(&(&1 == "" or &1 == "*"))
+  |> Enum.uniq()
+
+config :recurse_gateway, app_cors_origins: app_cors_origins

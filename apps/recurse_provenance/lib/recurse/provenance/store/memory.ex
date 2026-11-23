@@ -161,13 +161,31 @@ defmodule Recurse.Provenance.Store.Memory do
     at = captured_at(entry)
 
     Enum.all?(asked, fn
-      {:kind_path, kind} -> entry.kind_path == kind
-      {:session, session} -> entry.evidence["session"] == session
-      {:actor, actor} -> entry.evidence["actor"] == actor
-      {:since, since} -> DateTime.compare(at, since) != :lt
-      {:until, until} -> DateTime.compare(at, until) == :lt
-      {:before, position} -> later?(position, {at, entry.ref}) and position != {at, entry.ref}
-      {_, _} -> true
+      {:kind_path, kind} ->
+        entry.kind_path == kind
+
+      {:session, session} ->
+        entry.evidence["session"] == session
+
+      {:actor, actor} ->
+        entry.evidence["actor"] == actor
+
+      {:own_principal, {principal, session_prefix}} ->
+        entry.evidence["actor"] == principal or
+          (is_binary(entry.evidence["session"]) and
+             String.starts_with?(entry.evidence["session"], session_prefix))
+
+      {:since, since} ->
+        DateTime.compare(at, since) != :lt
+
+      {:until, until} ->
+        DateTime.compare(at, until) == :lt
+
+      {:before, position} ->
+        later?(position, {at, entry.ref}) and position != {at, entry.ref}
+
+      {_, _} ->
+        true
     end)
   end
 

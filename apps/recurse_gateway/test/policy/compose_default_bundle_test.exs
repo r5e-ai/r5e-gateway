@@ -140,8 +140,22 @@ defmodule Recurse.Gateway.Policy.ComposeDefaultBundleTest do
     test "the baseline permit does not leak into the audit plane", %{ref: ref} do
       # A principal with no role at all: the old `permit (principal, action,
       # resource)` allowed this; the invoke_tool-scoped one must not.
-      for action <- ~w(ReadReceipts ReadPayload ExportEvidence DashboardQuery PolicyDraftCreate) do
+      for action <-
+            ~w(ReadReceipts ReadOwnEvidence ReadPayload ExportEvidence DashboardQuery PolicyDraftCreate) do
         assert {:deny, _} = Evaluator.evaluate(ref, identity(nil), audit_request(action)), action
+      end
+    end
+
+    test "non-admin user roles are granted ReadOwnEvidence but denied org-wide ReadReceipts",
+         %{ref: ref} do
+      for role <- ~w(caller employee parent student) do
+        assert {:allow, _} =
+                 Evaluator.evaluate(ref, identity(role), audit_request("ReadOwnEvidence")),
+               role
+
+        assert {:deny, _} =
+                 Evaluator.evaluate(ref, identity(role), audit_request("ReadReceipts")),
+               role
       end
     end
 

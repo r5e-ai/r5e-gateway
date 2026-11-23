@@ -142,6 +142,23 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     |> entry()
   end
 
+  @doc """
+  Fetch a single record by reference only when it belongs to `principal`
+  (record `actor` matches `principal` or `session` starts with `session_prefix`),
+  enforced directly in SQL.
+  """
+  @spec fetch_owned(term(), String.t(), String.t(), String.t()) :: {:ok, map()} | :error
+  def fetch_owned(handle, ref, principal, session_prefix)
+      when is_binary(ref) and is_binary(principal) and is_binary(session_prefix) do
+    from(r in "evidence_records",
+      where: r.ref == ^ref,
+      where: r.actor == ^principal or fragment("starts_with(?, ?)", r.session, ^session_prefix),
+      select: ^fields()
+    )
+    |> repo(handle).one()
+    |> entry()
+  end
+
   @impl true
   def by_submission(handle, stream, submission_id) do
     from(r in "evidence_records",
@@ -215,6 +232,29 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
     rows =
       from(r in "evidence_records",
         where: r.session == ^session,
+        order_by: [asc: r.stream, asc: r.seq],
+        select: ^fields()
+      )
+      |> repo(handle).all()
+
+    {:ok, Enum.map(rows, &elem(entry(&1), 1))}
+  rescue
+    error -> {:error, error}
+  end
+
+  @doc """
+  Fetch a session's records only when each record belongs to `principal`
+  (record `actor` matches `principal` or `session` starts with `session_prefix`),
+  enforced directly in SQL.
+  """
+  @spec by_session_owned(term(), String.t(), String.t(), String.t()) ::
+          {:ok, [map()]} | {:error, term()}
+  def by_session_owned(handle, session, principal, session_prefix)
+      when is_binary(session) and is_binary(principal) and is_binary(session_prefix) do
+    rows =
+      from(r in "evidence_records",
+        where: r.session == ^session,
+        where: r.actor == ^principal or fragment("starts_with(?, ?)", r.session, ^session_prefix),
         order_by: [asc: r.stream, asc: r.seq],
         select: ^fields()
       )
@@ -382,6 +422,13 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
 
       {:actor, actor}, query ->
         where(query, [r], r.actor == ^actor)
+
+      {:own_principal, {principal, session_prefix}}, query ->
+        where(
+          query,
+          [r],
+          r.actor == ^principal or fragment("starts_with(?, ?)", r.session, ^session_prefix)
+        )
 
       {:kind_paths, kinds}, query ->
         where(query, [r], r.kind_path in ^kinds)
