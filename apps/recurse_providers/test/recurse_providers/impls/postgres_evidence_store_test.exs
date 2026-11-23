@@ -700,4 +700,69 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
     assert Enum.any?(report.findings, &(&1.check == :epoch and &1.result == :ok))
     assert Enum.count(report.findings, &(&1.check == :signature and &1.result == :ok)) == 4
   end
+
+  test "by_session_and_kinds scopes queries to one session or stream without scanning other sessions",
+       ctx do
+    deployment = "scoped-#{System.unique_integer([:positive])}"
+    prefix = "urn:r5e:stream:#{deployment}:"
+    stream = prefix <> "endpoint:det"
+    target_session = "urn:r5e:session:tenant:abc1234567890def.s1"
+    other_session = "urn:r5e:session:tenant:abc1234567890def.s2"
+    flag_kind = "education.r5e.io/v1/SafeguardingFlag"
+    other_kind = "provenance.r5e.io/v2/ToolCall"
+
+    append_record = fn seq, prev, kind_path, env_session, body ->
+      evidence =
+        Recurse.Provenance.Evidence.new(
+          kind_path: kind_path,
+          schema_ref: Ref.bytes("schema:" <> kind_path),
+          profile_ref: Profile.ref(ctx.profile),
+          issuer: ctx.signer.key_id,
+          actor: "urn:r5e:workload:detector",
+          session: env_session,
+          stream: stream,
+          seq: seq,
+          previous: prev,
+          captured_at: DateTime.utc_now(),
+          body: body
+        )
+
+      {:ok, signed} = Recurse.Provenance.Envelope.sign(evidence, ctx.signer)
+
+      :ok =
+        Store.append(Repo, %{
+          ref: signed.ref,
+          stream: stream,
+          seq: seq,
+          kind_path: kind_path,
+          envelope: signed.envelope,
+          evidence: evidence
+        })
+
+      signed.ref
+    end
+
+    # 1. Matching envelope session + matching kind -> included
+    ref1 = append_record.(1, nil, flag_kind, target_session, %{"session" => target_session})
+    # 2. Matching envelope session + non-matching kind -> excluded
+    ref2 = append_record.(2, ref1, other_kind, target_session, %{"tool" => "echo"})
+    # 3. Other envelope session + matching kind -> excluded
+    ref3 = append_record.(3, ref2, flag_kind, other_session, %{"session" => other_session})
+    # 4. Sessionless record whose body.session matches target_session + matching kind -> included
+    ref4 = append_record.(4, ref3, flag_kind, nil, %{"session" => target_session})
+    # 5. Sessionless record whose body.session is other_session + matching kind -> excluded
+    _ref5 = append_record.(5, ref4, flag_kind, nil, %{"session" => other_session})
+
+    assert {:ok, entries} = Store.by_session_and_kinds(Repo, target_session, [flag_kind], prefix)
+    assert Enum.map(entries, & &1.ref) == [ref1, ref4]
+
+    assert {:ok, []} = Store.by_session_and_kinds(Repo, target_session, [], prefix)
+
+    # Stream scope matches only sessionless records on that stream with matching kind
+    assert {:ok, stream_entries} =
+             Store.by_session_and_kinds(Repo, "stream:" <> stream, [flag_kind], prefix)
+
+    assert length(stream_entries) == 2
+    assert ref4 in Enum.map(stream_entries, & &1.ref)
+  end
 end

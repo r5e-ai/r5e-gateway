@@ -93,11 +93,10 @@ defmodule Recurse.Gateway.Config.RuntimeExsParseTest do
     assert source =~ ~s|&(&1 == "" or &1 == "*")|
   end
 
-  test "R5E_EVIDENCE_AUTO_HOLD_KINDS is wired and defaults to SafeguardingFlag" do
+  test "R5E_EVIDENCE_AUTO_HOLD_KINDS is wired and defaults to empty list" do
     source = File.read!(@runtime_exs)
 
-    assert source =~ ~s|System.get_env("R5E_EVIDENCE_AUTO_HOLD_KINDS")|
-    assert source =~ ~s|["education.r5e.io/v1/SafeguardingFlag"]|
+    assert source =~ ~s|env.("R5E_EVIDENCE_AUTO_HOLD_KINDS") \|\| ""|
 
     assert source =~
              ~s|config :recurse_gateway, evidence_auto_hold_kinds: evidence_auto_hold_kinds|

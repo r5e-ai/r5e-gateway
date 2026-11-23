@@ -218,6 +218,40 @@ defmodule Recurse.Provenance.Store.Memory do
   end
 
   @impl true
+  def by_session_and_kinds(_store, _scope, [], _stream_prefix), do: {:ok, []}
+
+  def by_session_and_kinds(store, "stream:" <> stream, kinds, _stream_prefix)
+      when is_list(kinds) do
+    Agent.get(store, fn s ->
+      {:ok,
+       s.records
+       |> Map.values()
+       |> Enum.filter(
+         &(&1.stream == stream and is_nil(&1.evidence["session"]) and &1.kind_path in kinds)
+       )
+       |> Enum.sort_by(&{&1.stream, &1.seq})}
+    end)
+  end
+
+  def by_session_and_kinds(store, scope, kinds, stream_prefix)
+      when is_binary(scope) and is_list(kinds) and is_binary(stream_prefix) do
+    Agent.get(store, fn s ->
+      {:ok,
+       s.records
+       |> Map.values()
+       |> Enum.filter(&matches_session_and_kinds?(&1, scope, kinds, stream_prefix))
+       |> Enum.sort_by(&{&1.stream, &1.seq})}
+    end)
+  end
+
+  defp matches_session_and_kinds?(entry, scope, kinds, stream_prefix) do
+    entry.kind_path in kinds and String.starts_with?(entry.stream, stream_prefix) and
+      (entry.evidence["session"] == scope or
+         (is_nil(entry.evidence["session"]) and
+            get_in(entry.evidence, ["body", "session"]) == scope))
+  end
+
+  @impl true
   def seal_covering(store, stream, seq) do
     Agent.get(store, fn s ->
       s.records

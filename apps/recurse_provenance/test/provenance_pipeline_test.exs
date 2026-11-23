@@ -974,4 +974,61 @@ defmodule Recurse.Provenance.PipelineTest do
                Pipeline.admit(pipeline, countersigned(second, signer, subject), keys_of(subject))
     end
   end
+
+  test "Store.Memory.by_session_and_kinds filters strictly to matching scope and kinds", ctx do
+    {:ok, mem} = Memory.start_link()
+    prefix = "urn:r5e:stream:mem:"
+    stream = prefix <> "endpoint:det"
+    target = "urn:r5e:session:tenant:abc1234567890def.s1"
+    other = "urn:r5e:session:tenant:abc1234567890def.s2"
+    flag_kind = "education.r5e.io/v1/SafeguardingFlag"
+    other_kind = "provenance.r5e.io/v2/ToolCall"
+
+    put_entry = fn seq, prev, kind, env_session, body ->
+      evidence =
+        Recurse.Provenance.Evidence.new(
+          kind_path: kind,
+          schema_ref: Ref.bytes("schema:" <> kind),
+          profile_ref: Profile.ref(ctx.profile),
+          issuer: ctx.signer.key_id,
+          actor: @actor,
+          session: env_session,
+          stream: stream,
+          seq: seq,
+          previous: prev,
+          captured_at: DateTime.utc_now(),
+          body: body
+        )
+
+      {:ok, signed} = Envelope.sign(evidence, ctx.signer)
+
+      :ok =
+        Memory.append(mem, %{
+          ref: signed.ref,
+          stream: stream,
+          seq: seq,
+          kind_path: kind,
+          envelope: signed.envelope,
+          evidence: evidence
+        })
+
+      signed.ref
+    end
+
+    ref1 = put_entry.(1, nil, flag_kind, target, %{"session" => target})
+    ref2 = put_entry.(2, ref1, other_kind, target, %{"tool" => "echo"})
+    ref3 = put_entry.(3, ref2, flag_kind, other, %{"session" => other})
+    ref4 = put_entry.(4, ref3, flag_kind, nil, %{"session" => target})
+    _ref5 = put_entry.(5, ref4, flag_kind, nil, %{"session" => other})
+
+    assert {:ok, entries} = Memory.by_session_and_kinds(mem, target, [flag_kind], prefix)
+    assert Enum.map(entries, & &1.ref) == [ref1, ref4]
+    assert {:ok, []} = Memory.by_session_and_kinds(mem, target, [], prefix)
+
+    assert {:ok, stream_entries} =
+             Memory.by_session_and_kinds(mem, "stream:" <> stream, [flag_kind], prefix)
+
+    assert length(stream_entries) == 2
+    assert ref4 in Enum.map(stream_entries, & &1.ref)
+  end
 end

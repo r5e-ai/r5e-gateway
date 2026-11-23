@@ -54,7 +54,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
   @largest_blob 4_194_304
   @largest_profile 65_536
   @ahead_seconds 30
-  @auto_hold_reason "safeguarding_flag_auto_hold"
+  @auto_hold_reason "auto_hold"
   @hold_retry_attempts 3
 
   # Kinds that say who may do what, how the chain began, what was sealed
@@ -751,18 +751,20 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
   defp finalize_auto_holds(placed, caller, admitted) do
     case place_auto_holds(placed, caller) do
-      :ok -> {:ok, admitted}
-      {:error, _reason} -> {:error, :safeguarding_hold_failed}
+      :ok ->
+        {:ok, admitted}
+
+      {:error, _reason} ->
+        {:error, {:safeguarding_hold_failed, Enum.map(admitted, & &1["ref"])}}
     end
   end
 
   # When a valid record whose kind is configured in `Retention.auto_hold_kinds/0`
-  # (default `education.r5e.io/v1/SafeguardingFlag`) is admitted for a session,
-  # automatically place an idempotent gateway-signed `RetentionHold` on that
-  # session so no guardian/owner disposal or retention sweep can erase flagged
-  # evidence before counselor review releases the hold. Fails closed if hold
-  # placement errors (client retries, and `Retention.dispose` also refuses
-  # disposal with `safeguarding_hold_pending`).
+  # is admitted for a session, automatically place an idempotent gateway-signed
+  # `RetentionHold` on that session so no owner disposal or retention sweep can
+  # erase flagged evidence before two-step release completes. Fails closed if
+  # hold placement errors (client retries, and `Retention.dispose` also refuses
+  # disposal with `hold_pending`).
   defp place_auto_holds(placed, caller) do
     case Retention.auto_hold_kinds() do
       [] ->

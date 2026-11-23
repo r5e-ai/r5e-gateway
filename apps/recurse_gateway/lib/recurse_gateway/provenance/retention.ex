@@ -42,7 +42,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
   @ticket_context "r5e.hold-release-ticket/v1"
   @ticket_seconds 300
   @hold_scope "urn:r5e:hold:"
-  @default_auto_hold_kinds ["education.r5e.io/v1/SafeguardingFlag"]
+  @default_auto_hold_kinds []
 
   @type error ::
           :malformed_request
@@ -54,7 +54,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
           | :nothing_to_dispose
           | :store_unavailable
           | {:under_hold, String.t()}
-          | {:safeguarding_hold_pending, String.t()}
+          | {:hold_pending, String.t()}
           | {:never_disposed_of | :kept_until | :profile_not_held, String.t()}
           | atom()
 
@@ -66,8 +66,9 @@ defmodule Recurse.Gateway.Provenance.Retention do
   Parse a comma-separated `R5E_EVIDENCE_AUTO_HOLD_KINDS` value into a
   deduplicated list of record kind paths (`namespace/version/Kind`).
 
-  When `nil` (env var unset), defaults to `#{inspect(@default_auto_hold_kinds)}`.
-  An explicit empty string (`""`) disables automatic holds.
+  Defaults to `[]` (disabled) when `nil` or empty so deployments opt in
+  explicitly to domain-specific automatic hold rules (for example
+  `education.r5e.io/v1/SafeguardingFlag` in school deployments).
   """
   @spec parse_auto_hold_kinds(String.t() | nil) :: [String.t()]
   def parse_auto_hold_kinds(nil), do: @default_auto_hold_kinds
@@ -82,13 +83,13 @@ defmodule Recurse.Gateway.Provenance.Retention do
 
   @doc """
   Return the configured record kind paths that automatically trigger an
-  indefinite gateway-signed `RetentionHold` upon admission.
+  indefinite gateway-signed `RetentionHold` upon admission. Defaults to `[]`
+  when `:evidence_auto_hold_kinds` is unset.
 
   Standing note: any party holding an active badge permitted to submit one of
   these kinds can trigger an indefinite `RetentionHold` on its own sessions,
-  blocking owner/FERPA disposal until the two-step counselor/retention release
-  completes. That is intentional so flagged evidence cannot be erased before
-  review.
+  blocking owner disposal until the two-step release completes. That is
+  intentional so flagged evidence cannot be erased before review.
   """
   @spec auto_hold_kinds() :: [String.t()]
   def auto_hold_kinds do
@@ -514,7 +515,9 @@ defmodule Recurse.Gateway.Provenance.Retention do
   and its records' retention, each checkable by a reader on its own.
 
   The answer lists what was disposed of and what was refused and why.
-  A session with nothing left to make unreadable is passed over.
+  Hold refusals use neutral codes (`"under_hold"` / `"hold_pending"`) so
+  owner/guardian erasure responses do not disclose domain-specific hold
+  causes. A session with nothing left to make unreadable is passed over.
   `complete` is true when no session of theirs was refused. A session
   the person begins afterwards is not covered: ask again.
 
@@ -664,16 +667,26 @@ defmodule Recurse.Gateway.Provenance.Retention do
   defp auto_hold_triggers(%{store: {module, handle}, deployment: deployment}, scope, kinds) do
     prefix = "urn:r5e:stream:#{deployment}:"
 
-    Enum.reduce_while(kinds, {:ok, []}, fn kind, {:ok, acc} ->
-      case module.by_kind(handle, kind, prefix) do
-        {:ok, entries} ->
-          matched = Enum.filter(entries, &trigger_for_scope?(&1.evidence, scope))
-          {:cont, {:ok, acc ++ matched}}
+    case fetch_scoped_triggers(module, handle, scope, kinds, prefix) do
+      {:ok, entries} ->
+        {:ok, Enum.filter(entries, &trigger_for_scope?(&1.evidence, scope))}
 
-        {:error, _reason} ->
-          {:halt, {:error, :store_unavailable}}
-      end
-    end)
+      {:error, _reason} ->
+        {:error, :store_unavailable}
+    end
+  end
+
+  defp fetch_scoped_triggers(module, handle, scope, kinds, prefix) do
+    if function_exported?(module, :by_session_and_kinds, 4) do
+      module.by_session_and_kinds(handle, scope, kinds, prefix)
+    else
+      entries =
+        module
+        |> scope_records(handle, scope)
+        |> Enum.filter(&(Evidence.kind_path(&1.evidence) in kinds))
+
+      {:ok, entries}
+    end
   end
 
   defp trigger_for_scope?(%{"session" => session}, scope)
@@ -723,7 +736,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
 
     case Enum.find(triggers, &(not trigger_covered?(&1, holds, releases))) do
       nil -> :ok
-      %{ref: ref} -> {:error, {:safeguarding_hold_pending, ref}}
+      %{ref: ref} -> {:error, {:hold_pending, ref}}
     end
   end
 

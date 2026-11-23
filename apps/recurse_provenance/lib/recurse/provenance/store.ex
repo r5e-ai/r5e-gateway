@@ -124,6 +124,21 @@ defmodule Recurse.Provenance.Store do
               {:ok, [entry()]} | {:error, term()}
 
   @doc """
+  Records matching `scope` (envelope `session` or sessionless `body.session`,
+  or `stream` when `scope` is `"stream:<stream>"`) whose `kind_path` is in
+  `kinds` and whose stream starts with `stream_prefix`, ordered by stream and
+  sequence.
+  """
+  @callback by_session_and_kinds(
+              handle(),
+              scope :: String.t(),
+              kinds :: [String.t()],
+              stream_prefix :: String.t()
+            ) :: {:ok, [entry()]} | {:error, term()}
+
+  @optional_callbacks by_session_and_kinds: 4
+
+  @doc """
   The streams beginning with `prefix` that hold a record no seal covers
   yet: the stream's last record is beyond its last seal. This is how
   records admitted whole, on streams no writer owns, are found for
