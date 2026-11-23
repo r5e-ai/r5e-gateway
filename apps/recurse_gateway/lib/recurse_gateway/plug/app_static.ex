@@ -29,21 +29,21 @@ defmodule Recurse.Gateway.Plug.AppStatic do
   alias Recurse.Gateway.Plug.SecurityHeaders
 
   @impl Plug
-  @spec init(keyword()) :: %{default_root: Path.t(), default_static_opts: term()}
+  @spec init(keyword()) :: %{root: Path.t() | nil, default_static_opts: term()}
   def init(opts) when is_list(opts) do
-    default_root =
-      Keyword.get_lazy(opts, :root, fn ->
-        Path.join(:code.priv_dir(:recurse_gateway), "static/app")
-      end)
+    root = Keyword.get(opts, :root)
+
+    from =
+      if is_binary(root) and root != "", do: root, else: {:recurse_gateway, "priv/static/app"}
 
     %{
-      default_root: default_root,
-      default_static_opts: Plug.Static.init(at: "/", from: default_root, gzip: true)
+      root: root,
+      default_static_opts: Plug.Static.init(at: "/", from: from, gzip: true)
     }
   end
 
   @impl Plug
-  @spec call(Plug.Conn.t(), %{default_root: Path.t(), default_static_opts: term()}) ::
+  @spec call(Plug.Conn.t(), %{root: Path.t() | nil, default_static_opts: term()}) ::
           Plug.Conn.t()
   def call(%Plug.Conn{method: method} = conn, state) when method in ["GET", "HEAD"] do
     {root, static_opts} = resolve_root(state)
@@ -102,15 +102,18 @@ defmodule Recurse.Gateway.Plug.AppStatic do
     end
   end
 
-  defp resolve_root(%{default_root: default_root, default_static_opts: default_static_opts}) do
+  defp resolve_root(%{root: explicit_root, default_static_opts: default_static_opts}) do
     case Application.get_env(:recurse_gateway, :app_static_dir) do
       dir when is_binary(dir) and dir != "" ->
         {dir, Plug.Static.init(at: "/", from: dir, gzip: true)}
 
       _ ->
-        {default_root, default_static_opts}
+        {runtime_root(explicit_root), default_static_opts}
     end
   end
+
+  defp runtime_root(dir) when is_binary(dir) and dir != "", do: dir
+  defp runtime_root(_), do: Application.app_dir(:recurse_gateway, "priv/static/app")
 
   defp not_found(conn) do
     conn

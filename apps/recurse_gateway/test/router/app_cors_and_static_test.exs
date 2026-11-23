@@ -7,7 +7,7 @@ defmodule Recurse.Gateway.Router.AppCorsAndStaticTest do
 
   @moduletag :tmp_dir
 
-  alias Recurse.Gateway.Plug.AppCors
+  alias Recurse.Gateway.Plug.{AppCors, AppStatic}
   alias Recurse.Gateway.Router
 
   @router_opts Router.init([])
@@ -198,6 +198,13 @@ defmodule Recurse.Gateway.Router.AppCorsAndStaticTest do
   end
 
   describe "static /app serving" do
+    test "init/1 defers priv_dir resolution to runtime so releases do not bake build-stage paths" do
+      state = AppStatic.init([])
+
+      assert state.root == nil
+      assert %{from: {:recurse_gateway, "priv/static/app"}} = state.default_static_opts
+    end
+
     test "returns clean 404 when priv/static/app/index.html is absent", %{tmp_dir: tmp_dir} do
       empty_dir = Path.join(tmp_dir, "missing-app")
       Application.put_env(:recurse_gateway, :app_static_dir, empty_dir)
