@@ -48,6 +48,7 @@ import {
   type TimeDisplayMode,
 } from "~/lib/evidenceTypes";
 import { recordDetailPath } from "~/lib/routes";
+import { toolCallPreviewOf } from "~/lib/toolArgs";
 
 const TIME_MODE_STORAGE_KEY = "r5e.v2.timeMode";
 
@@ -151,6 +152,7 @@ export default function Dashboard(): JSX.Element {
           entry.target !== undefined ? entry.target : serverTargetOf(payload);
         const reason =
           entry.reason !== undefined ? entry.reason : reasonOf(payload);
+        const argsPreview = toolCallPreviewOf(entry.kind, payload, target);
         return {
           entry,
           payload,
@@ -158,6 +160,7 @@ export default function Dashboard(): JSX.Element {
           outcome,
           target,
           reason,
+          argsPreview,
         };
       }),
     [rawRows],
@@ -987,7 +990,7 @@ export default function Dashboard(): JSX.Element {
                 </thead>
                 <tbody className="divide-y divide-r5e-border/70">
                   {decodedRows.map(
-                    ({ entry, payload, policy, outcome, target, reason }) => {
+                    ({ entry, payload, policy, outcome, target, reason, argsPreview }) => {
                       const fullActor = entry.actor ?? payload?.actor ?? "";
                       const actorDisplay = formatIdentityDisplay(fullActor);
                       const fullSession = entry.session ?? payload?.session ?? "";
@@ -1050,10 +1053,24 @@ export default function Dashboard(): JSX.Element {
                                   <td
                                     key={colId}
                                     className="truncate px-3 py-2.5 font-mono text-xs text-r5e-text"
-                                    title={target ?? undefined}
+                                    title={
+                                      target && argsPreview
+                                        ? `${target} · ${argsPreview}`
+                                        : target ?? argsPreview ?? undefined
+                                    }
                                   >
-                                    {target ?? (
+                                    {target ? (
+                                      <div className="truncate">{target}</div>
+                                    ) : (
                                       <span className="text-r5e-text/50">—</span>
+                                    )}
+                                    {argsPreview && (
+                                      <div
+                                        data-testid="tool-args-preview"
+                                        className="mt-0.5 truncate text-[10px] text-r5e-text/65"
+                                      >
+                                        {argsPreview}
+                                      </div>
                                     )}
                                   </td>
                                 );
