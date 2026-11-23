@@ -606,6 +606,121 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
       )
   end
 
+  test "foreign body.session in a SafeguardingFlag cannot place a hold on or block disposal of another user's session",
+       ctx do
+    # Victim opens a session and captures encrypted content.
+    {201, %{"session" => victim_session}} =
+      post(
+        &ApiHandler.open_session/1,
+        %{"clientSessionId" => "victim-session"},
+        "caller",
+        @student_sub
+      )
+
+    capture_call(victim_session, ~s({"prompt":"victim transcript"}))
+    :ok = Runtime.flush()
+
+    # Attacker is a distinct authenticated principal badged for SafeguardingFlag.
+    attacker_sub = "other-student-9999"
+    attacker_urn = "urn:r5e:principal:#{@tenant}:#{attacker_sub}"
+    attacker_key = Key.generate("ed25519")
+    attacker_badge = enrol_detector(attacker_key, @safeguarding_kind, attacker_sub)
+
+    {201, %{"session" => attacker_session}} =
+      post(
+        &ApiHandler.open_session/1,
+        %{"clientSessionId" => "attacker-session"},
+        "caller",
+        attacker_sub
+      )
+
+    # 1) Sessionless flag naming the victim's session in body.session.
+    {flag1, profile_blob, detail_blob1} =
+      build_custom_flag(ctx, %{
+        signer: attacker_key,
+        badge: attacker_badge,
+        on_behalf_of: attacker_urn,
+        envelope_session: nil,
+        body_session: victim_session,
+        seq: 1,
+        previous: nil,
+        detail_bytes: ~s({"summary":"forged-body-session-1"})
+      })
+
+    # 2) Flag in attacker's own envelope session naming victim's session in body.session.
+    {flag2, _profile_blob, detail_blob2} =
+      build_custom_flag(ctx, %{
+        signer: attacker_key,
+        badge: attacker_badge,
+        on_behalf_of: attacker_urn,
+        envelope_session: attacker_session,
+        body_session: victim_session,
+        seq: 2,
+        previous: flag1.ref,
+        detail_bytes: ~s({"summary":"forged-body-session-2"})
+      })
+
+    # 3) Sessionless flag naming a cross-tenant session that reuses attacker's fingerprint.
+    cross_tenant_session =
+      Recurse.Gateway.Provenance.SessionName.for("other-tenant", attacker_urn, "cross-tenant")
+
+    {flag3, _profile_blob, detail_blob3} =
+      build_custom_flag(ctx, %{
+        signer: attacker_key,
+        badge: attacker_badge,
+        on_behalf_of: attacker_urn,
+        envelope_session: nil,
+        body_session: cross_tenant_session,
+        seq: 3,
+        previous: flag2.ref,
+        detail_bytes: ~s({"summary":"cross-tenant-body-session"})
+      })
+
+    {201, %{"admitted" => [_, _, _]}} =
+      post(
+        &ApiHandler.submit/1,
+        %{
+          "records" => [
+            %{"envelope" => flag1.envelope},
+            %{"envelope" => flag2.envelope},
+            %{"envelope" => flag3.envelope}
+          ],
+          "keys" => [wire(attacker_key)],
+          "blobs" => [profile_blob, detail_blob1, detail_blob2, detail_blob3]
+        },
+        "caller",
+        attacker_sub
+      )
+
+    # Only attacker_session receives a hold; neither victim_session nor cross_tenant_session is held.
+    %{"holds" => holds} = Retention.list()
+    assert Enum.map(holds, & &1["scope"]) == [attacker_session]
+
+    # Victim's direct disposal and owner FERPA disposal MUST NOT be blocked by attacker's foreign body.session.
+    {201,
+     %{
+       "complete" => true,
+       "refused" => [],
+       "disposed" => [%{"session" => ^victim_session, "outcome" => "disposed"}]
+     }} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"owner" => @student_urn, "reason" => "ferpa_erasure_unblocked_by_foreign_flag"},
+        "platform_operator"
+      )
+
+    # Cross-tenant scope with same fingerprint is likewise NOT matched as a pending trigger.
+    capture_call(cross_tenant_session, ~s({"prompt":"cross-tenant transcript"}))
+    :ok = Runtime.flush()
+
+    {201, %{"outcome" => "disposed"}} =
+      post(
+        &ApiHandler.dispose/1,
+        %{"scope" => cross_tenant_session, "reason" => "cross_tenant_disposal_unblocked"},
+        "platform_operator"
+      )
+  end
+
   # -- helpers ---------------------------------------------------------------
 
   defp safeguarding_flag_definition(kind_path) do
@@ -661,7 +776,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
     %{kind_path: kind_path, ref: Ref.bytes(bytes), bytes: bytes}
   end
 
-  defp enrol_detector(detector, kind_path) do
+  defp enrol_detector(detector, kind_path, subject \\ @student_sub) do
     {200, %{"payload" => payload64, "ticket" => ticket}} =
       post(
         &ApiHandler.badge_prepare/1,
@@ -676,7 +791,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
           "requestedTtlSeconds" => 3600
         },
         "caller",
-        @student_sub
+        subject
       )
 
     {:ok, sig} = detector.sign.(Envelope.message(Base.decode64!(payload64)))
@@ -690,7 +805,7 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
           "subjectSignature" => %{"keyid" => detector.key_id, "sig" => Base.encode64(sig)}
         },
         "caller",
-        @student_sub
+        subject
       )
 
     badge_doc = payload64 |> Base.decode64!() |> JSON.decode!()
@@ -700,18 +815,31 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
   end
 
   defp build_safeguarding_flag(ctx, session, seq, previous, detail_bytes) do
+    build_custom_flag(ctx, %{
+      signer: ctx.detector,
+      badge: ctx.badge,
+      on_behalf_of: @student_urn,
+      envelope_session: session,
+      body_session: session,
+      seq: seq,
+      previous: previous,
+      detail_bytes: detail_bytes
+    })
+  end
+
+  defp build_custom_flag(ctx, opts) do
     kind_path = ctx.active_kind
-    stream = ctx.badge.prefix <> "detector"
-    detail_ref = Ref.bytes(detail_bytes)
+    stream = opts.badge.prefix <> "detector"
+    detail_ref = Ref.bytes(opts.detail_bytes)
 
     {:ok, profile} =
       Profile.new(
         schemas: Map.put(Definitions.schema_refs(), kind_path, ctx.flag_schema_ref),
         bindings: [
           %{
-            stream_prefix: ctx.badge.prefix,
+            stream_prefix: opts.badge.prefix,
             actor_prefixes: ["urn:r5e:"],
-            issuer_keys: [ctx.detector.key_id],
+            issuer_keys: [opts.signer.key_id],
             sealer_keys: []
           }
         ],
@@ -728,18 +856,18 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
         kind_path: kind_path,
         schema_ref: ctx.flag_schema_ref,
         profile_ref: Profile.ref(profile),
-        issuer: ctx.detector.key_id,
+        issuer: opts.signer.key_id,
         actor: "urn:r5e:workload:school-detector",
-        on_behalf_of: @student_urn,
-        session: session,
+        on_behalf_of: opts.on_behalf_of,
+        session: opts.envelope_session,
         stream: stream,
-        seq: seq,
-        previous: previous,
+        seq: opts.seq,
+        previous: opts.previous,
         captured_at: DateTime.utc_now(),
         body: %{
           "topic" => "safeguarding.flag",
           "contentRefs" => [detail_ref],
-          "session" => session,
+          "session" => opts.body_session,
           "school" => "urn:r5e:school:lincoln-high",
           "severity" => "high",
           "enforcement" => "non-blocking",
@@ -748,10 +876,10 @@ defmodule Recurse.Gateway.Evidence.SafeguardingHoldTest do
         }
       )
 
-    {:ok, signed} = Envelope.sign(evidence, ctx.detector)
+    {:ok, signed} = Envelope.sign(evidence, opts.signer)
 
     profile_blob = %{"ref" => Ref.bytes(profile_bytes), "base64" => Base.encode64(profile_bytes)}
-    detail_blob = %{"ref" => detail_ref, "base64" => Base.encode64(detail_bytes)}
+    detail_blob = %{"ref" => detail_ref, "base64" => Base.encode64(opts.detail_bytes)}
     {signed, profile_blob, detail_blob}
   end
 

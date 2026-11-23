@@ -676,11 +676,38 @@ defmodule Recurse.Gateway.Provenance.Retention do
     end)
   end
 
+  defp trigger_for_scope?(%{"session" => session}, scope)
+       when is_binary(session) and session != "",
+       do: session == scope
+
   defp trigger_for_scope?(evidence, scope) do
-    evidence["session"] == scope or
-      Evidence.content_scope(evidence) == scope or
-      get_in(evidence, ["body", "session"]) == scope
+    Evidence.content_scope(evidence) == scope or
+      body_session_owned_by_trigger?(evidence, scope)
   end
+
+  defp body_session_owned_by_trigger?(%{"body" => %{"session" => scope}} = evidence, scope) do
+    principal = evidence["onBehalfOf"] || evidence["actor"]
+
+    with true <- is_binary(principal) and principal != "",
+         {:ok, %{tenant: session_tenant}} <- SessionName.parts(scope),
+         true <- principal_in_tenant?(principal, session_tenant) do
+      SessionName.owned_by?(scope, principal)
+    else
+      _ -> false
+    end
+  end
+
+  defp body_session_owned_by_trigger?(_evidence, _scope), do: false
+
+  defp principal_in_tenant?("urn:r5e:principal:" <> rest, session_tenant) do
+    case String.split(rest, ":", parts: 2) do
+      [encoded_tenant, _subject] -> encoded_tenant == session_tenant
+      _ -> false
+    end
+  end
+
+  defp principal_in_tenant?("spiffe://" <> _ = spiffe, _session_tenant), do: spiffe != ""
+  defp principal_in_tenant?(_principal, _session_tenant), do: false
 
   defp verify_auto_hold_triggers(_info, _scope, []), do: :ok
 
