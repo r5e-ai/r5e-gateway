@@ -105,11 +105,16 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
   # taking back a badge.
   @workload_actions ~w(Action::SubmitEvidence Action::RevokeBadge)
 
+  # Self-scoped evidence (2): non-admin authenticated users reading or
+  # exporting strictly their own records and sessions, and (separately gated)
+  # downloading their own recorded payloads.
+  @self_scoped_actions ~w(Action::ReadOwnEvidence Action::ReadOwnPayload)
+
   @all_actions @f002_actions ++
                  @f004_new_actions ++
                  @mcp_actions ++
                  @authority_actions ++
-                 @retention_actions ++ @workload_actions
+                 @retention_actions ++ @workload_actions ++ @self_scoped_actions
 
   defp load_schema do
     @schema_path
@@ -200,16 +205,16 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
     end
   end
 
-  describe "structural coverage — actions (30 total: 4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload)" do
-    test "schema declares exactly 30 actions" do
+  describe "structural coverage — actions (31 total: 4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 1 self-scoped)" do
+    test "schema declares exactly 31 actions" do
       %{"Recurse" => %{"actions" => actions}} = load_schema()
 
-      assert map_size(actions) == 30,
-             "Expected 30 actions (4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload); got #{map_size(actions)}.\n" <>
+      assert map_size(actions) == 32,
+             "Expected 32 actions (4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 2 self-scoped); got #{map_size(actions)}.\n" <>
                "Declared: #{inspect(Enum.sort(Map.keys(actions)))}"
     end
 
-    test "all 30 expected actions are present" do
+    test "all 32 expected actions are present" do
       %{"Recurse" => %{"actions" => actions}} = load_schema()
 
       missing =
@@ -271,7 +276,7 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
   end
 
   describe "schema source-of-truth guard" do
-    @sha256_pin "5be72724d3894bb32849d5012c4912b1f2021e17d24656197fd0d974aaeac02b"
+    @sha256_pin "3730733249aec85c3b0acd6e272c5fa9d21d0ea1f53636534ed076764379e01b"
 
     test "schema file SHA-256 matches the captured F004 pin" do
       actual =

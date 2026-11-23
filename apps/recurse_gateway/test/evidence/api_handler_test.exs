@@ -13,8 +13,8 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Recurse.Gateway.Evidence.{ApiHandler, TailSocket}
   alias Recurse.Gateway.Policy.BundleLoader
-  alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Gateway.Provenance.{Runtime, SessionName}
+  alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Gateway.Test.JwtTestHelper
   alias Recurse.Provenance.{Body, Export, Key, Pipeline, Ref}
   alias Recurse.Providers.Impls.{LocalKeyService, PostgresEvidenceStore}
@@ -186,6 +186,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
           token =
             JwtTestHelper.mint_test_jwt(
               recurse_role: role,
+              subject: Keyword.get(opts, :subject, "user-0001"),
               audience: "recurse-gateway-test",
               issuer: "https://test-broker.example.invalid"
             )
@@ -297,20 +298,21 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       assert verify(%{"bundle" => %{}}, role: nil).status == 401
     end
 
-    test "the data-plane caller role is refused", ctx do
+    test "an unauthorized role is refused on every route", ctx do
       [%{ref: ref} | _] = ctx.receipts
-      assert record(ref, role: "caller").status == 403
-      assert session(ctx.session, role: "caller").status == 403
-      assert export(%{"session" => ctx.session}, role: "caller").status == 403
+      assert record(ref, role: "tenant_app").status == 403
+      assert session(ctx.session, role: "tenant_app").status == 403
+      assert export(%{"session" => ctx.session}, role: "tenant_app").status == 403
+      assert verify(%{"bundle" => %{}}, role: "caller").status == 403
     end
   end
 
   describe "listing records" do
     @tool_call "provenance.r5e.io/v2/ToolCall"
 
-    test "needs the same right as reading one record" do
+    test "needs credentials and either ReadReceipts or ReadOwnEvidence" do
       assert records(%{}, role: nil).status == 401
-      assert records(%{}, role: "caller").status == 403
+      assert records(%{}, role: "tenant_app").status == 403
     end
 
     test "newest first, a page at a time, each row with its actor and session", ctx do
@@ -474,7 +476,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       args_ref = Ref.bytes(@args)
 
       assert content(ref, args_ref, role: nil).status == 401
-      assert content(ref, args_ref, role: "caller").status == 403
+      assert content(ref, args_ref, role: "tenant_app").status == 403
 
       # Held by the deployment, but this record does not name it.
       assert content(ref, ctx.profile_ref).status == 404
@@ -940,6 +942,309 @@ defmodule Recurse.Gateway.Evidence.ApiHandlerTest do
       bundle = body(export(%{"session" => ctx.session}))
       assert verify(%{"bundle" => bundle, "trustedProfiles" => ["mine"]}).status == 400
       assert verify(%{}).status == 400
+    end
+  end
+
+  describe "self-scoped user evidence (ReadOwnEvidence)" do
+    defp principal_urn(subject),
+      do: "urn:r5e:principal:#{SessionName.encode(@tenant)}:#{SessionName.encode(subject)}"
+
+    defp capture_for(actor, session, args) do
+      {:ok, receipt} =
+        Pipeline.capture(Runtime.pipeline(), %{
+          kind_path: "provenance.r5e.io/v2/ToolCall",
+          actor: actor,
+          session: session,
+          attachments: [%{name: "args", bytes: args}],
+          blobs: [@policy],
+          body:
+            Body.tool_call(
+              tool: "Bash",
+              content_ref: "attachment:args",
+              media_type: "application/json",
+              size: byte_size(args),
+              policy:
+                Body.policy_evaluation(
+                  policy_ref: Ref.bytes(@policy),
+                  outcome: "allow",
+                  input_refs: ["attachment:args"]
+                )
+            )
+        })
+
+      receipt
+    end
+
+    @tag :encrypted
+    test "non-admin users read and export strictly their own records and content, never another user's",
+         ctx do
+      alice_sub = "alice.self@example.test"
+      bob_sub = "bob.self@example.test"
+      alice_urn = principal_urn(alice_sub)
+      bob_urn = principal_urn(bob_sub)
+
+      # Both users reuse the exact same bare client session id to prove
+      # self-scoped resolution never collides or leaks the other user's name.
+      shared_id = "shared-chat-#{System.unique_integer([:positive])}"
+      alice_session = SessionName.for(@tenant, alice_urn, shared_id)
+      alice_only_id = "alice-only-#{System.unique_integer([:positive])}"
+      alice_only_session = SessionName.for(@tenant, alice_urn, alice_only_id)
+      bob_session = SessionName.for(@tenant, bob_urn, shared_id)
+      bob_private_id = "bob-private-#{System.unique_integer([:positive])}"
+      bob_private_session = SessionName.for(@tenant, bob_urn, bob_private_id)
+
+      alice_args = ~s({"command":"echo alice-secret"})
+      bob_args = ~s({"command":"echo bob-secret"})
+
+      # 1. Alice record matched by actor AND session
+      alice_rec = capture_for(alice_urn, alice_session, alice_args)
+      # 2. Alice record matched by session principal even when actor is a workload
+      alice_workload_rec = capture_for("urn:r5e:workload:helper-1", alice_session, alice_args)
+      # 3. Alice sessionless record matched strictly by actor
+      alice_actor_only = capture_for(alice_urn, nil, alice_args)
+      # 4. Alice private session
+      alice_private_rec = capture_for(alice_urn, alice_only_session, alice_args)
+
+      # Bob's records
+      bob_rec = capture_for(bob_urn, bob_session, bob_args)
+      bob_private_rec = capture_for(bob_urn, bob_private_session, bob_args)
+
+      {:ok, _} = Runtime.seal()
+
+      # Place a retention hold on Bob's private session so we can assert
+      # Alice's self-scoped export never carries org-wide retention holds.
+      hold_conn =
+        ApiHandler.hold(
+          request(:post, "/v1/evidence/retention/holds",
+            body: %{"scope" => bob_private_session, "reason" => "bob_case"},
+            role: "platform_operator"
+          )
+        )
+
+      assert hold_conn.status == 201
+      %{"hold" => bob_hold_ref} = body(hold_conn)
+
+      alice_expected_refs =
+        Enum.sort([
+          alice_rec.ref,
+          alice_workload_rec.ref,
+          alice_actor_only.ref,
+          alice_private_rec.ref
+        ])
+
+      # Positive: listing records works for caller, employee, parent, and student
+      for role <- ~w(caller employee parent student) do
+        listed = records(%{"limit" => "200"}, role: role, subject: alice_sub)
+        assert listed.status == 200
+
+        got_refs =
+          listed |> body() |> Map.fetch!("records") |> Enum.map(& &1["ref"]) |> Enum.sort()
+
+        assert got_refs == alice_expected_refs
+      end
+
+      # Positive: fetching own record by ref (actor-matched & workload-in-own-session)
+      assert record(alice_rec.ref, role: "caller", subject: alice_sub).status == 200
+      assert record(alice_workload_rec.ref, role: "caller", subject: alice_sub).status == 200
+      assert record(alice_actor_only.ref, role: "caller", subject: alice_sub).status == 200
+
+      # Positive: fetching own content bytes (encrypted store!)
+      alice_content =
+        content(alice_rec.ref, Ref.bytes(alice_args), role: "caller", subject: alice_sub)
+
+      assert alice_content.status == 200
+      assert alice_content.resp_body == alice_args
+
+      # Positive: fetching own session by bare id (no 409 collision with Bob!),
+      # by <fingerprint>.<id> tail, and by full URN
+      bare_session = session(shared_id, role: "caller", subject: alice_sub)
+      assert bare_session.status == 200
+
+      assert %{"session" => ^alice_session, "records" => alice_session_rows} =
+               body(bare_session)
+
+      assert Enum.map(alice_session_rows, & &1["ref"]) == [alice_rec.ref, alice_workload_rec.ref]
+
+      "urn:r5e:session:" <> alice_rest = alice_session
+      [_tenant_part, alice_tail] = String.split(alice_rest, ":", parts: 2)
+      assert session(alice_tail, role: "caller", subject: alice_sub).status == 200
+      assert session(alice_session, role: "caller", subject: alice_sub).status == 200
+
+      # Positive: exporting own session (with & without content) verifies offline
+      # and omits org-wide retention holds belonging to other users.
+      exported =
+        export(%{"session" => shared_id, "content" => true}, role: "caller", subject: alice_sub)
+
+      assert exported.status == 200
+      bundle = body(exported)
+      exported_refs = Enum.map(bundle["records"], & &1["ref"])
+      assert alice_rec.ref in exported_refs
+      assert alice_workload_rec.ref in exported_refs
+      refute bob_rec.ref in exported_refs
+      refute bob_private_rec.ref in exported_refs
+      refute bob_hold_ref in exported_refs
+      assert Enum.any?(bundle["blobs"], &(&1["ref"] == Ref.bytes(alice_args)))
+      report = Export.verify(bundle, trusted_profiles: [ctx.profile_ref])
+      assert %{failed: 0} = report.summary
+
+      # Negative cross-user isolation: Bob can NEVER see Alice's records,
+      # content, or sessions through any route or filter.
+      bob_list = records(%{"limit" => "200"}, role: "caller", subject: bob_sub)
+      assert bob_list.status == 200
+
+      bob_refs =
+        bob_list |> body() |> Map.fetch!("records") |> Enum.map(& &1["ref"]) |> Enum.sort()
+
+      assert bob_refs == Enum.sort([bob_rec.ref, bob_private_rec.ref])
+
+      # Bob passing ?actor=<alice> or ?session=<alice_session> gets zero records
+      assert %{"records" => []} =
+               body(records(%{"actor" => alice_urn}, role: "caller", subject: bob_sub))
+
+      assert %{"records" => []} =
+               body(records(%{"session" => alice_session}, role: "caller", subject: bob_sub))
+
+      assert %{"records" => []} =
+               body(records(%{"session" => alice_tail}, role: "caller", subject: bob_sub))
+
+      # Bob probing Alice's refs, content, sessions, and export all get 404
+      assert record(alice_rec.ref, role: "caller", subject: bob_sub).status == 404
+      assert record(alice_workload_rec.ref, role: "caller", subject: bob_sub).status == 404
+      assert record(alice_actor_only.ref, role: "caller", subject: bob_sub).status == 404
+
+      assert content(alice_rec.ref, Ref.bytes(alice_args), role: "caller", subject: bob_sub).status ==
+               404
+
+      assert session(alice_session, role: "caller", subject: bob_sub).status == 404
+      assert session(alice_tail, role: "caller", subject: bob_sub).status == 404
+      assert session(alice_only_id, role: "caller", subject: bob_sub).status == 404
+
+      assert export(%{"session" => alice_session, "content" => true},
+               role: "caller",
+               subject: bob_sub
+             ).status == 404
+
+      assert export(%{"session" => alice_tail}, role: "caller", subject: bob_sub).status == 404
+      assert export(%{"session" => alice_only_id}, role: "caller", subject: bob_sub).status == 404
+
+      # Even after Alice's session is disposed, Bob still gets 404 (never 410 leak)
+      # while Alice gets 410 for her own disposed content.
+      assert dispose(alice_session).status == 201
+
+      assert content(alice_rec.ref, Ref.bytes(alice_args), role: "caller", subject: bob_sub).status ==
+               404
+
+      assert content(alice_rec.ref, Ref.bytes(alice_args), role: "caller", subject: alice_sub).status ==
+               410
+
+      # Direct SQL-layer verification on PostgresEvidenceStore
+      handle = elem(Runtime.info().store, 1)
+      bob_prefix = SessionName.for(@tenant, bob_urn, "")
+
+      assert :error =
+               PostgresEvidenceStore.fetch_owned(handle, alice_rec.ref, bob_urn, bob_prefix)
+
+      assert {:ok, []} =
+               PostgresEvidenceStore.by_session_owned(handle, alice_session, bob_urn, bob_prefix)
+
+      # Non-self-scoped endpoints remain forbidden for caller role
+      assert facets(%{}, role: "caller", subject: alice_sub).status == 403
+      assert tail(%{}, role: "caller", subject: alice_sub).status == 403
+
+      assert ApiHandler.retention(request(:get, "/v1/evidence/retention", role: "caller")).status ==
+               403
+    end
+
+    test "caller is denied with 403 when active Cedar bundle does not grant ReadOwnEvidence" do
+      no_own_bundle =
+        Path.join(System.tmp_dir!(), "no_own_bundle_#{System.unique_integer()}.cedar")
+
+      File.write!(
+        no_own_bundle,
+        ~s[permit(principal, action == Recurse::Action::"ReadReceipts", resource) when { principal has recurse_role && principal.recurse_role == "tenant_auditor" };]
+      )
+
+      on_exit(fn -> File.rm(no_own_bundle) end)
+
+      start_supervised!(
+        Supervisor.child_spec(
+          {BundleLoader,
+           bundle_path: no_own_bundle,
+           entity_schema_path:
+             Path.join([
+               Application.app_dir(:recurse_gateway, "priv"),
+               "cedar",
+               "schema.cedarschema.json"
+             ]),
+           trap_sighup: false,
+           name: nil},
+          id: make_ref()
+        )
+      )
+
+      assert records(%{}, role: "caller", subject: "alice.denied@example.test").status == 403
+
+      assert export(%{"session" => "any"}, role: "caller", subject: "alice.denied@example.test").status ==
+               403
+    end
+
+    test "self-scoped content download and content export require ReadOwnPayload separately from ReadOwnEvidence" do
+      student_sub = "student.noload@example.test"
+      student_urn = "urn:r5e:principal:#{@tenant}:#{SessionName.encode(student_sub)}"
+      student_session = SessionName.for(@tenant, student_urn, "study-01")
+      student_args = ~s({"prompt":"algebra help"})
+
+      student_rec = capture_for(student_urn, student_session, student_args)
+      :ok = Runtime.flush()
+
+      # School-style bundle: permits self-scoped metadata (ReadOwnEvidence)
+      # while intentionally omitting ReadOwnPayload.
+      metadata_only_bundle =
+        Path.join(System.tmp_dir!(), "metadata_only_bundle_#{System.unique_integer()}.cedar")
+
+      File.write!(
+        metadata_only_bundle,
+        ~s[permit(principal, action == Recurse::Action::"ReadOwnEvidence", resource) when { principal has recurse_role && principal.recurse_role == "student" };]
+      )
+
+      on_exit(fn -> File.rm(metadata_only_bundle) end)
+
+      start_supervised!(
+        Supervisor.child_spec(
+          {BundleLoader,
+           bundle_path: metadata_only_bundle,
+           entity_schema_path:
+             Path.join([
+               Application.app_dir(:recurse_gateway, "priv"),
+               "cedar",
+               "schema.cedarschema.json"
+             ]),
+           trap_sighup: false,
+           name: nil},
+          id: make_ref()
+        )
+      )
+
+      # Metadata endpoints and metadata-only export succeed under ReadOwnEvidence
+      assert records(%{}, role: "student", subject: student_sub).status == 200
+      assert session(student_session, role: "student", subject: student_sub).status == 200
+      assert record(student_rec.ref, role: "student", subject: student_sub).status == 200
+
+      assert export(%{"session" => student_session, "content" => false},
+               role: "student",
+               subject: student_sub
+             ).status == 200
+
+      # Raw content download and content export are denied without ReadOwnPayload
+      assert content(student_rec.ref, Ref.bytes(student_args),
+               role: "student",
+               subject: student_sub
+             ).status == 403
+
+      assert export(%{"session" => student_session, "content" => true},
+               role: "student",
+               subject: student_sub
+             ).status == 403
     end
   end
 end

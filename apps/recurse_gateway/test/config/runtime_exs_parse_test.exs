@@ -84,4 +84,22 @@ defmodule Recurse.Gateway.Config.RuntimeExsParseTest do
 
     refute source =~ ~s|jwks_url: env.("BROWSER_OIDC_JWKS_URL") \|\| broker_jwks_url|
   end
+
+  test "R5E_APP_CORS_ORIGINS is wired, defaults empty, and strips wildcards" do
+    source = File.read!(@runtime_exs)
+
+    assert source =~ ~s|env.("R5E_APP_CORS_ORIGINS")|
+    assert source =~ ~s|config :recurse_gateway, app_cors_origins: app_cors_origins|
+    assert source =~ ~s|&(&1 == "" or &1 == "*")|
+  end
+
+  test "R5E_EVIDENCE_AUTO_HOLD_KINDS is wired and defaults to SafeguardingFlag" do
+    source = File.read!(@runtime_exs)
+
+    assert source =~ ~s|System.get_env("R5E_EVIDENCE_AUTO_HOLD_KINDS")|
+    assert source =~ ~s|["education.r5e.io/v1/SafeguardingFlag"]|
+
+    assert source =~
+             ~s|config :recurse_gateway, evidence_auto_hold_kinds: evidence_auto_hold_kinds|
+  end
 end

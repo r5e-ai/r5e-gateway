@@ -42,6 +42,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
   @ticket_context "r5e.hold-release-ticket/v1"
   @ticket_seconds 300
   @hold_scope "urn:r5e:hold:"
+  @default_auto_hold_kinds ["education.r5e.io/v1/SafeguardingFlag"]
 
   @type error ::
           :malformed_request
@@ -53,12 +54,55 @@ defmodule Recurse.Gateway.Provenance.Retention do
           | :nothing_to_dispose
           | :store_unavailable
           | {:under_hold, String.t()}
+          | {:safeguarding_hold_pending, String.t()}
           | {:never_disposed_of | :kept_until | :profile_not_held, String.t()}
           | atom()
 
   @doc "This deployment's retention stream."
   @spec stream(String.t()) :: String.t()
   def stream(deployment), do: "urn:r5e:stream:#{deployment}:retention"
+
+  @doc """
+  Parse a comma-separated `R5E_EVIDENCE_AUTO_HOLD_KINDS` value into a
+  deduplicated list of record kind paths (`namespace/version/Kind`).
+
+  When `nil` (env var unset), defaults to `#{inspect(@default_auto_hold_kinds)}`.
+  An explicit empty string (`""`) disables automatic holds.
+  """
+  @spec parse_auto_hold_kinds(String.t() | nil) :: [String.t()]
+  def parse_auto_hold_kinds(nil), do: @default_auto_hold_kinds
+
+  def parse_auto_hold_kinds(raw) when is_binary(raw) do
+    raw
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  @doc """
+  Return the configured record kind paths that automatically trigger an
+  indefinite gateway-signed `RetentionHold` upon admission.
+
+  Standing note: any party holding an active badge permitted to submit one of
+  these kinds can trigger an indefinite `RetentionHold` on its own sessions,
+  blocking owner/FERPA disposal until the two-step counselor/retention release
+  completes. That is intentional so flagged evidence cannot be erased before
+  review.
+  """
+  @spec auto_hold_kinds() :: [String.t()]
+  def auto_hold_kinds do
+    case Application.fetch_env(:recurse_gateway, :evidence_auto_hold_kinds) do
+      {:ok, kinds} when is_list(kinds) ->
+        kinds
+        |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+        |> Enum.map(&String.trim/1)
+        |> Enum.uniq()
+
+      _ ->
+        @default_auto_hold_kinds
+    end
+  end
 
   # -- holds ----------------------------------------------------------------
 
@@ -123,6 +167,42 @@ defmodule Recurse.Gateway.Provenance.Retention do
   end
 
   def hold(_request, _on_behalf_of), do: {:error, :malformed_request}
+
+  @doc """
+  Ensure an active (unreleased, unexpired) hold covers `scope`.
+
+  If an active hold on `scope` is already recorded on the retention stream
+  (matching indefinitely when `request` carries no `until`), re-applies its
+  lock so any newly arrived content is covered and returns
+  `{:ok, %{"hold" => ref, "seq" => seq, "already_held" => true}}` without
+  appending a duplicate `RetentionHold`. Otherwise records and seals a new
+  gateway-signed `RetentionHold`.
+  """
+  @spec ensure_hold(map(), String.t() | nil) :: {:ok, map()} | {:error, error()}
+  def ensure_hold(%{"scope" => scope, "reason" => _} = request, on_behalf_of)
+      when is_binary(scope) do
+    info = Runtime.info()
+    at = DateTime.utc_now()
+    entries = entries(info)
+    counting = counting(info, entries)
+    indefinite? = is_nil(request["until"])
+
+    existing =
+      Enum.find(active_holds(entries, counting, at), fn %{evidence: %{"body" => body}} ->
+        body["scope"] == scope and (not indefinite? or is_nil(body["until"]))
+      end)
+
+    case existing do
+      %{ref: ref, seq: seq, evidence: %{"body" => body}} ->
+        _ = lock(info, ref, body)
+        {:ok, %{"hold" => ref, "seq" => seq, "already_held" => true}}
+
+      nil ->
+        hold(request, on_behalf_of)
+    end
+  end
+
+  def ensure_hold(_request, _on_behalf_of), do: {:error, :malformed_request}
 
   defp lock(%{store: {module, handle}}, ref, %{"scope" => scope}) when is_binary(scope),
     do: module.hold_content(handle, ref, {:scope, scope})
@@ -368,6 +448,7 @@ defmodule Recurse.Gateway.Provenance.Retention do
     with true <- body["action"] in ["deleted", "expired"] || {:error, :malformed_request},
          :ok <- may_record(info, @disposal),
          {:ok, ended} <- holds_over(info, scope, at),
+         :ok <- no_pending_auto_holds(info, scope),
          :ok <- module.disposal_allowed(handle, scope, at),
          :ok <- key_left(module, handle, scope),
          {:ok, receipt} <- record(info, @disposal, body, on_behalf_of, at) do
@@ -564,6 +645,122 @@ defmodule Recurse.Gateway.Provenance.Retention do
       _ -> []
     end
   end
+
+  # Fail closed if an admitted record of a configured auto-hold kind exists for
+  # `scope` without a matching counselor-released hold. Closes both hold
+  # placement failures and any race window between admission and hold flush.
+  defp no_pending_auto_holds(info, scope) do
+    case auto_hold_kinds() do
+      [] ->
+        :ok
+
+      kinds ->
+        with {:ok, triggers} <- auto_hold_triggers(info, scope, kinds) do
+          verify_auto_hold_triggers(info, scope, triggers)
+        end
+    end
+  end
+
+  defp auto_hold_triggers(%{store: {module, handle}, deployment: deployment}, scope, kinds) do
+    prefix = "urn:r5e:stream:#{deployment}:"
+
+    Enum.reduce_while(kinds, {:ok, []}, fn kind, {:ok, acc} ->
+      case module.by_kind(handle, kind, prefix) do
+        {:ok, entries} ->
+          matched = Enum.filter(entries, &trigger_for_scope?(&1.evidence, scope))
+          {:cont, {:ok, acc ++ matched}}
+
+        {:error, _reason} ->
+          {:halt, {:error, :store_unavailable}}
+      end
+    end)
+  end
+
+  defp trigger_for_scope?(%{"session" => session}, scope)
+       when is_binary(session) and session != "",
+       do: session == scope
+
+  defp trigger_for_scope?(evidence, scope) do
+    Evidence.content_scope(evidence) == scope or
+      body_session_owned_by_trigger?(evidence, scope)
+  end
+
+  defp body_session_owned_by_trigger?(%{"body" => %{"session" => scope}} = evidence, scope) do
+    principal = evidence["onBehalfOf"] || evidence["actor"]
+
+    with true <- is_binary(principal) and principal != "",
+         {:ok, %{tenant: session_tenant}} <- SessionName.parts(scope),
+         true <- principal_in_tenant?(principal, session_tenant) do
+      SessionName.owned_by?(scope, principal)
+    else
+      _ -> false
+    end
+  end
+
+  defp body_session_owned_by_trigger?(_evidence, _scope), do: false
+
+  defp principal_in_tenant?("urn:r5e:principal:" <> rest, session_tenant) do
+    case String.split(rest, ":", parts: 2) do
+      [encoded_tenant, _subject] -> encoded_tenant == session_tenant
+      _ -> false
+    end
+  end
+
+  defp principal_in_tenant?("spiffe://" <> _ = spiffe, _session_tenant), do: spiffe != ""
+  defp principal_in_tenant?(_principal, _session_tenant), do: false
+
+  defp verify_auto_hold_triggers(_info, _scope, []), do: :ok
+
+  defp verify_auto_hold_triggers(info, scope, triggers) do
+    entries = entries(info)
+    counting = counting(info, entries)
+
+    holds =
+      for %{evidence: %{"kind" => @hold, "body" => %{"scope" => ^scope}}} = entry <- entries,
+          do: entry
+
+    releases = release_times(entries, counting)
+
+    case Enum.find(triggers, &(not trigger_covered?(&1, holds, releases))) do
+      nil -> :ok
+      %{ref: ref} -> {:error, {:safeguarding_hold_pending, ref}}
+    end
+  end
+
+  defp release_times(entries, counting) do
+    for %{ref: ref, evidence: %{"kind" => @release, "capturedAt" => text, "body" => body}} <-
+          entries,
+        counts?(counting, ref),
+        {:ok, at, _} <- [DateTime.from_iso8601(text)],
+        into: %{} do
+      {body["hold"], at}
+    end
+  end
+
+  defp trigger_covered?(trigger, holds, releases) do
+    trigger_at = parse_captured_at(trigger.evidence["capturedAt"])
+    Enum.any?(holds, &hold_satisfies_trigger?(&1, trigger.ref, trigger_at, releases))
+  end
+
+  defp hold_satisfies_trigger?(hold, trigger_ref, trigger_at, releases) do
+    case Map.fetch(releases, hold.ref) do
+      {:ok, release_at} ->
+        get_in(hold.evidence, ["body", "details", "triggerRef"]) == trigger_ref or
+          (not is_nil(trigger_at) and DateTime.compare(release_at, trigger_at) != :lt)
+
+      :error ->
+        false
+    end
+  end
+
+  defp parse_captured_at(text) when is_binary(text) do
+    case DateTime.from_iso8601(text) do
+      {:ok, dt, _} -> dt
+      _ -> nil
+    end
+  end
+
+  defp parse_captured_at(_), do: nil
 
   # -- after a restart ---------------------------------------------------------
 

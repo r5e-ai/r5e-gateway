@@ -98,13 +98,15 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
 
   alias Recurse.Gateway.AuditPlane.Authz
   alias Recurse.Gateway.Evidence.TailSocket
-  alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Gateway.Provenance.{Admission, Carried, Disclosing, Enrolment, Retention, Runtime}
   alias Recurse.Gateway.Provenance.SessionName
+  alias Recurse.Gateway.ProviderRegistry
   alias Recurse.Provenance.{Evidence, Export, Exporter, Key, Pipeline, Ref}
   alias Recurse.Shared.IdentityContext
 
   @read ~s(Recurse::Action::"ReadReceipts")
+  @read_own ~s(Recurse::Action::"ReadOwnEvidence")
+  @read_own_payload ~s(Recurse::Action::"ReadOwnPayload")
   @export ~s(Recurse::Action::"ExportEvidence")
   @payload ~s(Recurse::Action::"ReadPayload")
   @enrol ~s(Recurse::Action::"EnrolWorkload")
@@ -127,8 +129,8 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   def records(conn) do
     %Plug.Conn{query_params: params} = conn = Plug.Conn.fetch_query_params(conn)
 
-    gated(conn, @read, "/v1/evidence/records", fn conn, ctx, index ->
-      case page(params, ctx, index) do
+    gated_or_own(conn, @read, "/v1/evidence/records", fn conn, ctx, index, scope ->
+      case page(params, ctx, index, scope) do
         {:ok, page} -> json(conn, 200, page)
         :none -> json(conn, 200, %{"records" => [], "cursor" => nil})
         {:many, sessions} -> several(conn, sessions)
@@ -138,9 +140,10 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end)
   end
 
-  defp page(params, ctx, {module, handle} = index) do
+  defp page(params, ctx, {module, handle} = index, scope) do
     with {:ok, asked} <- listing(params),
-         {:ok, asked} <- of_session(asked, params["session"], ctx, index),
+         {:ok, asked} <- of_session(asked, params["session"], ctx, index, scope),
+         asked = apply_own_scope(asked, scope),
          # One more than asked for says whether there is more to read.
          {:ok, entries} <- module.list(handle, %{asked | limit: asked.limit + 1}) do
       {page, rest} = Enum.split(entries, asked.limit)
@@ -148,6 +151,11 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       {:ok, %{"records" => Enum.map(page, &render/1), "cursor" => cursor}}
     end
   end
+
+  defp apply_own_scope(asked, :all), do: asked
+
+  defp apply_own_scope(asked, {:own, %{principal: principal, session_prefix: prefix}}),
+    do: Map.put(asked, :own_principal, {principal, prefix})
 
   @doc """
   `GET /v1/evidence/facets`
@@ -370,11 +378,13 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end
   end
 
-  # A session is only ever looked for among the caller's tenant's own.
-  defp of_session(asked, nil, _ctx, _index), do: {:ok, asked}
+  # A session is only ever looked for among the caller's tenant's own (and
+  # for self-scoped readers, strictly among the caller's own sessions).
+  defp of_session(asked, session, ctx, index, scope \\ :all)
+  defp of_session(asked, nil, _ctx, _index, _scope), do: {:ok, asked}
 
-  defp of_session(asked, id, ctx, index) do
-    case named(ctx, id, index) do
+  defp of_session(asked, id, ctx, index, scope) do
+    case named(ctx, id, index, scope) do
       {:ok, session} -> {:ok, Map.put(asked, :session, session)}
       other -> other
     end
@@ -387,9 +397,9 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   @doc "`GET /v1/evidence/records/:ref`"
   @spec record(Plug.Conn.t()) :: Plug.Conn.t()
   def record(%Plug.Conn{path_params: %{"ref" => ref}} = conn) do
-    gated(conn, @read, "/v1/evidence/records", fn conn, _ctx, {module, handle} ->
+    gated_or_own(conn, @read, "/v1/evidence/records", fn conn, _ctx, index, scope ->
       with true <- Ref.valid?(ref, :evidence),
-           {:ok, entry} <- module.fetch(handle, ref) do
+           {:ok, entry} <- fetch_record(index, ref, scope) do
         json(conn, 200, render(entry))
       else
         _ -> not_found(conn)
@@ -412,25 +422,30 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   def content(%Plug.Conn{path_params: %{"ref" => ref, "bytes_ref" => bytes_ref}} = conn) do
     endpoint = "/v1/evidence/records/content"
 
-    gated(conn, @read, endpoint, fn conn, _ctx, index ->
-      case content_allowed(conn, true, endpoint) do
-        :ok -> held(conn, index, ref, bytes_ref)
+    gated_or_own(conn, @read, endpoint, fn conn, _ctx, index, scope ->
+      case content_allowed(conn, true, endpoint, scope) do
+        :ok -> held(conn, index, ref, bytes_ref, scope)
         {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
       end
     end)
   end
 
-  defp held(conn, {module, handle} = index, ref, bytes_ref) do
+  defp held(conn, index, ref, bytes_ref, scope) do
     with true <- Ref.valid?(ref, :evidence) and Ref.valid?(bytes_ref, :bytes),
-         {:ok, entry} <- module.fetch(handle, ref),
+         {:ok, entry} <- fetch_record(index, ref, scope),
          true <- bytes_ref in Exporter.content_refs([entry]),
-         scope = Evidence.content_scope(entry.evidence),
-         {:ok, bytes} <- readable(index, bytes_ref, scope) do
+         content_scope = Evidence.content_scope(entry.evidence),
+         {:ok, bytes} <- readable(index, bytes_ref, content_scope) do
       download(conn, bytes_ref, bytes)
     else
-      {:error, :key_service_unavailable} -> json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
-      {:unreadable, scope} -> if disposed?(index, scope), do: gone(conn), else: not_found(conn)
-      _ -> not_found(conn)
+      {:error, :key_service_unavailable} ->
+        json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+
+      {:unreadable, content_scope} ->
+        if disposed?(index, content_scope), do: gone(conn), else: not_found(conn)
+
+      _ ->
+        not_found(conn)
     end
   end
 
@@ -467,9 +482,9 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   @doc "`GET /v1/evidence/sessions/:session_id`"
   @spec session(Plug.Conn.t()) :: Plug.Conn.t()
   def session(%Plug.Conn{path_params: %{"session_id" => id}} = conn) do
-    gated(conn, @read, "/v1/evidence/sessions", fn conn, ctx, {module, handle} ->
-      with {:ok, session} <- named(ctx, id, {module, handle}),
-           {:ok, [_ | _] = entries} <- module.by_session(handle, session) do
+    gated_or_own(conn, @read, "/v1/evidence/sessions", fn conn, ctx, index, scope ->
+      with {:ok, session} <- named(ctx, id, index, scope),
+           {:ok, [_ | _] = entries} <- fetch_session(index, session, scope) do
         json(conn, 200, %{"session" => session, "records" => Enum.map(entries, &render/1)})
       else
         {:many, sessions} -> several(conn, sessions)
@@ -483,12 +498,13 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   def export(%Plug.Conn{body_params: %{"session" => id} = body} = conn) when is_binary(id) do
     content? = body["content"] == true
 
-    gated(conn, @export, "/v1/evidence/export", fn conn, ctx, index ->
-      with :ok <- content_allowed(conn, content?, "/v1/evidence/export"),
-           {:ok, session} <- named(ctx, id, index),
+    gated_or_own(conn, @export, "/v1/evidence/export", fn conn, ctx, index, scope ->
+      with :ok <- content_allowed(conn, content?, "/v1/evidence/export", scope),
+           {:ok, session} <- named(ctx, id, index, scope),
+           :ok <- session_exportable?(index, session, scope),
            {:ok, %{"records" => [_ | _]} = bundle} <-
              Exporter.session(index, session, content: content?) do
-        json(conn, 200, Carried.carry(bundle))
+        json(conn, 200, carry_for_scope(bundle, scope))
       else
         {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
         {:many, sessions} -> several(conn, sessions)
@@ -618,31 +634,33 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   @spec submit(Plug.Conn.t()) :: Plug.Conn.t()
   def submit(%Plug.Conn{body_params: request} = conn) do
     serving(conn, @submit, "/v1/evidence/records", fn conn, ctx ->
-      case Admission.submit(request, caller(ctx)) do
-        {:ok, admitted} ->
-          status =
-            if Enum.all?(admitted, &(&1["status"] == "already_admitted")), do: 200, else: 201
-
-          json(conn, status, %{"admitted" => admitted})
-
-        {:error, :malformed_request} ->
-          bad_request(conn, ~s(expected {"records": [{"envelope": {…}}], …}, 1 to 64 records))
-
-        {:error, {reason, about}} when is_atom(reason) and is_map(about) ->
-          json(conn, 409, Map.put(about, "error", Atom.to_string(reason)))
-
-        {:error, reason}
-        when reason in [:not_next_in_stream, :stream_fork_refused, :gateway_has_no_endorsement] ->
-          json(conn, 409, %{"error" => Atom.to_string(reason)})
-
-        {:error, reason} when is_atom(reason) ->
-          json(conn, 422, %{"error" => Atom.to_string(reason)})
-
-        {:error, _other} ->
-          json(conn, 422, %{"error" => "not_recorded"})
-      end
+      submit_answer(conn, Admission.submit(request, caller(ctx)))
     end)
   end
+
+  defp submit_answer(conn, {:ok, admitted}) do
+    status = if Enum.all?(admitted, &(&1["status"] == "already_admitted")), do: 200, else: 201
+    json(conn, status, %{"admitted" => admitted})
+  end
+
+  defp submit_answer(conn, {:error, :malformed_request}),
+    do: bad_request(conn, ~s(expected {"records": [{"envelope": {…}}], …}, 1 to 64 records))
+
+  defp submit_answer(conn, {:error, {reason, about}}) when is_atom(reason) and is_map(about),
+    do: json(conn, 409, Map.put(about, "error", Atom.to_string(reason)))
+
+  defp submit_answer(conn, {:error, :safeguarding_hold_failed}),
+    do: json(conn, 503, %{"error" => "safeguarding_hold_failed"})
+
+  defp submit_answer(conn, {:error, reason})
+       when reason in [:not_next_in_stream, :stream_fork_refused, :gateway_has_no_endorsement],
+       do: json(conn, 409, %{"error" => Atom.to_string(reason)})
+
+  defp submit_answer(conn, {:error, reason}) when is_atom(reason),
+    do: json(conn, 422, %{"error" => Atom.to_string(reason)})
+
+  defp submit_answer(conn, {:error, _other}),
+    do: json(conn, 422, %{"error" => "not_recorded"})
 
   @doc "`POST /v1/authority/badges/revoke`"
   @spec badge_revoke(Plug.Conn.t()) :: Plug.Conn.t()
@@ -915,10 +933,118 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end
   end
 
-  # Asking for content needs the right to read payloads too.
-  defp content_allowed(_conn, false, _endpoint), do: :ok
+  defp gated_or_own(conn, org_action, endpoint, fun) do
+    case Authz.gate_any(conn, [org_action, @read_own], resource(endpoint)) do
+      {:ok, conn, %IdentityContext{} = ctx, _bundle_ref, ^org_action} ->
+        with_index(conn, ctx, :all, fun)
 
-  defp content_allowed(conn, true, endpoint) do
+      {:ok, conn, %IdentityContext{} = ctx, _bundle_ref, @read_own} ->
+        case own_scope(ctx) do
+          {:ok, own} -> with_index(conn, ctx, {:own, own}, fun)
+          :error -> Authz.send_forbidden(conn, :missing_subject)
+        end
+
+      error ->
+        Authz.dispatch_gate_error(conn, error)
+    end
+  end
+
+  defp with_index(conn, ctx, scope, fun) do
+    case index_for(ctx) do
+      {:ok, index} -> fun.(conn, ctx, index, scope)
+      :error -> not_found(conn)
+    end
+  end
+
+  defp own_scope(%IdentityContext{tenant_id: tenant, principal: principal} = ctx)
+       when is_binary(tenant) and tenant != "" do
+    if non_empty_principal_id?(principal) do
+      %{principal: named} = caller(ctx)
+      {:ok, %{principal: named, session_prefix: SessionName.for(tenant, named, "")}}
+    else
+      :error
+    end
+  end
+
+  defp own_scope(_ctx), do: :error
+
+  defp non_empty_principal_id?(%{kind: :obo_human, subject: sub}), do: non_empty_binary?(sub)
+  defp non_empty_principal_id?(%{spiffe_id: spiffe}), do: non_empty_binary?(spiffe)
+  defp non_empty_principal_id?(%{subject: sub}), do: non_empty_binary?(sub)
+  defp non_empty_principal_id?(%{account_id: id}), do: non_empty_binary?(id)
+  defp non_empty_principal_id?(_), do: false
+
+  defp non_empty_binary?(value), do: is_binary(value) and value != ""
+
+  defp fetch_record({module, handle}, ref, :all), do: module.fetch(handle, ref)
+
+  defp fetch_record(
+         {module, handle},
+         ref,
+         {:own, %{principal: principal, session_prefix: prefix}}
+       ) do
+    if function_exported?(module, :fetch_owned, 4) do
+      module.fetch_owned(handle, ref, principal, prefix)
+    else
+      with {:ok, entry} <- module.fetch(handle, ref),
+           true <- owned_entry?(entry, principal, prefix) do
+        {:ok, entry}
+      else
+        _ -> :error
+      end
+    end
+  end
+
+  defp fetch_session({module, handle}, session, :all), do: module.by_session(handle, session)
+
+  defp fetch_session(
+         {module, handle},
+         session,
+         {:own, %{principal: principal, session_prefix: prefix}}
+       ) do
+    if function_exported?(module, :by_session_owned, 4) do
+      module.by_session_owned(handle, session, principal, prefix)
+    else
+      with {:ok, entries} <- module.by_session(handle, session) do
+        {:ok, Enum.filter(entries, &owned_entry?(&1, principal, prefix))}
+      end
+    end
+  end
+
+  defp owned_entry?(%{evidence: evidence}, principal, session_prefix) do
+    evidence["actor"] == principal or
+      (is_binary(evidence["session"]) and String.starts_with?(evidence["session"], session_prefix))
+  end
+
+  defp session_exportable?(_index, _session, :all), do: :ok
+
+  defp session_exportable?(index, session, {:own, _} = scope) do
+    case fetch_session(index, session, scope) do
+      {:ok, [_ | _]} -> :ok
+      _ -> :none
+    end
+  end
+
+  defp carry_for_scope(bundle, :all), do: Carried.carry(bundle)
+
+  defp carry_for_scope(bundle, {:own, _}),
+    do: Carried.carry(bundle, retention: false, security: false)
+
+  # Asking for content needs the right to read payloads too: `ReadPayload` on
+  # org-wide reads, or `ReadOwnPayload` on self-scoped reads so deployments
+  # (such as schools) can disable raw payload downloads independently of
+  # self-scoped metadata listing.
+  defp content_allowed(conn, want_content?, endpoint, scope \\ :all)
+  defp content_allowed(_conn, false, _endpoint, _scope), do: :ok
+
+  defp content_allowed(conn, true, endpoint, {:own, _}) do
+    case Authz.gate(conn, @read_own_payload, resource(endpoint)) do
+      {:ok, _conn, _ctx, _bundle_ref} -> :ok
+      error -> {:forbidden, error}
+    end
+  end
+
+  defp content_allowed(conn, true, endpoint, :all) do
     case Authz.gate(conn, @payload, resource(endpoint)) do
       {:ok, _conn, _ctx, _bundle_ref} -> :ok
       error -> {:forbidden, error}
@@ -944,26 +1070,70 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   # the id alone. An id alone is looked up among the caller's tenant's
   # sessions; when different people used the same id the reader is given
   # the names to choose from. Nothing outside the caller's tenant is ever
-  # matched.
-  defp named(%IdentityContext{tenant_id: tenant}, asked, {module, handle}) do
-    prefix = "urn:r5e:session:" <> SessionName.encode(tenant) <> ":"
+  # matched. Under self-scoped `ReadOwnEvidence`, resolution is restricted
+  # strictly to the caller's own fingerprint prefix so another user's
+  # sessions are never matched or disclosed via 409 collisions.
+  defp named(
+         %IdentityContext{tenant_id: tenant},
+         asked,
+         _index,
+         {:own, %{principal: principal, session_prefix: own_prefix}}
+       ) do
+    tenant_prefix = "urn:r5e:session:" <> SessionName.encode(tenant) <> ":"
 
     cond do
       String.starts_with?(asked, "urn:r5e:session:") ->
-        if String.starts_with?(asked, prefix) and match?({:ok, _}, SessionName.parts(asked)),
+        if String.starts_with?(asked, own_prefix) and match?({:ok, _}, SessionName.parts(asked)),
           do: {:ok, asked},
           else: :none
 
-      match?({:ok, _}, SessionName.parts(prefix <> asked)) and
-          match?({:ok, [_ | _]}, module.by_session(handle, prefix <> asked)) ->
-        {:ok, prefix <> asked}
+      match?({:ok, _}, SessionName.parts(tenant_prefix <> asked)) ->
+        if String.starts_with?(tenant_prefix <> asked, own_prefix),
+          do: {:ok, tenant_prefix <> asked},
+          else: :none
 
       true ->
-        case module.sessions_named(handle, prefix, SessionName.encode(asked)) do
-          [session] -> {:ok, session}
-          [_, _ | _] = sessions -> {:many, sessions}
-          [] -> :none
-        end
+        candidate = SessionName.for(tenant, principal, asked)
+        if match?({:ok, _}, SessionName.parts(candidate)), do: {:ok, candidate}, else: :none
+    end
+  end
+
+  defp named(%IdentityContext{tenant_id: tenant}, asked, {module, handle}, :all) do
+    prefix = "urn:r5e:session:" <> SessionName.encode(tenant) <> ":"
+
+    if String.starts_with?(asked, "urn:r5e:session:") do
+      validate_prefixed_session(asked, prefix)
+    else
+      resolve_short_session(prefix, asked, module, handle)
+    end
+  end
+
+  defp validate_prefixed_session(candidate, prefix) do
+    if String.starts_with?(candidate, prefix) and valid_session_name?(candidate),
+      do: {:ok, candidate},
+      else: :none
+  end
+
+  defp resolve_short_session(prefix, asked, module, handle) do
+    qualified = prefix <> asked
+
+    if valid_session_name?(qualified) and has_records?(module, handle, qualified) do
+      {:ok, qualified}
+    else
+      lookup_sessions_by_id(module, handle, prefix, asked)
+    end
+  end
+
+  defp valid_session_name?(name), do: match?({:ok, _}, SessionName.parts(name))
+
+  defp has_records?(module, handle, session),
+    do: match?({:ok, [_ | _]}, module.by_session(handle, session))
+
+  defp lookup_sessions_by_id(module, handle, prefix, asked) do
+    case module.sessions_named(handle, prefix, SessionName.encode(asked)) do
+      [session] -> {:ok, session}
+      [_, _ | _] = sessions -> {:many, sessions}
+      [] -> :none
     end
   end
 

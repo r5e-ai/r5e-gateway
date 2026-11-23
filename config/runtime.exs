@@ -743,3 +743,46 @@ config :recurse_gateway,
 config :recurse_gateway,
   retain_payloads?: env_bool.("R5E_RETAIN_PAYLOADS", false),
   retain_payloads_max_bytes: env_int.("R5E_RETAIN_PAYLOADS_MAX_BYTES", "8388608")
+
+# ---------------------------------------------------------------------------
+# Unified r5e App CORS allowlist — opt-in via R5E_APP_CORS_ORIGINS.
+#
+# Comma-separated exact origins (e.g. "tauri://localhost,http://localhost:5173").
+# Defaults safely to empty (`[]`, CORS disabled) unless explicitly configured.
+# Wildcard `"*"` entries are stripped because credentials are enabled.
+# ---------------------------------------------------------------------------
+app_cors_origins =
+  (env.("R5E_APP_CORS_ORIGINS") || "")
+  |> String.split(",", trim: true)
+  |> Enum.map(&String.trim/1)
+  |> Enum.reject(&(&1 == "" or &1 == "*"))
+  |> Enum.uniq()
+
+config :recurse_gateway, app_cors_origins: app_cors_origins
+
+# ---------------------------------------------------------------------------
+# Automatic RetentionHold trigger kinds — R5E_EVIDENCE_AUTO_HOLD_KINDS.
+#
+# Comma-separated record kind paths (`namespace/version/Kind`) whose admission
+# automatically places an indefinite gateway-signed `RetentionHold` on the
+# record's session. Defaults to `["education.r5e.io/v1/SafeguardingFlag"]` when
+# unset; set explicitly to `""` to disable automatic holds.
+#
+# Note: any workload holding an active badge permitted to submit a configured
+# auto-hold kind can place an indefinite hold on its own sessions, blocking
+# owner/FERPA disposal until the two-step counselor release completes.
+# ---------------------------------------------------------------------------
+evidence_auto_hold_kinds =
+  case System.get_env("R5E_EVIDENCE_AUTO_HOLD_KINDS") do
+    nil ->
+      ["education.r5e.io/v1/SafeguardingFlag"]
+
+    raw ->
+      raw
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+  end
+
+config :recurse_gateway, evidence_auto_hold_kinds: evidence_auto_hold_kinds

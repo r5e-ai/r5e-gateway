@@ -97,6 +97,7 @@ defmodule Recurse.Provenance.Store do
           optional(:kind_path) => String.t(),
           optional(:session) => String.t(),
           optional(:actor) => String.t(),
+          optional(:own_principal) => {String.t(), String.t()},
           optional(:since) => DateTime.t(),
           optional(:until) => DateTime.t(),
           optional(:before) => {DateTime.t(), Ref.t()}

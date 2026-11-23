@@ -90,6 +90,27 @@ defmodule Recurse.Gateway.AuditPlane.Authz do
     end
   end
 
+  @doc """
+  Gate a request against an ordered list of Cedar actions using a single JWT
+  validation, single rate-limit check, and single atomic policy bundle snapshot.
+
+  Evaluates actions in order and returns the first permitted action in
+  `{:ok, conn, identity_ctx, bundle_ref, matched_action}`. Returns
+  `{:error, :forbidden, matched}` only if every action is denied.
+  """
+  @spec gate_any(Plug.Conn.t(), [action(), ...], resource_spec(), map()) ::
+          {:ok, Plug.Conn.t(), IdentityContext.t(), PolicyBundleRef.t(), action()} | authz_err()
+  def gate_any(conn, [_ | _] = actions, resource, extra_context \\ %{})
+      when is_map(resource) and is_map(extra_context) do
+    with {:ok, conn_with_ctx, ctx} <- authenticate(conn),
+         {:ok, conn_after_ratelimit} <- rate_limit(conn_with_ctx),
+         {:ok, bundle_ref} <- fetch_bundle(),
+         {:allowed, matched_action} <-
+           evaluate_any_cedar(bundle_ref, ctx, actions, resource, extra_context) do
+      {:ok, conn_after_ratelimit, ctx, bundle_ref, matched_action}
+    end
+  end
+
   # F002 T092 / FR-030 — per-tenant rate limit for the Audit Plane. The
   # plug halts the conn + sends a 429 with the F001 error envelope on
   # breach; we detect that via `conn.halted == true` and short-circuit
@@ -156,6 +177,15 @@ defmodule Recurse.Gateway.AuditPlane.Authz do
       {:allow, _matched} -> :allowed
       {:deny, matched} -> {:error, :forbidden, matched}
     end
+  end
+
+  defp evaluate_any_cedar(bundle_ref, ctx, actions, resource, extra_context) do
+    Enum.reduce_while(actions, {:error, :forbidden, []}, fn action, _acc ->
+      case evaluate_cedar(bundle_ref, ctx, action, resource, extra_context) do
+        :allowed -> {:halt, {:allowed, action}}
+        {:error, :forbidden, matched} -> {:cont, {:error, :forbidden, matched}}
+      end
+    end)
   end
 
   # ---------------------------------------------------------------------------
