@@ -172,6 +172,7 @@ defmodule Recurse.Gateway.Router do
   )
 
   plug(:claimed)
+  plug(:personal_enabled_gate)
   plug(:match)
   plug(:dispatch)
 
@@ -197,6 +198,21 @@ defmodule Recurse.Gateway.Router do
       |> Plug.Conn.put_resp_content_type("application/json")
       |> Plug.Conn.send_resp(503, ~s({"error":"deployment_not_claimed"}))
       |> Plug.Conn.halt()
+    end
+  end
+
+  defp personal_enabled_gate(conn, _opts) do
+    personal_path? =
+      conn.request_path == "/v1/personal" or
+        String.starts_with?(conn.request_path, "/v1/personal/")
+
+    if personal_path? and not Recurse.Gateway.Personal.Policy.enabled?() do
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.send_resp(404, ~s({"error":"ERR_NOT_FOUND"}))
+      |> Plug.Conn.halt()
+    else
+      conn
     end
   end
 

@@ -234,7 +234,7 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutesTest do
       assert {:deny, _} = CedarToolUseGate.evaluate(intent, base_ctx)
     end
 
-    test "ChatCompletionsHandler allows primary ZDR & fallback-to-ZDR, denies non-ZDR via Cedar, and fails closed on fallback-to-non-ZDR" do
+    test "ChatCompletionsHandler derives ZDR strictly from server provider config (ignores caller headers) and fails closed on non-ZDR fallback" do
       prev_routes = Application.get_env(:recurse_gateway, :upstream_zdr_routes)
 
       Application.put_env(
@@ -251,14 +251,16 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutesTest do
           else: Application.put_env(:recurse_gateway, :upstream_zdr_routes, prev_routes)
       end)
 
-      ProviderRegistry.install_raw!(%{
-        llm: {LLMMock, %{}},
-        ledger: {Recurse.Gateway.LlmProxy.ZdrRoutesTest.StubLedger, %{}},
-        storage: {StorageMock, %{}},
-        secrets: {Recurse.Gateway.Test.StubSecretsProvider, %{backend: :stub}},
-        tenant_id: "district-test",
-        signer: "observed://gateway/test"
-      })
+      install_llm = fn llm_state ->
+        ProviderRegistry.install_raw!(%{
+          llm: {LLMMock, llm_state},
+          ledger: {Recurse.Gateway.LlmProxy.ZdrRoutesTest.StubLedger, %{}},
+          storage: {StorageMock, %{}},
+          secrets: {Recurse.Gateway.Test.StubSecretsProvider, %{backend: :stub}},
+          tenant_id: "district-test",
+          signer: "observed://gateway/test"
+        })
+      end
 
       hash = Cedar.canonical_hash(@zdr_chat_bundle)
 
@@ -304,14 +306,15 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutesTest do
         {:ok, %{status: 200, headers: [], body: upstream_ok}}
       end)
 
-      expect(StorageMock, :put_payload, 3, fn _state, _bytes, _ctx ->
+      expect(StorageMock, :put_payload, 4, fn _state, _bytes, _ctx ->
         {:ok, %{uri: "s3://test/zdr-run.json", hash: <<0::256>>}}
       end)
 
-      # 1. Primary ZDR route -> 200 non-refusal
+      # 1. Server-configured primary ZDR route -> 200 non-refusal
+      install_llm.(%{upstream_route_id: "anthropic-zdr-primary"})
+
       conn_ok =
         conn(:post, "/v1/chat/completions")
-        |> put_req_header("x-r5e-upstream-route", "anthropic-zdr-primary")
         |> Map.put(:body_params, body)
         |> Plug.Conn.assign(:identity_ctx, ctx)
         |> ChatCompletionsHandler.handle()
@@ -320,11 +323,11 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutesTest do
       resp_ok = JSON.decode!(conn_ok.resp_body)
       assert get_in(resp_ok, ["choices", Access.at(0), "message", "refusal"]) == nil
 
-      # 2. Fallback to ZDR route -> 200 non-refusal
+      # 2. Server-configured fallback to ZDR route -> 200 non-refusal
+      install_llm.(%{upstream_route_id: "anthropic-zdr-primary", primary_available?: false})
+
       conn_fb_ok =
         conn(:post, "/v1/chat/completions")
-        |> put_req_header("x-r5e-upstream-route", "anthropic-zdr-primary")
-        |> put_req_header("x-r5e-upstream-fallback", "true")
         |> Map.put(:body_params, body)
         |> Plug.Conn.assign(:identity_ctx, ctx)
         |> ChatCompletionsHandler.handle()
@@ -333,23 +336,39 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutesTest do
       resp_fb_ok = JSON.decode!(conn_fb_ok.resp_body)
       assert get_in(resp_fb_ok, ["choices", Access.at(0), "message", "refusal"]) == nil
 
-      # 3. Non-ZDR route -> Cedar denies (context.upstream_zdr_pinned == false), LLM never called
-      conn_non_zdr =
+      # 3. Server-configured non-ZDR route -> Cedar denies EVEN IF caller spoofs ZDR header!
+      install_llm.(%{upstream_route_id: "consumer-non-zdr"})
+
+      conn_spoofed =
         conn(:post, "/v1/chat/completions")
-        |> put_req_header("x-r5e-upstream-route", "consumer-non-zdr")
+        |> put_req_header("x-r5e-upstream-route", "anthropic-zdr-primary")
         |> Map.put(:body_params, body)
         |> Plug.Conn.assign(:identity_ctx, ctx)
         |> ChatCompletionsHandler.handle()
 
-      assert conn_non_zdr.status == 200
-      resp_non_zdr = JSON.decode!(conn_non_zdr.resp_body)
-      assert is_binary(get_in(resp_non_zdr, ["choices", Access.at(0), "message", "refusal"]))
+      assert conn_spoofed.status == 200
+      resp_spoofed = JSON.decode!(conn_spoofed.resp_body)
+      assert is_binary(get_in(resp_spoofed, ["choices", Access.at(0), "message", "refusal"]))
 
-      # 4. Fallback to non-ZDR route -> fails closed with 503 non_zdr_fallback_refused
+      # 4. Unconfigured LLM provider -> Cedar denies EVEN IF caller spoofs ZDR header!
+      install_llm.(%{})
+
+      conn_bare =
+        conn(:post, "/v1/chat/completions")
+        |> put_req_header("x-r5e-upstream-route", "anthropic-zdr-primary")
+        |> Map.put(:body_params, body)
+        |> Plug.Conn.assign(:identity_ctx, ctx)
+        |> ChatCompletionsHandler.handle()
+
+      assert conn_bare.status == 200
+      resp_bare = JSON.decode!(conn_bare.resp_body)
+      assert is_binary(get_in(resp_bare, ["choices", Access.at(0), "message", "refusal"]))
+
+      # 5. Server-configured fallback to non-ZDR route -> fails closed 503 non_zdr_fallback_refused
+      install_llm.(%{upstream_route_id: "anthropic-zdr-bad-fallback", primary_available?: false})
+
       conn_fb_fail =
         conn(:post, "/v1/chat/completions")
-        |> put_req_header("x-r5e-upstream-route", "anthropic-zdr-bad-fallback")
-        |> put_req_header("x-r5e-upstream-fallback", "true")
         |> Map.put(:body_params, body)
         |> Plug.Conn.assign(:identity_ctx, ctx)
         |> ChatCompletionsHandler.handle()

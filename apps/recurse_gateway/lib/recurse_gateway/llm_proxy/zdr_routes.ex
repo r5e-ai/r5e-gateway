@@ -186,6 +186,11 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutes do
     cedar_context_for_metadata(metadata || %{}, opts)
   end
 
+  def cedar_context_for_config(%{metadata: metadata} = cfg, opts) when is_map(metadata) do
+    merged = Map.merge(metadata, Map.delete(cfg, :metadata))
+    cedar_context_for_metadata(merged, opts)
+  end
+
   def cedar_context_for_config(metadata, opts) when is_map(metadata) do
     cedar_context_for_metadata(metadata, opts)
   end
@@ -195,28 +200,46 @@ defmodule Recurse.Gateway.LlmProxy.ZdrRoutes do
   end
 
   defp cedar_context_for_metadata(metadata, opts) do
-    route_id =
-      Keyword.get(opts, :route_id) ||
-        Map.get(metadata, "upstream_route_id") ||
-        Map.get(metadata, :upstream_route_id)
+    select_opts =
+      Keyword.put_new(opts, :primary_available?, metadata_primary_available?(metadata))
 
-    case route_id do
+    case extract_metadata_route_id(metadata, opts) do
       id when is_binary(id) and id != "" ->
-        case select_route(id, opts) do
-          {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}} ->
-            {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}}
-
-          {:error, :route_not_found, _} ->
-            {:ok, %{upstream_route_id: id, upstream_zdr_pinned: false}}
-
-          {:error, reason, details} ->
-            {:error, reason, details}
-        end
+        select_cedar_context(id, select_opts)
 
       _ ->
         {:ok, %{upstream_route_id: "", upstream_zdr_pinned: false}}
     end
   end
+
+  defp extract_metadata_route_id(metadata, opts) do
+    Keyword.get(opts, :route_id) ||
+      Map.get(metadata, "upstream_route_id") ||
+      Map.get(metadata, :upstream_route_id) ||
+      Map.get(metadata, "zdr_route_id") ||
+      Map.get(metadata, :zdr_route_id)
+  end
+
+  defp select_cedar_context(id, select_opts) do
+    case select_route(id, select_opts) do
+      {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}} ->
+        {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}}
+
+      {:error, :route_not_found, _} ->
+        {:ok, %{upstream_route_id: id, upstream_zdr_pinned: false}}
+
+      {:error, reason, details} ->
+        {:error, reason, details}
+    end
+  end
+
+  defp metadata_primary_available?(%{primary_available?: avail}) when is_boolean(avail),
+    do: avail
+
+  defp metadata_primary_available?(%{"primary_available" => avail}) when is_boolean(avail),
+    do: avail
+
+  defp metadata_primary_available?(_), do: true
 
   # ---------------------------------------------------------------------------
   # Internal helpers

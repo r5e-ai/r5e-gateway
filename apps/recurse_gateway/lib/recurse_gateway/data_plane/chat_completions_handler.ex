@@ -106,7 +106,7 @@ defmodule Recurse.Gateway.DataPlane.ChatCompletionsHandler do
   def handle(%Plug.Conn{assigns: %{identity_ctx: %IdentityContext{} = ctx}} = conn) do
     with {:ok, request_body} <- read_body(conn),
          :ok <- validate_request(request_body),
-         {:ok, zdr_ctx} <- resolve_zdr_route(conn),
+         {:ok, zdr_ctx} <- resolve_zdr_route(),
          {:ok, %Active{bundle: bundle_ref}} <- Active.current(),
          policy_result <- evaluate_policy(bundle_ref, ctx, request_body, zdr_ctx),
          {:ok, conn_final} <- dispatch(conn, ctx, request_body, bundle_ref, policy_result) do
@@ -226,44 +226,16 @@ defmodule Recurse.Gateway.DataPlane.ChatCompletionsHandler do
   # Policy evaluation
   # ---------------------------------------------------------------------------
 
-  defp resolve_zdr_route(conn) do
-    case extract_zdr_route_id(conn) do
-      nil ->
+  # Resolve route-bound ZDR context strictly from the server-configured LLM
+  # upstream provider state (consistent with `StreamingProxy`), never trusting
+  # inbound caller HTTP headers.
+  defp resolve_zdr_route do
+    case ProviderRegistry.fetch() do
+      {:ok, %{llm: {_llm_mod, llm_state}}} ->
+        ZdrRoutes.cedar_context_for_config(llm_state)
+
+      _ ->
         {:ok, %{upstream_route_id: "", upstream_zdr_pinned: false}}
-
-      id ->
-        select_zdr_route(id, primary_route_available?(conn))
-    end
-  end
-
-  defp extract_zdr_route_id(conn) do
-    case Plug.Conn.get_req_header(conn, "x-r5e-upstream-route") do
-      [id | _] when is_binary(id) and id != "" -> id
-      _ -> default_configured_route_id()
-    end
-  end
-
-  defp default_configured_route_id do
-    case ZdrRoutes.configured_routes() do
-      [first | _] -> first.route_id
-      [] -> nil
-    end
-  end
-
-  defp primary_route_available?(conn) do
-    not match?(["true" | _], Plug.Conn.get_req_header(conn, "x-r5e-upstream-fallback"))
-  end
-
-  defp select_zdr_route(id, primary_available?) do
-    case ZdrRoutes.select_route(id, primary_available?: primary_available?) do
-      {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}} ->
-        {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}}
-
-      {:error, :route_not_found, _} ->
-        {:ok, %{upstream_route_id: id, upstream_zdr_pinned: false}}
-
-      {:error, reason, details} ->
-        {:error, reason, details}
     end
   end
 

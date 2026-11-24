@@ -86,7 +86,7 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
   @chain_default_limit 250
   @chain_max_limit 500
   @chain_kept_ms 5_000
-  @chain_kept_bytes 10_485_760
+  @chain_default_max_bytes 4_194_304
 
   @type error ::
           :malformed_request
@@ -494,14 +494,55 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
         Application.get_env(:recurse_gateway, :evidence_public_chain?, false) == true
 
   @doc """
+  Whether `R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT=true` conflicts with
+  private personal household or custody release-gate mode.
+  """
+  @spec public_chain_conflict?() :: boolean()
+  def public_chain_conflict? do
+    include_raw? =
+      Application.get_env(:recurse_gateway, :evidence_public_chain_include_content?, false) ==
+        true
+
+    private_mode? =
+      Application.get_env(:recurse_gateway, :personal_enabled?, false) == true or
+        Application.get_env(:recurse_gateway, :custody_require_release_grant?, false) == true
+
+    include_raw? and private_mode?
+  end
+
+  @doc """
+  Whether `/v1/public/chain` carries undisclosed content payloads (strictly
+  opt-in via `R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT=true` and refused if
+  personal or custody modes are enabled).
+  """
+  @spec public_chain_include_content?() :: boolean()
+  def public_chain_include_content? do
+    Application.get_env(:recurse_gateway, :evidence_public_chain_include_content?, false) == true and
+      not public_chain_conflict?()
+  end
+
+  @doc "Hard maximum JSON response byte size for `/v1/public/chain`."
+  @spec public_chain_max_bytes() :: pos_integer()
+  def public_chain_max_bytes do
+    case Application.get_env(
+           :recurse_gateway,
+           :evidence_public_chain_max_bytes,
+           @chain_default_max_bytes
+         ) do
+      n when is_integer(n) and n >= 1 -> n
+      _ -> @chain_default_max_bytes
+    end
+  end
+
+  @doc """
   A record that was provided to the public (or any record on the chain when
   `R5E_EVIDENCE_PUBLIC_CHAIN` is also enabled), as the text of a bundle. It
   carries the content that was provided with that record and lists the rest
-  as withheld (or all carried content when full public chain mode is active).
-  `:not_public` for anything else, whether or not it exists. `:busy` when too
-  many are being built at once; ask again.
+  as withheld (or all carried content only when `R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT`
+  is also explicitly enabled without private-mode conflict).
   """
-  @spec public_bundle(String.t()) :: {:ok, binary()} | {:error, :not_public | :busy}
+  @spec public_bundle(String.t()) ::
+          {:ok, binary()} | {:error, :not_public | :busy | :public_chain_conflict}
   def public_bundle(ref) do
     cond do
       not is_binary(ref) or not public_reading?() ->
@@ -513,33 +554,55 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
         end)
 
       public_chain?() and Ref.valid?(ref, :evidence) ->
-        cached_or_build({:chain_record, ref}, @chain_kept_ms, @kept_bytes, fn ->
-          assemble_record(ref, true)
-        end)
+        build_chain_record(ref)
 
       true ->
         {:error, :not_public}
     end
   end
 
+  defp build_chain_record(ref) do
+    if public_chain_conflict?() do
+      {:error, :public_chain_conflict}
+    else
+      include_content? = public_chain_include_content?()
+
+      cached_or_build({:chain_record, ref, include_content?}, @chain_kept_ms, @kept_bytes, fn ->
+        assemble_record(ref, include_content?)
+      end)
+    end
+  end
+
   @doc """
   A bounded offline-verifiable bundle of this deployment's chain (up to
-  `limit`, default `250`, max `500`), including carried content payloads and
-  deployment chain/authority/definition records. Returns `:not_public` unless
-  both `R5E_EVIDENCE_PUBLIC_READ` and `R5E_EVIDENCE_PUBLIC_CHAIN` are true,
-  and `:busy` when `@building` concurrent public builds are already in flight.
+  `limit`, default `250`, max `500`), enforcing `R5E_EVIDENCE_PUBLIC_CHAIN_MAX_BYTES`
+  before returning or caching. Carries only explicitly disclosed content by
+  default, unless `R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT=true` without
+  personal/custody mode conflict.
   """
-  @spec public_chain_bundle(pos_integer()) :: {:ok, binary()} | {:error, :not_public | :busy}
+  @spec public_chain_bundle(pos_integer()) ::
+          {:ok, binary()}
+          | {:error, :not_public | :busy | :payload_too_large | :public_chain_conflict}
   def public_chain_bundle(limit \\ @chain_default_limit)
       when is_integer(limit) and limit >= 1 do
-    if public_chain?() do
-      bounded = min(limit, @chain_max_limit)
+    cond do
+      not public_chain?() ->
+        {:error, :not_public}
 
-      cached_or_build({:chain, bounded}, @chain_kept_ms, @chain_kept_bytes, fn ->
-        assemble_chain(bounded)
-      end)
-    else
-      {:error, :not_public}
+      public_chain_conflict?() ->
+        {:error, :public_chain_conflict}
+
+      true ->
+        bounded = min(limit, @chain_max_limit)
+        include_content? = public_chain_include_content?()
+        max_bytes = public_chain_max_bytes()
+
+        cached_or_build(
+          {:chain, bounded, include_content?, max_bytes},
+          @chain_kept_ms,
+          max_bytes,
+          fn -> assemble_chain(bounded, include_content?, max_bytes) end
+        )
     end
   end
 
@@ -595,7 +658,7 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
     end
   end
 
-  defp assemble_chain(limit) do
+  defp assemble_chain(limit, include_content?, max_bytes) do
     with %{store: {module, handle} = store, deployment: deployment} <- Runtime.info(),
          prefix = "urn:r5e:stream:#{deployment}:",
          {:ok, listed} <- module.list(handle, %{stream_prefix: prefix, limit: limit}),
@@ -603,16 +666,30 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
            Enum.reject(listed, fn entry ->
              entry.evidence["kind"] in ["EpochSeal", "Checkpoint"]
            end),
+         content_opt = chain_content_opt(entries, include_content?),
          {:ok, bundle} <-
            Exporter.bundle(
              store,
              entries,
              %{"chain" => deployment, "limit" => limit},
-             content: true
+             content: content_opt
            ) do
-      {:ok, JSON.encode!(Carried.carry(bundle, retention: false, security: false))}
+      text = JSON.encode!(Carried.carry(bundle, retention: false, security: false))
+      if byte_size(text) <= max_bytes, do: {:ok, text}, else: {:error, :payload_too_large}
     else
       _ -> {:error, :not_public}
     end
+  end
+
+  defp chain_content_opt(_entries, true), do: true
+
+  defp chain_content_opt(entries, false) do
+    Enum.reduce(entries, MapSet.new(), fn entry, acc ->
+      if public?(entry.ref) do
+        MapSet.union(acc, provided_with(entry.ref))
+      else
+        acc
+      end
+    end)
   end
 end

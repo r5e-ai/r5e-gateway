@@ -149,9 +149,12 @@ defmodule Recurse.Gateway.Personal.Policy do
   defp child_badge_body?(_), do: false
 
   defp check_records(opened_records) do
-    Enum.reduce_while(opened_records, :ok, fn %{evidence: evidence}, :ok ->
+    Enum.reduce_while(opened_records, :ok, fn record, :ok ->
+      evidence = record.evidence
+      record_ref = Map.get(record, :ref)
+
       with :ok <- check_child_device_record(evidence),
-           :ok <- check_household_erasure_cosign(evidence) do
+           :ok <- check_household_erasure_cosign(evidence, record_ref) do
         {:cont, :ok}
       else
         error -> {:halt, error}
@@ -178,15 +181,26 @@ defmodule Recurse.Gateway.Personal.Policy do
 
   defp check_child_device_record(_), do: :ok
 
-  defp check_household_erasure_cosign(%{
-         "apiVersion" => "personal.r5e.io/v1",
-         "kind" => "PersonalErasure",
-         "body" => %{"scope" => "household", "targetId" => household_id} = body
-       })
-       when is_binary(household_id) do
-    case Store.get_household(household_id) do
+  defp check_household_erasure_cosign(
+         %{
+           "apiVersion" => "personal.r5e.io/v1",
+           "kind" => "PersonalErasure",
+           "body" => %{"scope" => scope, "targetId" => target_id} = body
+         },
+         record_ref
+       )
+       when scope in ["session", "member", "household"] and is_binary(target_id) do
+    household_id = resolve_erasure_household_id(scope, target_id, body)
+
+    case household_id && Store.get_household(household_id) do
       {:ok, %{threshold: threshold}} when threshold >= 2 ->
-        if Store.approved_cosign?(household_id, "household", household_id, body["coSignRef"]) do
+        if Store.valid_cosign_for_admission?(
+             household_id,
+             scope,
+             target_id,
+             body["coSignRef"],
+             record_ref
+           ) do
           :ok
         else
           {:error, :co_sign_required}
@@ -197,7 +211,22 @@ defmodule Recurse.Gateway.Personal.Policy do
     end
   end
 
-  defp check_household_erasure_cosign(_), do: :ok
+  defp check_household_erasure_cosign(_evidence, _record_ref), do: :ok
+
+  defp resolve_erasure_household_id("household", target_id, _body), do: target_id
+
+  defp resolve_erasure_household_id(_scope, _target_id, %{"householdId" => hh_id})
+       when is_binary(hh_id) and hh_id != "",
+       do: hh_id
+
+  defp resolve_erasure_household_id("session", target_id, _body) do
+    case Regex.run(~r/:(hh_[a-f0-9]{12,64}):/, target_id) do
+      [_, hh_id] -> hh_id
+      _ -> nil
+    end
+  end
+
+  defp resolve_erasure_household_id(_scope, _target_id, _body), do: nil
 
   defp verify_raw_sig("ed25519", pub, message, sig) when byte_size(pub) == 32 do
     :crypto.verify(:eddsa, :none, message, sig, [pub, :ed25519])
