@@ -9,7 +9,9 @@ defmodule Recurse.Shared.LlmProxy.Parsers.AnthropicMessagesTest do
   can be asserted.
   """
 
-  use ExUnit.Case, async: true
+  # `with_log/1` captures process-global Logger output; run synchronously so
+  # concurrent parser tests logging unhandled events cannot race line 174.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
