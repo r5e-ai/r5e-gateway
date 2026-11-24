@@ -157,6 +157,7 @@ defmodule Recurse.Gateway.Personal.E2eeHandler do
         {:error, :not_found} -> Common.not_found(conn)
         {:gone, erasure_ref} -> Common.gone(conn, erasure_ref)
         {:error, :payload_too_large} -> Common.json(conn, 413, %{"error" => "payload_too_large"})
+        {:error, :digest_mismatch} -> Common.json(conn, 422, %{"error" => "digest_mismatch"})
         {:error, reason} -> Common.bad_request(conn, "invalid blob upload: #{inspect(reason)}")
       end
     end)
@@ -167,7 +168,8 @@ defmodule Recurse.Gateway.Personal.E2eeHandler do
          {:ok, scope} <- extract_blob_scope(conn),
          {:ok, cipher_alg} <- extract_cipher_alg(conn),
          {:ok, nonce} <- extract_blob_nonce(conn),
-         {:ok, ciphertext, conn} <- read_blob_bytes(conn) do
+         {:ok, ciphertext, conn} <- read_blob_bytes(conn),
+         :ok <- verify_ciphertext_digest(bytes_ref, ciphertext) do
       {:ok,
        %{
          bytes_ref: bytes_ref,
@@ -181,6 +183,10 @@ defmodule Recurse.Gateway.Personal.E2eeHandler do
 
   defp validate_bytes_ref(bytes_ref) do
     if Ref.valid?(bytes_ref, :bytes), do: :ok, else: {:error, :invalid_bytes_ref}
+  end
+
+  defp verify_ciphertext_digest(bytes_ref, ciphertext) do
+    if Ref.bytes(ciphertext) == bytes_ref, do: :ok, else: {:error, :digest_mismatch}
   end
 
   defp extract_blob_scope(conn) do

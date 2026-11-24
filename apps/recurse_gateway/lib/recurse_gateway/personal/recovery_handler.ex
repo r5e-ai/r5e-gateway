@@ -366,17 +366,21 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   defp decode_optional_x25519(nil), do: {:ok, nil}
   defp decode_optional_x25519(b64), do: decode_len(b64, 32..32)
 
+  @max_cooling_off_seconds 604_800
+
   defp resolve_cooling_off_seconds(body) do
-    default_s =
+    floor_s =
       Application.get_env(
         :recurse_gateway,
         :personal_recovery_cooling_off_seconds,
         @default_cooling_off_seconds
       )
 
+    # Server-configured floor is non-reducible: clients may extend the waiting
+    # window up to 7 days, never shorten it below the server minimum.
     case body["coolingOffSeconds"] do
-      n when is_integer(n) and n >= 0 and n <= @default_cooling_off_seconds -> n
-      _ -> default_s
+      n when is_integer(n) and n > floor_s -> min(n, @max_cooling_off_seconds)
+      _ -> floor_s
     end
   end
 end

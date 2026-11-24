@@ -307,7 +307,7 @@ defmodule Recurse.Gateway.Personal.PersonalEndpointsTest do
 
     scope = "urn:r5e:session:#{hh_a}:abcdef0123456789.chat-1"
     ciphertext = "encrypted-e2ee-chat-bytes"
-    bytes_ref = Ref.bytes("plaintext-for-ref")
+    bytes_ref = Ref.bytes(ciphertext)
     nonce_b64 = Base.encode64(:crypto.strong_rand_bytes(12))
 
     # Store key wrap + blob
@@ -333,6 +333,34 @@ defmodule Recurse.Gateway.Personal.PersonalEndpointsTest do
       )
 
     assert c_w.status == 201
+
+    # Tampered ciphertext whose SHA-256 does not match bytes_ref -> 422 digest_mismatch
+    c_bad_digest =
+      call_router(
+        :put,
+        "/v1/personal/blobs/#{bytes_ref}",
+        %{
+          "scope" => scope,
+          "nonce" => nonce_b64,
+          "ciphertextBase64" => Base.encode64(ciphertext <> "tampered")
+        },
+        role: "owner",
+        sub: "parent-a",
+        hh_id: hh_a
+      )
+
+    assert c_bad_digest.status == 422
+    assert JSON.decode!(c_bad_digest.resp_body)["error"] == "digest_mismatch"
+
+    # Blob was NOT stored after digest mismatch
+    assert call_router(
+             :get,
+             "/v1/personal/blobs/#{bytes_ref}?scope=#{URI.encode_www_form(scope)}",
+             nil,
+             role: "owner",
+             sub: "parent-a",
+             hh_id: hh_a
+           ).status == 404
 
     c_bput =
       call_router(
@@ -502,6 +530,20 @@ defmodule Recurse.Gateway.Personal.PersonalEndpointsTest do
     assert c_unilateral.status == 409
     assert JSON.decode!(c_unilateral.resp_body)["error"] == "co_sign_required"
 
+    # 1b. Single parent CANNOT downgrade threshold from 2 -> 1 via PATCH /v1/personal/settings!
+    c_downgrade =
+      call_router(
+        :patch,
+        "/v1/personal/settings",
+        %{"threshold" => 1},
+        role: "owner",
+        sub: "parent-a",
+        hh_id: hh_id
+      )
+
+    assert c_downgrade.status == 409
+    assert JSON.decode!(c_downgrade.resp_body)["error"] == "co_sign_required"
+
     # 2. Parent A creates erasure proposal
     c_prop =
       call_router(
@@ -655,7 +697,9 @@ defmodule Recurse.Gateway.Personal.PersonalEndpointsTest do
              hh_id: hh_id
            ).status == 200
 
-    # Cooling-off window active -> 409 waiting_window_active
+    # Cooling-off window floor cannot be bypassed by client sending coolingOffSeconds: 0!
+    Application.put_env(:recurse_gateway, :personal_recovery_cooling_off_seconds, 86_400)
+
     c_req_wait =
       call_router(
         :post,
@@ -663,20 +707,27 @@ defmodule Recurse.Gateway.Personal.PersonalEndpointsTest do
         %{
           "newRootPublicKey" => %{"alg" => "ed25519"},
           "newWorkingPublicKey" => %{"alg" => "es256"},
-          "coolingOffSeconds" => 3600
+          "coolingOffSeconds" => 0
         },
         role: "owner",
         sub: "assisted-parent",
         hh_id: hh_id
       )
 
+    assert c_req_wait.status == 202
     %{"requestId" => req_wait} = JSON.decode!(c_req_wait.resp_body)
 
-    assert call_router(:post, "/v1/personal/recovery/requests/#{req_wait}/complete", %{},
-             role: "owner",
-             sub: "assisted-parent",
-             hh_id: hh_id
-           ).status == 409
+    c_wait_fail =
+      call_router(:post, "/v1/personal/recovery/requests/#{req_wait}/complete", %{},
+        role: "owner",
+        sub: "assisted-parent",
+        hh_id: hh_id
+      )
+
+    assert c_wait_fail.status == 409
+    assert JSON.decode!(c_wait_fail.resp_body)["error"] == "waiting_window_active"
+
+    Application.put_env(:recurse_gateway, :personal_recovery_cooling_off_seconds, 0)
 
     # Cancel pending request -> 200, subsequent complete -> 409 request_cancelled
     c_cancel =
@@ -809,6 +860,129 @@ defmodule Recurse.Gateway.Personal.PersonalEndpointsTest do
     assert body_none["envelopeReleased"] == false
     assert body_none["envelopeStatus"] == "absent_deleted"
     assert body_none["recoveryEnvelope"] == nil
+  end
+
+  test "GET /v1/personal/digests strictly isolates SafetyIntervention records per household" do
+    deployment = "personal-digest-#{System.unique_integer([:positive])}"
+    prev_dep = Application.get_env(:recurse_gateway, :evidence_deployment)
+    :persistent_term.erase({Recurse.Gateway.Provenance.Runtime, :info})
+    Application.put_env(:recurse_gateway, :evidence_deployment, deployment)
+
+    on_exit(fn ->
+      if is_nil(prev_dep),
+        do: Application.delete_env(:recurse_gateway, :evidence_deployment),
+        else: Application.put_env(:recurse_gateway, :evidence_deployment, prev_dep)
+    end)
+
+    child_a = "mem_aaaaaaaaaaaa"
+    child_b = "mem_bbbbbbbbbbbb"
+
+    c_a =
+      call_router(
+        :post,
+        "/v1/personal/households",
+        %{
+          "members" => [
+            %{"memberId" => child_a, "role" => "child", "ageBand" => "8-12"}
+          ]
+        },
+        role: "owner",
+        sub: "digest-parent-a"
+      )
+
+    %{"householdId" => hh_a} = JSON.decode!(c_a.resp_body)
+
+    c_b =
+      call_router(
+        :post,
+        "/v1/personal/households",
+        %{
+          "members" => [
+            %{"memberId" => child_b, "role" => "child", "ageBand" => "8-12"}
+          ]
+        },
+        role: "owner",
+        sub: "digest-parent-b"
+      )
+
+    %{"householdId" => hh_b} = JSON.decode!(c_b.resp_body)
+
+    # Append SafetyIntervention records for Household A's child and Household B's child
+    signer = Key.generate("ed25519")
+    stream = "urn:r5e:stream:#{deployment}:personal"
+    sess_a = "urn:r5e:session:#{hh_a}:child_a.s1"
+    sess_b = "urn:r5e:session:#{hh_b}:child_b.s1"
+
+    append_intervention = fn seq, prev, actor, session, category ->
+      ev =
+        Recurse.Provenance.Evidence.new(
+          kind_path: "personal.r5e.io/v1/SafetyIntervention",
+          schema_ref: Ref.bytes("schema:SafetyIntervention"),
+          profile_ref: Ref.bytes("profile:test"),
+          issuer: signer.key_id,
+          actor: actor,
+          session: session,
+          stream: stream,
+          seq: seq,
+          previous: prev,
+          captured_at: DateTime.utc_now(),
+          body: %{"category" => category}
+        )
+
+      {:ok, signed} = Recurse.Provenance.Envelope.sign(ev, signer)
+
+      :ok =
+        Recurse.Providers.Impls.PostgresEvidenceStore.append(Repo, %{
+          ref: signed.ref,
+          stream: stream,
+          seq: seq,
+          kind_path: "personal.r5e.io/v1/SafetyIntervention",
+          envelope: signed.envelope,
+          evidence: ev
+        })
+
+      signed.ref
+    end
+
+    ref1 = append_intervention.(1, nil, "urn:r5e:member:#{hh_a}:#{child_a}", sess_a, "age-gate")
+
+    _ref2 =
+      append_intervention.(2, ref1, "urn:r5e:member:#{hh_b}:#{child_b}", sess_b, "quiet-hours")
+
+    # Household A (no member_id filter) sees ONLY Household A's intervention
+    c_dig_a =
+      call_router(:get, "/v1/personal/digests", nil,
+        role: "owner",
+        sub: "digest-parent-a",
+        hh_id: hh_a
+      )
+
+    assert c_dig_a.status == 200
+    items_a = JSON.decode!(c_dig_a.resp_body)["items"]
+    assert Enum.map(items_a, & &1["sessionScope"]) == [sess_a]
+
+    # Household B (no member_id filter) sees ONLY Household B's intervention
+    c_dig_b =
+      call_router(:get, "/v1/personal/digests", nil,
+        role: "owner",
+        sub: "digest-parent-b",
+        hh_id: hh_b
+      )
+
+    assert c_dig_b.status == 200
+    items_b = JSON.decode!(c_dig_b.resp_body)["items"]
+    assert Enum.map(items_b, & &1["sessionScope"]) == [sess_b]
+
+    # Household B explicitly querying Household A's child member_id gets [] (zero leak!)
+    c_cross_member =
+      call_router(:get, "/v1/personal/digests?member_id=#{child_a}", nil,
+        role: "owner",
+        sub: "digest-parent-b",
+        hh_id: hh_b
+      )
+
+    assert c_cross_member.status == 200
+    assert JSON.decode!(c_cross_member.resp_body)["items"] == []
   end
 
   # ---------------------------------------------------------------------------

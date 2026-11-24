@@ -104,6 +104,7 @@ defmodule Recurse.Gateway.Evidence.ReleaseGateTest do
 
     on_exit(fn ->
       ProviderRegistry.uninstall()
+      :persistent_term.erase({Runtime, :info})
 
       Enum.each(restore, fn
         {k, nil} -> Application.delete_env(:recurse_gateway, k)
@@ -257,17 +258,19 @@ defmodule Recurse.Gateway.Evidence.ReleaseGateTest do
     assert c_withdrawn.status == 403
   end
 
-  test "D4 WorkloadTerms routine-debug carveout permits machine sessions without ReleaseGranted, but not human TermsAccepted sessions",
+  test "D4 WorkloadTerms carveout never bypasses unlinked human sessions, permits bound machine workload sessions, and stops when human TermsAccepted applies",
        %{
          deployment: deployment,
          store: store,
          defs: defs,
-         session: session,
-         record_ref: record_ref,
-         bytes_ref: bytes_ref,
+         record_ref: human_record_ref,
+         bytes_ref: human_bytes_ref,
          gateway: gateway
        } do
+    workload_actor = "urn:r5e:workload:nightly-cron"
+
     append_custody_record(store, deployment, gateway, defs["WorkloadTerms"], "WorkloadTerms", %{
+      "workload" => workload_actor,
       "humanSubjectsPresent" => false,
       "powers" => [
         %{
@@ -278,16 +281,30 @@ defmodule Recurse.Gateway.Evidence.ReleaseGateTest do
       ]
     })
 
-    # Allowed under D4 WorkloadTerms when no human TermsAccepted governs the session
+    # 1. CRITICAL negative test: existence of a WorkloadTerms on the chain MUST NOT
+    #    bypass the release gate for an unlinked human session!
+    c_unlinked_human =
+      conn(:get, "/v1/evidence/records/#{human_record_ref}/content/#{human_bytes_ref}")
+      |> Map.put(:path_params, %{"ref" => human_record_ref, "bytes_ref" => human_bytes_ref})
+      |> bearer("platform_operator", "auditor-1")
+      |> ApiHandler.content()
+
+    assert c_unlinked_human.status == 403
+    assert JSON.decode!(c_unlinked_human.resp_body)["error"] == "release_grant_required"
+
+    # 2. Dedicated machine-only session positively bound to that WorkloadTerms -> 200
+    {:ok, wl_session, wl_record_ref, wl_bytes_ref} =
+      capture_session_for_actor(workload_actor, "machine-workload-debug-payload")
+
     c_wl =
-      conn(:get, "/v1/evidence/records/#{record_ref}/content/#{bytes_ref}")
-      |> Map.put(:path_params, %{"ref" => record_ref, "bytes_ref" => bytes_ref})
+      conn(:get, "/v1/evidence/records/#{wl_record_ref}/content/#{wl_bytes_ref}")
+      |> Map.put(:path_params, %{"ref" => wl_record_ref, "bytes_ref" => wl_bytes_ref})
       |> bearer("platform_operator", "auditor-1")
       |> ApiHandler.content()
 
     assert c_wl.status == 200
 
-    # Once human-subject TermsAccepted is admitted for the session, WorkloadTerms carveout no longer applies!
+    # 3. Once human-subject TermsAccepted governs the session, carveout no longer applies -> 403
     append_custody_record(
       store,
       deployment,
@@ -295,12 +312,12 @@ defmodule Recurse.Gateway.Evidence.ReleaseGateTest do
       defs["TermsAccepted"],
       "TermsAccepted",
       %{"keyCustody" => "customer-kms"},
-      session
+      wl_session
     )
 
     c_human =
-      conn(:get, "/v1/evidence/records/#{record_ref}/content/#{bytes_ref}")
-      |> Map.put(:path_params, %{"ref" => record_ref, "bytes_ref" => bytes_ref})
+      conn(:get, "/v1/evidence/records/#{wl_record_ref}/content/#{wl_bytes_ref}")
+      |> Map.put(:path_params, %{"ref" => wl_record_ref, "bytes_ref" => wl_bytes_ref})
       |> bearer("platform_operator", "auditor-1")
       |> ApiHandler.content()
 
@@ -326,8 +343,13 @@ defmodule Recurse.Gateway.Evidence.ReleaseGateTest do
 
   defp capture_session_with_content(_deployment, _store) do
     actor = "urn:r5e:principal:#{@tenant}:#{@user_sub}"
-    session = "urn:r5e:session:#{@tenant}:#{fingerprint(actor)}.s1"
-    bytes = "secret-session-payload"
+    capture_session_for_actor(actor, "secret-session-payload")
+  end
+
+  defp capture_session_for_actor(actor, bytes) do
+    session =
+      "urn:r5e:session:#{@tenant}:#{fingerprint(actor)}.s#{System.unique_integer([:positive])}"
+
     bytes_ref = Ref.bytes(bytes)
 
     {:ok, receipt} =

@@ -263,6 +263,7 @@ defmodule Recurse.Providers.Personal do
         member_id: m.member_id,
         role: m.role,
         age_band: m.age_band,
+        auth_subject: m.auth_subject,
         teen_confidentiality: m.teen_confidentiality
       }
     )

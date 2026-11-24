@@ -136,19 +136,42 @@ defmodule Recurse.Gateway.Evidence.ReleaseGate do
   end
 
   # D4 WorkloadTerms carveout: applies strictly when a machine workload with
-  # `humanSubjectsPresent == false` grants routine engineer inspection AND no
-  # human-subject `TermsAccepted` governs the session.
+  # `humanSubjectsPresent == false` grants routine engineer inspection, the
+  # session is positively bound to that `WorkloadTerms` (via explicit `termsRef`
+  # or exact session-actor match on `body["workload"]`), AND no human-subject
+  # `TermsAccepted` governs the session or its actors.
   defp workload_debug_carveout?({module, handle} = index, content_scope, prefix) do
     with {:ok, [_ | _] = workload_entries} <- module.by_kind(handle, @workload_terms, prefix),
-         false <- session_has_human_terms?(index, content_scope, prefix) do
-      session_terms_refs = session_referenced_terms(index, content_scope)
-
+         {:ok, [_ | _] = session_entries} <- load_session_entries(index, content_scope),
+         session_terms_refs = extract_session_terms_refs(session_entries),
+         session_actors = extract_session_actors(session_entries),
+         false <-
+           session_has_human_terms?(
+             index,
+             content_scope,
+             session_terms_refs,
+             session_actors,
+             prefix
+           ) do
       Enum.any?(workload_entries, fn %{ref: ref, evidence: %{"body" => body}} ->
         routine_inspect_workload?(body) and
-          (session_terms_refs == [] or ref in session_terms_refs)
+          workload_bound_to_session?(ref, body, session_terms_refs, session_actors)
       end)
     else
       _ -> false
+    end
+  end
+
+  defp workload_bound_to_session?(ref, body, session_terms_refs, session_actors) do
+    cond do
+      ref in session_terms_refs ->
+        true
+
+      session_terms_refs == [] and is_binary(body["workload"]) and body["workload"] != "" ->
+        session_actors != [] and Enum.all?(session_actors, &(&1 == body["workload"]))
+
+      true ->
+        false
     end
   end
 
@@ -163,26 +186,35 @@ defmodule Recurse.Gateway.Evidence.ReleaseGate do
 
   defp routine_inspect_workload?(_body), do: false
 
-  defp session_referenced_terms({module, handle}, content_scope) when is_binary(content_scope) do
-    case module.by_session(handle, content_scope) do
-      {:ok, entries} ->
-        entries
-        |> Enum.map(&get_in(&1.evidence, ["body", "termsRef"]))
-        |> Enum.filter(&is_binary/1)
-        |> Enum.uniq()
-
-      _ ->
-        []
-    end
+  defp load_session_entries({module, handle}, content_scope) when is_binary(content_scope) do
+    module.by_session(handle, content_scope)
   end
 
-  defp session_referenced_terms(_index, _content_scope), do: []
+  defp load_session_entries(_index, _content_scope), do: {:ok, []}
 
-  defp session_has_human_terms?({module, handle} = index, content_scope, prefix) do
-    case session_referenced_terms(index, content_scope) do
-      [_ | _] = refs -> Enum.any?(refs, &terms_accepted_ref?(module, handle, &1))
-      [] -> any_session_terms_accepted?(module, handle, content_scope, prefix)
-    end
+  defp extract_session_terms_refs(entries) do
+    entries
+    |> Enum.map(&get_in(&1.evidence, ["body", "termsRef"]))
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+  end
+
+  defp extract_session_actors(entries) do
+    entries
+    |> Enum.map(& &1.evidence["actor"])
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+  end
+
+  defp session_has_human_terms?(
+         {module, handle},
+         content_scope,
+         session_terms_refs,
+         session_actors,
+         prefix
+       ) do
+    Enum.any?(session_terms_refs, &terms_accepted_ref?(module, handle, &1)) or
+      any_session_or_actor_terms_accepted?(module, handle, content_scope, session_actors, prefix)
   end
 
   defp terms_accepted_ref?(module, handle, ref) do
@@ -192,10 +224,14 @@ defmodule Recurse.Gateway.Evidence.ReleaseGate do
     end
   end
 
-  defp any_session_terms_accepted?(module, handle, content_scope, prefix) do
+  defp any_session_or_actor_terms_accepted?(module, handle, content_scope, session_actors, prefix) do
     case module.by_kind(handle, @terms_accepted, prefix) do
       {:ok, [_ | _] = accepted} ->
-        Enum.any?(accepted, fn %{evidence: ev} -> ev["session"] == content_scope end)
+        Enum.any?(accepted, fn %{evidence: ev} ->
+          ev["session"] == content_scope or
+            ev["actor"] in session_actors or
+            get_in(ev, ["body", "subject"]) in session_actors
+        end)
 
       _ ->
         false

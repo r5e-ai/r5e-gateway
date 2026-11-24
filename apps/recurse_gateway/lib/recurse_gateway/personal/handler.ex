@@ -58,6 +58,7 @@ defmodule Recurse.Gateway.Personal.Handler do
         })
       else
         {:error, :not_found} -> Common.not_found(conn)
+        {:error, :co_sign_required} -> Common.json(conn, 409, %{"error" => "co_sign_required"})
         {:error, msg} when is_binary(msg) -> Common.json(conn, 422, %{"error" => msg})
         {:error, _} -> Common.json(conn, 422, %{"error" => "invalid_settings"})
       end
@@ -352,14 +353,14 @@ defmodule Recurse.Gateway.Personal.Handler do
 
   defp insert_initial_members(_, _), do: {:error, "members must be a list"}
 
-  defp build_settings_updates(body, _household) do
+  defp build_settings_updates(body, household) do
     quiet = Map.get(body, "quietHours")
 
     updates =
       []
       |> maybe_put_setting(:custody_mode, body["custodyMode"], ["client-e2ee", "gateway-managed"])
       |> maybe_put_setting(:recovery_mode, body["recoveryMode"], ["self_only", "r5e_assisted"])
-      |> maybe_put_threshold(body["threshold"])
+      |> maybe_put_threshold(body["threshold"], household.threshold)
       |> maybe_put_quiet(quiet)
 
     case updates do
@@ -375,13 +376,17 @@ defmodule Recurse.Gateway.Personal.Handler do
     if v in allowed, do: Keyword.put(acc, k, v), else: {:error, "invalid_#{k}"}
   end
 
-  defp maybe_put_threshold({:error, _} = err, _), do: err
-  defp maybe_put_threshold(acc, nil), do: acc
+  defp maybe_put_threshold({:error, _} = err, _t, _current), do: err
+  defp maybe_put_threshold(acc, nil, _current), do: acc
 
-  defp maybe_put_threshold(acc, t) when is_integer(t) and t >= 1,
+  defp maybe_put_threshold(_acc, t, current)
+       when is_integer(t) and t >= 1 and is_integer(current) and t < current,
+       do: {:error, :co_sign_required}
+
+  defp maybe_put_threshold(acc, t, _current) when is_integer(t) and t >= 1,
     do: Keyword.put(acc, :threshold, t)
 
-  defp maybe_put_threshold(_acc, _), do: {:error, "invalid_threshold"}
+  defp maybe_put_threshold(_acc, _t, _current), do: {:error, "invalid_threshold"}
 
   defp maybe_put_quiet({:error, _} = err, _), do: err
   defp maybe_put_quiet(acc, nil), do: acc
@@ -481,63 +486,129 @@ defmodule Recurse.Gateway.Personal.Handler do
 
   defp load_digest_items(household, params) do
     members = Store.list_members(household.household_id)
+    member_ids = MapSet.new(members, & &1.member_id)
+
+    member_subjects =
+      members
+      |> Enum.map(&Map.get(&1, :auth_subject))
+      |> Enum.reject(&is_nil/1)
+      |> MapSet.new()
 
     teen_private =
       MapSet.new(
         for m <- members, m.teen_confidentiality == "teen-private-crisis", do: m.member_id
       )
 
-    member_filter = params["member_id"]
+    member_filter = normalize_member_filter(params["member_id"])
 
-    deployment =
-      case Runtime.info() do
-        %{deployment: dep} -> dep
-        _ -> Application.get_env(:recurse_gateway, :evidence_deployment, "default")
-      end
+    if is_binary(member_filter) and not MapSet.member?(member_ids, member_filter) do
+      []
+    else
+      scope = %{
+        household_id: household.household_id,
+        custody_mode: household.custody_mode,
+        member_ids: member_ids,
+        member_subjects: member_subjects,
+        teen_private: teen_private,
+        member_filter: member_filter
+      }
 
-    {module, handle} = Runtime.store(deployment)
-    prefix = "urn:r5e:stream:#{deployment}:"
-
-    case module.by_kind(handle, "personal.r5e.io/v1/SafetyIntervention", prefix) do
-      {:ok, entries} ->
-        entries
-        |> Enum.filter(&digest_visible?(&1, member_filter, teen_private))
-        |> Enum.group_by(& &1.evidence["session"])
-        |> Enum.map(fn {session_scope, group} ->
-          %{
-            "sessionScope" => session_scope,
-            "custodyMode" => household.custody_mode,
-            "interventionCount" => length(group),
-            "categories" =>
-              group |> Enum.map(&get_in(&1.evidence, ["body", "category"])) |> Enum.uniq(),
-            "summaryRefs" =>
-              group
-              |> Enum.map(&get_in(&1.evidence, ["body", "summaryRef"]))
-              |> Enum.reject(&is_nil/1),
-            "erased" =>
-              match?(
-                {:gone, _},
-                Store.scope_tombstone(household.household_id, session_scope || "")
-              )
-          }
-        end)
-
-      _ ->
-        []
+      fetch_and_group_digests(scope)
     end
   rescue
     _ -> []
   end
 
-  defp digest_visible?(%{evidence: ev}, member_filter, teen_private) do
-    actor = ev["actor"] || ""
-    category = get_in(ev, ["body", "category"])
-    matches_member? = is_nil(member_filter) or String.contains?(actor, member_filter)
+  defp normalize_member_filter(id) when is_binary(id) and id != "", do: id
+  defp normalize_member_filter(_), do: nil
 
-    suppressed_crisis? =
-      category == "safety-redirect" and
-        Enum.any?(teen_private, &String.contains?(actor, &1))
+  defp fetch_and_group_digests(scope) do
+    {deployment, {module, handle}} =
+      case Runtime.info() do
+        %{deployment: dep, store: store} ->
+          {dep, store}
 
-    matches_member? and not suppressed_crisis?
+        _ ->
+          dep = Application.get_env(:recurse_gateway, :evidence_deployment, "default")
+          {dep, Runtime.store(dep)}
+      end
+
+    prefix = "urn:r5e:stream:#{deployment}:"
+
+    case module.by_kind(handle, "personal.r5e.io/v1/SafetyIntervention", prefix) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&digest_visible?(&1, scope))
+        |> Enum.group_by(& &1.evidence["session"])
+        |> Enum.map(&render_digest_group(&1, scope))
+
+      _ ->
+        []
+    end
   end
+
+  defp render_digest_group({session_scope, group}, scope) do
+    %{
+      "sessionScope" => session_scope,
+      "custodyMode" => scope.custody_mode,
+      "interventionCount" => length(group),
+      "categories" =>
+        group |> Enum.map(&get_in(&1.evidence, ["body", "category"])) |> Enum.uniq(),
+      "summaryRefs" =>
+        group
+        |> Enum.map(&get_in(&1.evidence, ["body", "summaryRef"]))
+        |> Enum.reject(&is_nil/1),
+      "erased" =>
+        match?(
+          {:gone, _},
+          Store.scope_tombstone(scope.household_id, session_scope || "")
+        )
+    }
+  end
+
+  defp digest_visible?(%{evidence: ev}, scope) do
+    belongs_to_household?(ev, scope) and
+      matches_member_filter?(ev, scope.member_filter) and
+      not suppressed_teen_crisis?(ev, scope.teen_private)
+  end
+
+  defp belongs_to_household?(ev, scope) do
+    body_hh = get_in(ev, ["body", "householdId"])
+
+    if is_binary(body_hh) and body_hh != "" do
+      body_hh == scope.household_id
+    else
+      body_member = get_in(ev, ["body", "memberId"])
+      actor = ev["actor"] || ""
+      session = ev["session"] || ""
+
+      (is_binary(body_member) and MapSet.member?(scope.member_ids, body_member)) or
+        actor_in_household?(actor, scope.member_ids, scope.member_subjects) or
+        String.contains?(session, ":#{scope.household_id}:")
+    end
+  end
+
+  defp matches_member_filter?(_ev, nil), do: true
+
+  defp matches_member_filter?(ev, member_id) do
+    get_in(ev, ["body", "memberId"]) == member_id or
+      urn_matches_id?(ev["actor"] || "", member_id)
+  end
+
+  defp suppressed_teen_crisis?(ev, teen_private) do
+    get_in(ev, ["body", "category"]) == "safety-redirect" and
+      (MapSet.member?(teen_private, get_in(ev, ["body", "memberId"])) or
+         Enum.any?(teen_private, &urn_matches_id?(ev["actor"] || "", &1)))
+  end
+
+  defp actor_in_household?(actor, member_ids, member_subjects) do
+    Enum.any?(member_ids, &urn_matches_id?(actor, &1)) or
+      Enum.any?(member_subjects, &urn_matches_id?(actor, &1))
+  end
+
+  defp urn_matches_id?(actor, id) when is_binary(actor) and is_binary(id) and id != "" do
+    actor == id or String.ends_with?(actor, ":" <> id)
+  end
+
+  defp urn_matches_id?(_, _), do: false
 end
