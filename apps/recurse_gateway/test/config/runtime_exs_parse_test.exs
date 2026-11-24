@@ -110,11 +110,22 @@ defmodule Recurse.Gateway.Config.RuntimeExsParseTest do
     assert source =~ ~s|config :recurse_gateway, upstream_zdr_routes: upstream_zdr_routes|
 
     assert source =~
-             ~s|custody_require_release_grant?: env_bool.("R5E_CUSTODY_REQUIRE_RELEASE_GRANT", false)|
+             ~s|custody_require_release_grant? = env_bool.("R5E_CUSTODY_REQUIRE_RELEASE_GRANT", false)|
 
-    assert source =~ ~s|personal_enabled?: env_bool.("R5E_PERSONAL_ENABLED", false)|
+    assert source =~ ~s|custody_require_release_grant?: custody_require_release_grant?|
+
+    assert source =~ ~s|personal_enabled?: personal_enabled?|
 
     assert source =~
              ~s|evidence_public_chain?: env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN", false)|
+
+    assert source =~
+             ~s|env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT", false)|
+
+    assert source =~
+             ~s|env_int.("R5E_EVIDENCE_PUBLIC_CHAIN_MAX_BYTES", "4194304")|
+
+    assert source =~
+             "R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT=true cannot be enabled alongside"
   end
 end

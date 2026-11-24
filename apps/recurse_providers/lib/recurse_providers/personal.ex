@@ -96,41 +96,55 @@ defmodule Recurse.Providers.Personal do
     end
   end
 
-  @doc "Find the household associated with a tenant_id (single- or multi-household)."
-  @spec find_household_for_tenant(String.t()) :: {:ok, map()} | :not_found
-  def find_household_for_tenant(tenant_id) when is_binary(tenant_id) do
-    case get_household(tenant_id) do
-      {:ok, hh} ->
-        {:ok, hh}
+  @doc """
+  Find households in `tenant_id` where `auth_subject` is an active (non-revoked)
+  member. Returns up to 2 `{household, member}` pairs so callers can detect
+  ambiguous membership rather than silently selecting the newest household.
+  """
+  @spec find_member_households(String.t(), String.t()) :: [{map(), map()}]
+  def find_member_households(tenant_id, auth_subject)
+      when is_binary(tenant_id) and is_binary(auth_subject) do
+    query =
+      from(h in "personal_households",
+        join: m in "personal_members",
+        on: m.household_id == h.household_id,
+        where:
+          h.tenant_id == ^tenant_id and
+            m.auth_subject == ^auth_subject and
+            is_nil(m.revoked_at),
+        limit: 2,
+        select:
+          {%{
+             household_id: h.household_id,
+             tenant_id: h.tenant_id,
+             profile_mode: h.profile_mode,
+             custody_mode: h.custody_mode,
+             recovery_mode: h.recovery_mode,
+             threshold: h.threshold,
+             active_terms_ref: h.active_terms_ref,
+             active_profile_ref: h.active_profile_ref,
+             quiet_hours_tz: h.quiet_hours_tz,
+             quiet_hours_start_min: h.quiet_hours_start_min,
+             quiet_hours_end_min: h.quiet_hours_end_min,
+             settings: h.settings
+           },
+           %{
+             household_id: m.household_id,
+             member_id: m.member_id,
+             role: m.role,
+             age_band: m.age_band,
+             auth_subject: m.auth_subject,
+             root_key_id: m.root_key_id,
+             working_key_id: m.working_key_id,
+             teen_confidentiality: m.teen_confidentiality,
+             recovery_envelope_deleted_at: m.recovery_envelope_deleted_at
+           }}
+      )
 
-      :not_found ->
-        query =
-          from(h in "personal_households",
-            where: h.tenant_id == ^tenant_id,
-            order_by: [desc: h.inserted_at],
-            limit: 1,
-            select: %{
-              household_id: h.household_id,
-              tenant_id: h.tenant_id,
-              profile_mode: h.profile_mode,
-              custody_mode: h.custody_mode,
-              recovery_mode: h.recovery_mode,
-              threshold: h.threshold,
-              active_terms_ref: h.active_terms_ref,
-              active_profile_ref: h.active_profile_ref,
-              quiet_hours_tz: h.quiet_hours_tz,
-              quiet_hours_start_min: h.quiet_hours_start_min,
-              quiet_hours_end_min: h.quiet_hours_end_min,
-              settings: h.settings
-            }
-          )
-
-        case Repo.one(query) do
-          nil -> :not_found
-          row -> {:ok, row}
-        end
-    end
+    Repo.all(query)
   end
+
+  def find_member_households(_, _), do: []
 
   @doc "Update mutable household settings (quiet hours, custody mode, recovery mode, threshold)."
   @spec update_household_settings(household_id(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -212,12 +226,15 @@ defmodule Recurse.Providers.Personal do
     end
   end
 
-  @doc "Find member by `auth_subject` inside a household."
+  @doc "Find active (non-revoked) member by `auth_subject` inside a household."
   @spec find_member_by_subject(household_id(), String.t()) :: {:ok, map()} | :not_found
   def find_member_by_subject(household_id, auth_subject) when is_binary(auth_subject) do
     query =
       from(m in "personal_members",
-        where: m.household_id == ^household_id and m.auth_subject == ^auth_subject,
+        where:
+          m.household_id == ^household_id and
+            m.auth_subject == ^auth_subject and
+            is_nil(m.revoked_at),
         limit: 1,
         select: %{
           household_id: m.household_id,
@@ -235,6 +252,29 @@ defmodule Recurse.Providers.Personal do
     case Repo.one(query) do
       nil -> :not_found
       row -> {:ok, row}
+    end
+  end
+
+  @doc "Rotate a member's active root and working signing key IDs after verified recovery."
+  @spec rotate_member_keys(household_id(), member_id(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, :not_found}
+  def rotate_member_keys(household_id, member_id, new_root_key_id, new_working_key_id)
+      when is_binary(new_root_key_id) and is_binary(new_working_key_id) do
+    case Repo.update_all(
+           from(m in "personal_members",
+             where:
+               m.household_id == ^household_id and
+                 m.member_id == ^member_id and
+                 is_nil(m.revoked_at)
+           ),
+           set: [
+             root_key_id: new_root_key_id,
+             working_key_id: new_working_key_id,
+             updated_at: DateTime.utc_now()
+           ]
+         ) do
+      {1, _} -> get_member(household_id, member_id)
+      {0, _} -> {:error, :not_found}
     end
   end
 
@@ -518,44 +558,185 @@ defmodule Recurse.Providers.Personal do
     end
   end
 
-  @doc "Upsert wrapped per-session DEKs for authorized recipients in `household_id`."
-  @spec put_key_wraps(household_id(), String.t(), [map()]) ::
+  @doc "Check whether `household_id` already holds E2EE wraps or blobs for `scope`."
+  @spec household_owns_scope?(household_id(), String.t()) :: boolean()
+  def household_owns_scope?(household_id, scope)
+      when is_binary(household_id) and is_binary(scope) do
+    has_wrap? =
+      not is_nil(
+        Repo.one(
+          from(w in "personal_e2ee_key_wraps",
+            where: w.household_id == ^household_id and w.scope == ^scope,
+            limit: 1,
+            select: w.scope
+          )
+        )
+      )
+
+    has_blob? =
+      not is_nil(
+        Repo.one(
+          from(b in "personal_e2ee_blobs",
+            where: b.household_id == ^household_id and b.scope == ^scope,
+            limit: 1,
+            select: b.scope
+          )
+        )
+      )
+
+    has_wrap? or has_blob?
+  end
+
+  def household_owns_scope?(_, _), do: false
+
+  @doc "Return all distinct live E2EE scopes (wraps or non-tombstoned blobs) for `household_id`."
+  @spec list_client_e2ee_scopes(household_id()) :: [String.t()]
+  def list_client_e2ee_scopes(household_id) when is_binary(household_id) do
+    wrap_scopes =
+      Repo.all(
+        from(w in "personal_e2ee_key_wraps",
+          where: w.household_id == ^household_id,
+          distinct: true,
+          select: w.scope
+        )
+      )
+
+    blob_scopes =
+      Repo.all(
+        from(b in "personal_e2ee_blobs",
+          where: b.household_id == ^household_id and is_nil(b.deleted_at),
+          distinct: true,
+          select: b.scope
+        )
+      )
+
+    Enum.uniq(wrap_scopes ++ blob_scopes)
+  end
+
+  def list_client_e2ee_scopes(_), do: []
+
+  @doc """
+  Upsert wrapped per-session DEKs for authorized recipients in `household_id`.
+  Prevents one parent from overwriting an existing wrap belonging to a
+  recipient key owned by another member (`{:error, :wrap_overwrite_forbidden}`).
+  """
+  @spec put_key_wraps(household_id(), String.t(), [map()], member_id() | nil) ::
           {:ok, non_neg_integer()} | {:error, atom()} | {:gone, String.t()}
-  def put_key_wraps(household_id, scope, wraps) when is_list(wraps) and wraps != [] do
+  def put_key_wraps(household_id, scope, wraps, caller_member_id \\ nil)
+
+  def put_key_wraps(household_id, scope, wraps, caller_member_id)
+      when is_list(wraps) and wraps != [] do
     case scope_tombstone(household_id, scope) do
       {:gone, erasure_ref} ->
         {:gone, erasure_ref}
 
       :live ->
-        recipient_ids = Enum.map(wraps, & &1.recipient_key_id) |> Enum.uniq()
-
-        existing =
-          from(r in "personal_e2ee_recipient_keys",
-            where:
-              r.household_id == ^household_id and
-                r.recipient_key_id in ^recipient_ids and
-                is_nil(r.revoked_at),
-            select: {r.recipient_key_id, r.recipient_kind}
-          )
-          |> Repo.all()
-          |> Map.new()
-
-        if map_size(existing) != length(recipient_ids) do
-          {:error, :recipient_not_found}
-        else
-          rows = build_key_wrap_rows(household_id, scope, wraps, existing, DateTime.utc_now())
-
-          {count, _} =
-            Repo.insert_all("personal_e2ee_key_wraps", rows,
-              on_conflict: {:replace, [:ephemeral_pub_key, :nonce, :wrapped_dek, :inserted_at]},
-              conflict_target: [:household_id, :scope, :recipient_key_id]
-            )
-
-          {:ok, count}
-        end
+        insert_key_wraps_tx(household_id, scope, wraps, caller_member_id)
     end
   rescue
     error -> {:error, error}
+  end
+
+  defp insert_key_wraps_tx(household_id, scope, wraps, caller_member_id) do
+    recipient_ids = wraps |> Enum.map(& &1.recipient_key_id) |> Enum.uniq()
+
+    {:ok, result} =
+      Repo.transaction(fn ->
+        existing_keys = fetch_active_recipient_keys(household_id, recipient_ids)
+
+        with :ok <- verify_all_recipients_exist(existing_keys, recipient_ids),
+             :ok <-
+               check_foreign_wrap_overwrite(
+                 household_id,
+                 scope,
+                 recipient_ids,
+                 existing_keys,
+                 caller_member_id
+               ) do
+          persist_key_wrap_rows(household_id, scope, wraps, existing_keys, caller_member_id)
+        end
+      end)
+
+    result
+  end
+
+  defp fetch_active_recipient_keys(household_id, recipient_ids) do
+    from(r in "personal_e2ee_recipient_keys",
+      where:
+        r.household_id == ^household_id and
+          r.recipient_key_id in ^recipient_ids and
+          is_nil(r.revoked_at),
+      select: {r.recipient_key_id, %{recipient_kind: r.recipient_kind, member_id: r.member_id}}
+    )
+    |> Repo.all()
+    |> Map.new()
+  end
+
+  defp verify_all_recipients_exist(existing_keys, recipient_ids) do
+    if map_size(existing_keys) == length(recipient_ids),
+      do: :ok,
+      else: {:error, :recipient_not_found}
+  end
+
+  defp check_foreign_wrap_overwrite(_hh_id, _scope, _ids, _existing_keys, nil), do: :ok
+
+  defp check_foreign_wrap_overwrite(household_id, scope, recipient_ids, existing_keys, caller_id) do
+    existing_wrap_ids =
+      from(w in "personal_e2ee_key_wraps",
+        where:
+          w.household_id == ^household_id and
+            w.scope == ^scope and
+            w.recipient_key_id in ^recipient_ids,
+        select: w.recipient_key_id
+      )
+      |> Repo.all()
+
+    foreign_conflict? =
+      Enum.any?(existing_wrap_ids, fn rk_id ->
+        owner = get_in(existing_keys, [rk_id, :member_id])
+        is_binary(owner) and owner != caller_id
+      end)
+
+    if foreign_conflict?, do: {:error, :wrap_overwrite_forbidden}, else: :ok
+  end
+
+  defp persist_key_wrap_rows(household_id, scope, wraps, existing_keys, caller_id) do
+    now = DateTime.utc_now()
+    rows = build_key_wrap_rows(household_id, scope, wraps, existing_keys, now)
+
+    {own_rows, other_rows} =
+      Enum.split_with(rows, fn row ->
+        owner = get_in(existing_keys, [row.recipient_key_id, :member_id])
+        is_nil(caller_id) or is_nil(owner) or owner == caller_id
+      end)
+
+    own_count = insert_own_wrap_rows(own_rows)
+    other_count = insert_other_wrap_rows(other_rows)
+    {:ok, own_count + other_count}
+  end
+
+  defp insert_own_wrap_rows([]), do: 0
+
+  defp insert_own_wrap_rows(rows) do
+    {count, _} =
+      Repo.insert_all("personal_e2ee_key_wraps", rows,
+        on_conflict: {:replace, [:ephemeral_pub_key, :nonce, :wrapped_dek, :inserted_at]},
+        conflict_target: [:household_id, :scope, :recipient_key_id]
+      )
+
+    count
+  end
+
+  defp insert_other_wrap_rows([]), do: 0
+
+  defp insert_other_wrap_rows(rows) do
+    {count, _} =
+      Repo.insert_all("personal_e2ee_key_wraps", rows,
+        on_conflict: :nothing,
+        conflict_target: [:household_id, :scope, :recipient_key_id]
+      )
+
+    count
   end
 
   defp build_key_wrap_rows(household_id, scope, wraps, existing, now) do
@@ -564,7 +745,8 @@ defmodule Recurse.Providers.Personal do
         household_id: household_id,
         scope: scope,
         recipient_key_id: wrap.recipient_key_id,
-        recipient_kind: Map.fetch!(existing, wrap.recipient_key_id),
+        recipient_kind:
+          existing |> Map.fetch!(wrap.recipient_key_id) |> Map.fetch!(:recipient_kind),
         wrap_alg: wrap.wrap_alg,
         ephemeral_pub_key: wrap.ephemeral_pub_key,
         nonce: wrap.nonce,
@@ -574,11 +756,12 @@ defmodule Recurse.Providers.Personal do
     end)
   end
 
-  @doc "List wrapped DEKs for `household_id` (optionally filtered by `scope` and/or `recipient_key_id`)."
+  @doc "List wrapped DEKs for `household_id` (optionally filtered by `scope`, `recipient_key_id`, and/or `member_id`)."
   @spec list_key_wraps(household_id(), keyword()) :: {:ok, [map()]} | {:gone, String.t()}
   def list_key_wraps(household_id, opts \\ []) do
     scope = Keyword.get(opts, :scope)
     recipient_key_id = Keyword.get(opts, :recipient_key_id)
+    member_id = Keyword.get(opts, :member_id)
 
     case if(is_binary(scope), do: scope_tombstone(household_id, scope), else: :live) do
       {:gone, erasure_ref} ->
@@ -600,9 +783,20 @@ defmodule Recurse.Providers.Personal do
           )
           |> maybe_where(:scope, scope)
           |> maybe_where(:recipient_key_id, recipient_key_id)
+          |> maybe_where_member(household_id, member_id)
 
         {:ok, Repo.all(query)}
     end
+  end
+
+  defp maybe_where_member(query, _household_id, nil), do: query
+
+  defp maybe_where_member(query, household_id, member_id) when is_binary(member_id) do
+    from(w in query,
+      join: r in "personal_e2ee_recipient_keys",
+      on: r.household_id == ^household_id and r.recipient_key_id == w.recipient_key_id,
+      where: r.member_id == ^member_id
+    )
   end
 
   @doc "Hard-delete all key wraps for a scope inside `household_id`."
@@ -1198,21 +1392,76 @@ defmodule Recurse.Providers.Personal do
     not is_nil(Repo.one(query))
   end
 
-  @doc "Mark an approved proposal executed after erasure succeeds."
-  @spec mark_proposal_executed(household_id(), String.t(), String.t()) :: :ok
-  def mark_proposal_executed(household_id, co_sign_ref, erasure_ref) do
-    Repo.update_all(
-      from(p in "personal_erasure_proposals",
-        where: p.household_id == ^household_id and p.co_sign_ref == ^co_sign_ref
-      ),
-      set: [
-        state: "executed",
-        executed_erasure_ref: erasure_ref,
-        updated_at: DateTime.utc_now()
-      ]
-    )
+  @doc """
+  Verify that `co_sign_ref` refers to a distinct-parent co-signed proposal for
+  `(household_id, scope, target_id)` during evidence admission. Accepts both
+  unexpired `"approved"` proposals (pre-execution) and `"executed"` proposals
+  whose erasure was already performed under this exact `(co_sign_ref, scope,
+  target_id)` so post-erasure `PersonalErasure` admission never conflicts with
+  `mark_proposal_executed/3`.
+  """
+  @spec valid_cosign_for_admission?(
+          household_id(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          String.t() | nil
+        ) :: boolean()
+  def valid_cosign_for_admission?(_household_id, _scope, _target_id, nil, _record_ref), do: false
 
-    :ok
+  def valid_cosign_for_admission?(household_id, scope, target_id, co_sign_ref, record_ref)
+      when is_binary(co_sign_ref) do
+    case fetch_admission_cosign(household_id, scope, target_id, co_sign_ref, DateTime.utc_now()) do
+      %{state: "approved"} ->
+        true
+
+      %{state: "executed", executed_erasure_ref: exec_ref} ->
+        matching_executed_ref?(exec_ref, record_ref)
+
+      nil ->
+        false
+    end
+  end
+
+  defp fetch_admission_cosign(household_id, scope, target_id, co_sign_ref, now) do
+    from(p in "personal_erasure_proposals",
+      where: p.household_id == ^household_id and p.scope == ^scope and p.target_id == ^target_id,
+      where: p.co_sign_ref == ^co_sign_ref,
+      where:
+        p.approver_member_id != p.proposer_member_id and
+          p.approver_key_id != p.proposer_key_id and
+          p.approver_root_key_id != p.proposer_root_key_id,
+      where: (p.state == "approved" and p.expires_at > ^now) or p.state == "executed",
+      limit: 1,
+      select: %{state: p.state, executed_erasure_ref: p.executed_erasure_ref}
+    )
+    |> Repo.one()
+  end
+
+  defp matching_executed_ref?(exec_ref, record_ref) do
+    is_nil(record_ref) or is_nil(exec_ref) or exec_ref == record_ref
+  end
+
+  @doc "Mark an approved proposal executed after erasure succeeds (strict state-transition guard)."
+  @spec mark_proposal_executed(household_id(), String.t(), String.t()) ::
+          {:ok, :executed} | {:error, :proposal_not_approved}
+  def mark_proposal_executed(household_id, co_sign_ref, erasure_ref) do
+    {count, _} =
+      Repo.update_all(
+        from(p in "personal_erasure_proposals",
+          where:
+            p.household_id == ^household_id and
+              p.co_sign_ref == ^co_sign_ref and
+              p.state == "approved"
+        ),
+        set: [
+          state: "executed",
+          executed_erasure_ref: erasure_ref,
+          updated_at: DateTime.utc_now()
+        ]
+      )
+
+    if count == 1, do: {:ok, :executed}, else: {:error, :proposal_not_approved}
   end
 
   defp maybe_where(query, _field, nil), do: query

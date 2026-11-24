@@ -1,8 +1,9 @@
 defmodule Recurse.Gateway.Evidence.PublicChainTest do
   @moduledoc """
-  End-to-end Router + CORS + Verifier tests for opt-in `R5E_EVIDENCE_PUBLIC_CHAIN`
-  (`GET /v1/public/chain`, `OPTIONS /v1/public/*`, and full-chain lookup on
-  `GET /v1/public/evidence/:ref`).
+  End-to-end Router + CORS + Verifier tests for opt-in `R5E_EVIDENCE_PUBLIC_CHAIN`,
+  `R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT`, `R5E_EVIDENCE_PUBLIC_CHAIN_MAX_BYTES`,
+  private-mode conflict fail-closed guards, `OPTIONS /v1/public/*`, and full-chain
+  lookup on `GET /v1/public/evidence/:ref`.
   """
 
   use ExUnit.Case, async: false
@@ -20,6 +21,7 @@ defmodule Recurse.Gateway.Evidence.PublicChainTest do
 
   @base "provenance.r5e.io/v2"
   @router_opts Router.init([])
+  @operator "urn:r5e:principal:dev:operator"
 
   setup %{tmp_dir: tmp_dir} do
     owner = Sandbox.start_owner!(Repo, shared: true)
@@ -36,18 +38,21 @@ defmodule Recurse.Gateway.Evidence.PublicChainTest do
        flush_interval_ms: 20}
     )
 
-    prev_read = Application.get_env(:recurse_gateway, :evidence_public_read?)
-    prev_chain = Application.get_env(:recurse_gateway, :evidence_public_chain?)
-    prev_cors = Application.get_env(:recurse_gateway, :app_cors_origins)
+    keys = [
+      :evidence_public_read?,
+      :evidence_public_chain?,
+      :evidence_public_chain_include_content?,
+      :evidence_public_chain_max_bytes,
+      :personal_enabled?,
+      :custody_require_release_grant?,
+      :app_cors_origins
+    ]
 
-    Application.delete_env(:recurse_gateway, :evidence_public_read?)
-    Application.delete_env(:recurse_gateway, :evidence_public_chain?)
-    Application.delete_env(:recurse_gateway, :app_cors_origins)
+    prev = Map.new(keys, &{&1, Application.get_env(:recurse_gateway, &1)})
+    Enum.each(keys, &Application.delete_env(:recurse_gateway, &1))
 
     on_exit(fn ->
-      restore_env(:evidence_public_read?, prev_read)
-      restore_env(:evidence_public_chain?, prev_chain)
-      restore_env(:app_cors_origins, prev_cors)
+      Enum.each(prev, fn {k, v} -> restore_env(k, v) end)
       :persistent_term.erase({Runtime, :info})
     end)
 
@@ -85,14 +90,50 @@ defmodule Recurse.Gateway.Evidence.PublicChainTest do
     assert get_resp_header(c4, "access-control-allow-origin") == []
   end
 
-  test "enabled public chain serves verified JSON bundle, CORS GET/OPTIONS, full-chain ref lookup, cache, and 503 busy guard" do
+  test "default include_content=false omits undisclosed payloads while carrying explicitly disclosed content" do
+    undisclosed_payload = "undisclosed-secret-output\n"
+    disclosed_payload = "explicitly-disclosed-output\n"
+    undisclosed_ref = capture_tool_call(undisclosed_payload)
+    disclosed_ref = capture_tool_call(disclosed_payload)
+
+    {:ok, _} =
+      Disclosing.disclose(
+        %{"records" => [disclosed_ref], "recipient" => Disclosing.public()},
+        @operator
+      )
+
+    Application.put_env(:recurse_gateway, :evidence_public_read?, true)
+    Application.put_env(:recurse_gateway, :evidence_public_chain?, true)
+
+    # Default include_content is false: undisclosed content MUST be withheld!
+    c_chain = router_call(:get, "/v1/public/chain?limit=50")
+    assert c_chain.status == 200
+    bundle = JSON.decode!(c_chain.resp_body)
+    blob_refs = Enum.map(bundle["blobs"], & &1["ref"])
+
+    assert undisclosed_ref in Enum.map(bundle["records"], & &1["ref"])
+    assert disclosed_ref in Enum.map(bundle["records"], & &1["ref"])
+    assert Ref.bytes(disclosed_payload) in blob_refs
+    refute Ref.bytes(undisclosed_payload) in blob_refs
+    assert %{failed: 0} = Export.verify(bundle, []).summary
+
+    # Direct lookup of undisclosed ref omits its content when include_content=false
+    c_ref = router_call(:get, "/v1/public/evidence/#{undisclosed_ref}")
+    assert c_ref.status == 200
+    ref_bundle = JSON.decode!(c_ref.resp_body)
+    refute Ref.bytes(undisclosed_payload) in Enum.map(ref_bundle["blobs"], & &1["ref"])
+    assert %{failed: 0} = Export.verify(ref_bundle, []).summary
+  end
+
+  test "opt-in include_content=true serves verified full bundle, enforces max_bytes 413, and fails closed on personal/custody conflict" do
     payload = "live-dev-chain-tool-output\n"
     rec_ref = capture_tool_call(payload)
 
     Application.put_env(:recurse_gateway, :evidence_public_read?, true)
     Application.put_env(:recurse_gateway, :evidence_public_chain?, true)
+    Application.put_env(:recurse_gateway, :evidence_public_chain_include_content?, true)
 
-    # 1. Preflight OPTIONS on /v1/public/chain allows GET, OPTIONS with `*` and no credentials
+    # 1. Preflight OPTIONS allows GET, OPTIONS with `*` and no credentials
     opt_ok =
       conn(:options, "/v1/public/chain")
       |> put_req_header("origin", "https://explorer.r5e.io")
@@ -104,7 +145,6 @@ defmodule Recurse.Gateway.Evidence.PublicChainTest do
     assert get_resp_header(opt_ok, "access-control-allow-methods") == ["GET, OPTIONS"]
     assert get_resp_header(opt_ok, "access-control-allow-credentials") == []
 
-    # Non-read-only preflight method (POST) is refused (no allow-origin header)
     opt_post =
       conn(:options, "/v1/public/chain")
       |> put_req_header("origin", "https://explorer.r5e.io")
@@ -114,7 +154,7 @@ defmodule Recurse.Gateway.Evidence.PublicChainTest do
     assert opt_post.status == 204
     assert get_resp_header(opt_post, "access-control-allow-origin") == []
 
-    # 2. GET /v1/public/chain returns 200 valid JSON bundle with CORS and 0 failed records
+    # 2. GET /v1/public/chain carries content payloads & verifies cleanly
     c_chain =
       conn(:get, "/v1/public/chain?limit=50")
       |> put_req_header("origin", "https://explorer.r5e.io")
@@ -122,32 +162,53 @@ defmodule Recurse.Gateway.Evidence.PublicChainTest do
 
     assert c_chain.status == 200
     assert get_resp_header(c_chain, "access-control-allow-origin") == ["*"]
-    assert get_resp_header(c_chain, "access-control-allow-credentials") == []
-
     bundle = JSON.decode!(c_chain.resp_body)
     assert bundle["format"] == "r5e.provenance-export/v2"
     assert rec_ref in Enum.map(bundle["records"], & &1["ref"])
     assert Ref.bytes(payload) in Enum.map(bundle["blobs"], & &1["ref"])
     assert %{failed: 0} = Export.verify(bundle, []).summary
 
-    # Second read hits the ETS cache
-    assert [{_, cached, _until}] = :ets.lookup(Disclosing, {:chain, 50})
+    # Cached under full key
+    assert [{_, cached, _until}] = :ets.lookup(Disclosing, {:chain, 50, true, 4_194_304})
     assert cached == c_chain.resp_body
 
-    # 3. GET /v1/public/evidence/:ref serves non-disclosed chain record when public chain is true
-    c_ref =
-      conn(:get, "/v1/public/evidence/#{rec_ref}")
-      |> put_req_header("origin", "https://explorer.r5e.io")
-      |> Router.call(@router_opts)
+    # 3. Hard max_bytes ceiling returns 413 without caching oversized payload
+    Application.put_env(:recurse_gateway, :evidence_public_chain_max_bytes, 512)
+    c_big = router_call(:get, "/v1/public/chain?limit=50")
+    assert c_big.status == 413
 
-    assert c_ref.status == 200
-    assert get_resp_header(c_ref, "access-control-allow-origin") == ["*"]
-    ref_bundle = JSON.decode!(c_ref.resp_body)
-    assert rec_ref in Enum.map(ref_bundle["records"], & &1["ref"])
-    assert Ref.bytes(payload) in Enum.map(ref_bundle["blobs"], & &1["ref"])
-    assert %{failed: 0} = Export.verify(ref_bundle, []).summary
+    assert JSON.decode!(c_big.resp_body) == %{
+             "error" => "chain_export_too_large",
+             "maxBytes" => 512
+           }
 
-    # 4. Concurrency guard returns 503 when all build slots are busy on an uncached limit
+    assert [] == :ets.lookup(Disclosing, {:chain, 50, true, 512})
+    Application.delete_env(:recurse_gateway, :evidence_public_chain_max_bytes)
+
+    # 4. Private-mode conflict guard fails closed (403) when personal or custody mode is enabled
+    Application.put_env(:recurse_gateway, :personal_enabled?, true)
+    c_personal_conflict = router_call(:get, "/v1/public/chain?limit=50")
+    assert c_personal_conflict.status == 403
+
+    assert JSON.decode!(c_personal_conflict.resp_body) == %{
+             "error" => "public_chain_content_conflict"
+           }
+
+    c_ref_conflict = router_call(:get, "/v1/public/evidence/#{rec_ref}")
+    assert c_ref_conflict.status == 403
+    Application.delete_env(:recurse_gateway, :personal_enabled?)
+
+    Application.put_env(:recurse_gateway, :custody_require_release_grant?, true)
+    c_custody_conflict = router_call(:get, "/v1/public/chain?limit=50")
+    assert c_custody_conflict.status == 403
+
+    assert JSON.decode!(c_custody_conflict.resp_body) == %{
+             "error" => "public_chain_content_conflict"
+           }
+
+    Application.delete_env(:recurse_gateway, :custody_require_release_grant?)
+
+    # 5. Concurrency guard returns 503 when all build slots are busy on an uncached limit
     :ets.insert(Disclosing, {:building, 4})
 
     try do

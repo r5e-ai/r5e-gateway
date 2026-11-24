@@ -422,25 +422,35 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   def content(%Plug.Conn{path_params: %{"ref" => ref, "bytes_ref" => bytes_ref}} = conn) do
     endpoint = "/v1/evidence/records/content"
 
-    gated_or_own(conn, @read, endpoint, fn conn, _ctx, index, scope ->
+    gated_or_own(conn, @read, endpoint, fn conn, ctx, index, scope ->
       case content_allowed(conn, true, endpoint, scope) do
-        :ok -> held(conn, index, ref, bytes_ref, scope)
+        :ok -> held(conn, ctx, index, ref, bytes_ref, scope)
         {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
       end
     end)
   end
 
-  defp held(conn, index, ref, bytes_ref, scope) do
+  defp held(conn, ctx, index, ref, bytes_ref, scope) do
+    release_opts = [
+      record_ref: ref,
+      caller: caller(ctx).principal,
+      caller_subject: caller_subject(ctx),
+      purpose: request_purpose(conn)
+    ]
+
     with true <- Ref.valid?(ref, :evidence) and Ref.valid?(bytes_ref, :bytes),
          {:ok, entry} <- fetch_record(index, ref, scope),
          true <- bytes_ref in Exporter.content_refs([entry]),
          content_scope = Evidence.content_scope(entry.evidence),
-         :ok <- ReleaseGate.authorize(index, content_scope, scope, record_ref: ref),
+         :ok <- ReleaseGate.authorize(index, content_scope, scope, release_opts),
          {:ok, bytes} <- readable(index, bytes_ref, content_scope) do
       download(conn, bytes_ref, bytes)
     else
       {:error, :release_grant_required} ->
         json(conn, 403, %{"error" => "release_grant_required"})
+
+      {:error, :store_unavailable} ->
+        json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
 
       {:error, :key_service_unavailable} ->
         json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
@@ -506,13 +516,16 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       with :ok <- content_allowed(conn, content?, "/v1/evidence/export", scope),
            {:ok, session} <- named(ctx, id, index, scope),
            :ok <- session_exportable?(index, session, scope),
-           :ok <- export_release_allowed(index, session, content?, scope),
+           :ok <- export_release_allowed(conn, ctx, index, session, content?, scope, body),
            {:ok, %{"records" => [_ | _]} = bundle} <-
              Exporter.session(index, session, content: content?) do
         json(conn, 200, carry_for_scope(bundle, scope))
       else
         {:error, :release_grant_required} ->
           json(conn, 403, %{"error" => "release_grant_required"})
+
+        {:error, :store_unavailable} ->
+          json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
 
         {:forbidden, error} ->
           Authz.dispatch_gate_error(conn, error)
@@ -777,30 +790,40 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   """
   @spec disclose(Plug.Conn.t()) :: Plug.Conn.t()
   def disclose(%Plug.Conn{body_params: request} = conn) do
-    gated(conn, @disclose, "/v1/evidence/disclosures", fn conn, ctx, _index ->
+    gated(conn, @disclose, "/v1/evidence/disclosures", fn conn, ctx, index ->
       with true <- Runtime.running?() || :not_running,
-           :ok <- content_allowed(conn, true, "/v1/evidence/export") do
+           :ok <- content_allowed(conn, true, "/v1/evidence/export"),
+           :ok <- disclosure_release_allowed(conn, ctx, index, request) do
         # Whoever asked is on the record, person or service.
-        case Disclosing.disclose(request, caller(ctx).principal) do
-          {:ok, body} ->
-            json(conn, 201, body)
-
-          {:error, reason} when reason in [:stream_fork_refused, :gateway_may_not_record_this] ->
-            json(conn, 409, %{"error" => Atom.to_string(reason)})
-
-          # Nothing was recorded; the same request can be sent again.
-          {:error, :key_service_unavailable} ->
-            json(conn, 503, %{"error" => "key_service_unavailable"})
-
-          {:error, reason} ->
-            json(conn, 422, %{"error" => Atom.to_string(reason)})
-        end
+        send_disclose_result(conn, Disclosing.disclose(request, caller(ctx).principal))
       else
-        :not_running -> not_found(conn)
-        {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
+        :not_running ->
+          not_found(conn)
+
+        {:error, :release_grant_required} ->
+          json(conn, 403, %{"error" => "release_grant_required"})
+
+        {:error, :store_unavailable} ->
+          json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
+
+        {:forbidden, error} ->
+          Authz.dispatch_gate_error(conn, error)
       end
     end)
   end
+
+  defp send_disclose_result(conn, {:ok, body}), do: json(conn, 201, body)
+
+  defp send_disclose_result(conn, {:error, reason})
+       when reason in [:stream_fork_refused, :gateway_may_not_record_this],
+       do: json(conn, 409, %{"error" => Atom.to_string(reason)})
+
+  # Nothing was recorded; the same request can be sent again.
+  defp send_disclose_result(conn, {:error, :key_service_unavailable}),
+    do: json(conn, 503, %{"error" => "key_service_unavailable"})
+
+  defp send_disclose_result(conn, {:error, reason}),
+    do: json(conn, 422, %{"error" => Atom.to_string(reason)})
 
   @doc """
   `GET /v1/public/chain`: bounded export bundle of the deployment's chain,
@@ -827,6 +850,15 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     else
       {:error, :invalid_limit} ->
         bad_request(conn, "limit must be a positive integer (max 500)")
+
+      {:error, :payload_too_large} ->
+        json(conn, 413, %{
+          "error" => "chain_export_too_large",
+          "maxBytes" => Disclosing.public_chain_max_bytes()
+        })
+
+      {:error, :public_chain_conflict} ->
+        json(conn, 403, %{"error" => "public_chain_content_conflict"})
 
       {:error, :busy} ->
         conn
@@ -863,6 +895,9 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.put_resp_header("cache-control", "public, max-age=300")
         |> Plug.Conn.send_resp(200, text)
+
+      {:error, :public_chain_conflict} ->
+        json(conn, 403, %{"error" => "public_chain_content_conflict"})
 
       {:error, :busy} ->
         conn
@@ -1120,10 +1155,98 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     end
   end
 
-  defp export_release_allowed(_index, _session, false, _scope), do: :ok
+  defp export_release_allowed(_conn, _ctx, _index, _session, false, _scope, _body), do: :ok
 
-  defp export_release_allowed(index, session, true, scope),
-    do: ReleaseGate.authorize(index, session, scope)
+  defp export_release_allowed(conn, ctx, index, session, true, scope, body) do
+    ReleaseGate.authorize(index, session, scope,
+      caller: caller(ctx).principal,
+      caller_subject: caller_subject(ctx),
+      purpose: request_purpose(conn, body)
+    )
+  end
+
+  defp disclosure_release_allowed(conn, ctx, index, request) do
+    if ReleaseGate.enabled?() do
+      authorize_disclosure_targets(conn, ctx, index, request)
+    else
+      :ok
+    end
+  end
+
+  defp authorize_disclosure_targets(
+         conn,
+         ctx,
+         {module, handle} = index,
+         %{"records" => [_ | _] = refs, "recipient" => recipient} = req
+       )
+       when is_binary(recipient) and recipient != "" do
+    base_opts = [
+      caller: caller(ctx).principal,
+      caller_subject: caller_subject(ctx),
+      disclosure_recipient: recipient,
+      purpose: request_purpose(conn, req)
+    ]
+
+    Enum.reduce_while(refs, :ok, fn ref, :ok ->
+      case authorize_disclosure_ref(index, module, handle, ref, base_opts) do
+        :ok -> {:cont, :ok}
+        err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp authorize_disclosure_targets(_conn, _ctx, _index, _req),
+    do: {:error, :release_grant_required}
+
+  defp authorize_disclosure_ref(index, module, handle, ref, base_opts) when is_binary(ref) do
+    case module.fetch(handle, ref) do
+      {:ok, entry} ->
+        content_scope = Evidence.content_scope(entry.evidence)
+
+        ReleaseGate.authorize(
+          index,
+          content_scope,
+          :all,
+          Keyword.put(base_opts, :record_ref, ref)
+        )
+
+      :error ->
+        {:error, :release_grant_required}
+
+      _ ->
+        {:error, :store_unavailable}
+    end
+  end
+
+  defp authorize_disclosure_ref(_index, _module, _handle, _ref, _base_opts),
+    do: {:error, :release_grant_required}
+
+  defp caller_subject(%IdentityContext{principal: principal}) when is_map(principal) do
+    Map.get(principal, :subject) || Map.get(principal, :spiffe_id) ||
+      Map.get(principal, :account_id)
+  end
+
+  defp caller_subject(_), do: nil
+
+  defp request_purpose(conn, body \\ nil) do
+    header_purpose(conn) || body_purpose(body) || query_purpose(conn)
+  end
+
+  defp header_purpose(conn) do
+    case Plug.Conn.get_req_header(conn, "x-r5e-purpose") do
+      [value | _] when is_binary(value) and value != "" -> String.trim(value)
+      _ -> nil
+    end
+  end
+
+  defp body_purpose(%{"purpose" => value}) when is_binary(value), do: value
+  defp body_purpose(_), do: nil
+
+  defp query_purpose(%Plug.Conn{query_params: %{"purpose" => value}})
+       when is_binary(value) and value != "",
+       do: value
+
+  defp query_purpose(_), do: nil
 
   # The deployment's store, when the caller belongs to the deployment's tenant.
   defp index_for(%IdentityContext{tenant_id: tenant}) do

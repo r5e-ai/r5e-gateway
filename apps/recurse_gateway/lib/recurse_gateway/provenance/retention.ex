@@ -502,6 +502,64 @@ defmodule Recurse.Gateway.Provenance.Retention do
   def dispose(_request, _on_behalf_of), do: {:error, :malformed_request}
 
   @doc """
+  Record a durable `PayloadDisposition` on the retention stream BEFORE client-side
+  E2EE key wraps and mutable ciphertext blobs are erased. Enforces active holds
+  (`{:under_hold, ref}`), pending auto-holds, and retention profiles without
+  requiring a gateway-managed server content key.
+  """
+  @spec record_client_erasure_disposition(
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          map(),
+          [String.t()]
+        ) :: {:ok, map()} | {:error, error()}
+  def record_client_erasure_disposition(
+        scope,
+        reason,
+        on_behalf_of,
+        details \\ %{},
+        extra_hold_scopes \\ []
+      )
+      when is_binary(scope) and scope != "" and is_binary(reason) and reason != "" and
+             is_map(details) and is_list(extra_hold_scopes) do
+    if Runtime.running?() do
+      %{store: {module, handle}} = info = Runtime.info()
+      :ok = Pipeline.flush(Runtime.pipeline())
+      at = DateTime.utc_now()
+      all_scopes = Enum.uniq([scope | Enum.filter(extra_hold_scopes, &is_binary/1)])
+
+      body = %{
+        "scope" => scope,
+        "reason" => reason,
+        "action" => "deleted",
+        "details" => details
+      }
+
+      with :ok <- may_record(info, @disposal),
+           :ok <- check_client_erasure_scopes(info, module, handle, all_scopes, at),
+           {:ok, receipt} <- record(info, @disposal, body, on_behalf_of, at) do
+        seal()
+        {:ok, %{"disposal" => receipt.ref, "seq" => receipt.seq, "outcome" => "disposed"}}
+      end
+    else
+      {:error, :evidence_runtime_unavailable}
+    end
+  end
+
+  defp check_client_erasure_scopes(info, module, handle, scopes, at) do
+    Enum.reduce_while(scopes, :ok, fn check_scope, :ok ->
+      with {:ok, _ended} <- holds_over(info, check_scope, at),
+           :ok <- no_pending_auto_holds(info, check_scope),
+           :ok <- module.disposal_allowed(handle, check_scope, at) do
+        {:cont, :ok}
+      else
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  @doc """
   Dispose of everything recorded in every session of one person.
   `request` has `owner` (the person's identity, as records name them)
   and `reason`, and may have `action` and `details`. `tenant` is the

@@ -1,12 +1,13 @@
 defmodule Recurse.Gateway.Personal.Common do
   @moduledoc """
   Shared helpers for `/v1/personal/*` HTTP handlers: opt-in feature gate
-  (`R5E_PERSONAL_ENABLED`), Cedar authz, strict household resolution bound to
-  the authenticated principal, and JSON response formatting.
+  (`R5E_PERSONAL_ENABLED`), Cedar authz, strict household and parent-role
+  resolution bound to the authenticated principal, and JSON response formatting.
   """
 
   alias Recurse.Gateway.AuditPlane.Authz
   alias Recurse.Gateway.Personal.Policy
+  alias Recurse.Gateway.Provenance.SessionName
   alias Recurse.Providers.Personal, as: Store
   alias Recurse.Shared.IdentityContext
 
@@ -49,43 +50,70 @@ defmodule Recurse.Gateway.Personal.Common do
   end
 
   @doc """
-  Resolve the caller's household and member record strictly from the verified
-  JWT `ctx` (plus optional `x-r5e-household-id` header verified against the
-  caller's tenant and membership). Never returns another household's record.
+  Resolve the caller's household and active member record strictly from the
+  verified JWT `ctx` (plus `x-r5e-household-id` header when the caller belongs
+  to multiple households).
+
+  Never defaults to an arbitrary or newest household on the node:
+    * Explicit `x-r5e-household-id` MUST exist in `ctx.tenant_id` and contain
+      an active (non-revoked) member matching `auth_subject == subject_id(ctx)`.
+    * Omitted `x-r5e-household-id` succeeds ONLY when `subject_id(ctx)` is an
+      active member of exactly one household in `ctx.tenant_id`; returns
+      `{:error, :ambiguous_household}` when multiple match and
+      `{:error, :not_found}` when none match.
   """
   @spec resolve_household_member(Plug.Conn.t(), IdentityContext.t()) ::
-          {:ok, map(), map()} | {:error, :not_found}
-  def resolve_household_member(conn, %IdentityContext{tenant_id: tenant_id} = ctx) do
+          {:ok, map(), map()} | {:error, :not_found | :ambiguous_household}
+  def resolve_household_member(conn, %IdentityContext{tenant_id: tenant_id} = ctx)
+      when is_binary(tenant_id) and tenant_id != "" do
     subject = subject_id(ctx)
     requested_hh = header(conn, "x-r5e-household-id")
 
-    with {:ok, household} <- lookup_household(tenant_id, requested_hh),
+    if is_binary(subject) and subject != "" do
+      resolve_for_subject(tenant_id, subject, requested_hh)
+    else
+      {:error, :not_found}
+    end
+  end
+
+  def resolve_household_member(_conn, _ctx), do: {:error, :not_found}
+
+  @doc """
+  Resolve the caller's household and verify the caller holds a parent/owner
+  role (`member.role in ["owner", "parent"]`), blocking `child` principals
+  from mutating household settings, pairings, E2EE wraps/blobs, recovery, or
+  erasures with `{:error, :parent_role_required}`.
+  """
+  @spec resolve_parent_member(Plug.Conn.t(), IdentityContext.t()) ::
+          {:ok, map(), map()}
+          | {:error, :not_found | :ambiguous_household | :parent_role_required}
+  def resolve_parent_member(conn, ctx) do
+    with {:ok, household, member} <- resolve_household_member(conn, ctx) do
+      if member.role in ["owner", "parent"] do
+        {:ok, household, member}
+      else
+        {:error, :parent_role_required}
+      end
+    end
+  end
+
+  defp resolve_for_subject(tenant_id, subject, hh_id) when is_binary(hh_id) and hh_id != "" do
+    with {:ok, household} <- Store.get_household(hh_id),
          true <- household.tenant_id == tenant_id,
-         {:ok, member} <- lookup_member(household.household_id, subject) do
+         {:ok, member} <- Store.find_member_by_subject(household.household_id, subject) do
       {:ok, household, member}
     else
       _ -> {:error, :not_found}
     end
   end
 
-  defp lookup_household(_tenant_id, hh_id) when is_binary(hh_id) and hh_id != "" do
-    Store.get_household(hh_id)
-  end
-
-  defp lookup_household(tenant_id, _nil) when is_binary(tenant_id) do
-    Store.find_household_for_tenant(tenant_id)
-  end
-
-  defp lookup_household(_, _), do: :not_found
-
-  defp lookup_member(household_id, subject) when is_binary(subject) and subject != "" do
-    case Store.find_member_by_subject(household_id, subject) do
-      {:ok, member} -> {:ok, member}
-      :not_found -> Store.get_member(household_id, subject)
+  defp resolve_for_subject(tenant_id, subject, _nil) do
+    case Store.find_member_households(tenant_id, subject) do
+      [{household, member}] -> {:ok, household, member}
+      [_, _ | _] -> {:error, :ambiguous_household}
+      [] -> {:error, :not_found}
     end
   end
-
-  defp lookup_member(_, _), do: :not_found
 
   @doc "Extract the verified subject identifier from `%IdentityContext{}`."
   @spec subject_id(IdentityContext.t()) :: String.t() | nil
@@ -95,6 +123,30 @@ defmodule Recurse.Gateway.Personal.Common do
   end
 
   def subject_id(_), do: nil
+
+  @doc "Canonical actor URN for evidence records captured on behalf of a caller."
+  @spec actor_urn(IdentityContext.t(), map() | nil) :: String.t()
+  def actor_urn(%IdentityContext{tenant_id: tenant} = ctx, member \\ nil) do
+    encoded = SessionName.encode(tenant || "default")
+    sub = subject_id(ctx) || (member && member.member_id) || "unknown"
+
+    if String.contains?(sub, ":"),
+      do: sub,
+      else: "urn:r5e:principal:#{encoded}:" <> URI.encode(sub, &URI.char_unreserved?/1)
+  end
+
+  @doc "Send standard HTTP error responses for household/role/runtime errors."
+  @spec send_common_error(Plug.Conn.t(), atom()) :: Plug.Conn.t()
+  def send_common_error(conn, :not_found), do: not_found(conn)
+
+  def send_common_error(conn, :ambiguous_household),
+    do: json(conn, 400, %{"error" => "household_id_required"})
+
+  def send_common_error(conn, :parent_role_required),
+    do: json(conn, 403, %{"error" => "parent_role_required"})
+
+  def send_common_error(conn, :evidence_runtime_unavailable),
+    do: json(conn, 503, %{"error" => "evidence_runtime_unavailable"})
 
   @doc "Read a single request header value (lowercased key)."
   @spec header(Plug.Conn.t(), String.t()) :: String.t() | nil

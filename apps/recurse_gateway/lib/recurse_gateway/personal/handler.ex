@@ -5,9 +5,9 @@ defmodule Recurse.Gateway.Personal.Handler do
   and child device revocation (`/v1/personal/devices/:device_key_id/revoke`).
   """
 
-  alias Recurse.Gateway.Personal.{Common, Policy}
+  alias Recurse.Gateway.Personal.{Common, Ledger, Policy}
   alias Recurse.Gateway.Provenance.Runtime
-  alias Recurse.Provenance.{Envelope, Ref}
+  alias Recurse.Provenance.Envelope
   alias Recurse.Providers.Personal, as: Store
 
   @manage_household ~s(Recurse::Action::"ManageHousehold")
@@ -15,6 +15,12 @@ defmodule Recurse.Gateway.Personal.Handler do
   @pair_child ~s(Recurse::Action::"PairChildDevice")
 
   @pairing_ttl_seconds 300
+  @common_errors [
+    :not_found,
+    :ambiguous_household,
+    :parent_role_required,
+    :evidence_runtime_unavailable
+  ]
 
   @doc "`POST /v1/personal/households`"
   @spec create_household(Plug.Conn.t()) :: Plug.Conn.t()
@@ -45,7 +51,7 @@ defmodule Recurse.Gateway.Personal.Handler do
   @spec update_settings(Plug.Conn.t()) :: Plug.Conn.t()
   def update_settings(%Plug.Conn{body_params: body} = conn) when is_map(body) do
     Common.gate(conn, @manage_household, "/v1/personal/settings", fn conn, ctx ->
-      with {:ok, household, _member} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, _member} <- Common.resolve_parent_member(conn, ctx),
            {:ok, updates} <- build_settings_updates(body, household),
            {:ok, updated} <- Store.update_household_settings(household.household_id, updates),
            :ok <- update_teen_modes(household.household_id, body["memberTeenConfidentiality"]) do
@@ -57,7 +63,7 @@ defmodule Recurse.Gateway.Personal.Handler do
           "quietHours" => render_quiet_hours(updated)
         })
       else
-        {:error, :not_found} -> Common.not_found(conn)
+        {:error, reason} when reason in @common_errors -> Common.send_common_error(conn, reason)
         {:error, :co_sign_required} -> Common.json(conn, 409, %{"error" => "co_sign_required"})
         {:error, msg} when is_binary(msg) -> Common.json(conn, 422, %{"error" => msg})
         {:error, _} -> Common.json(conn, 422, %{"error" => "invalid_settings"})
@@ -73,13 +79,13 @@ defmodule Recurse.Gateway.Personal.Handler do
     conn = Plug.Conn.fetch_query_params(conn)
 
     Common.gate(conn, @read_household, "/v1/personal/digests", fn conn, ctx ->
-      case Common.resolve_household_member(conn, ctx) do
+      case Common.resolve_parent_member(conn, ctx) do
         {:ok, household, _member} ->
           items = load_digest_items(household, conn.query_params)
           Common.json(conn, 200, %{"items" => items, "nextCursor" => nil})
 
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
       end
     end)
   end
@@ -89,7 +95,7 @@ defmodule Recurse.Gateway.Personal.Handler do
   def create_pairing(%Plug.Conn{body_params: %{"childMemberId" => child_id} = body} = conn)
       when is_binary(child_id) do
     Common.gate(conn, @pair_child, "/v1/personal/pairings", fn conn, ctx ->
-      with {:ok, household, parent} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, parent} <- Common.resolve_parent_member(conn, ctx),
            {:ok, %{role: "child"}} <- Store.get_member(household.household_id, child_id),
            challenge_id = Common.random_id("pair_", 12),
            pairing_code = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false),
@@ -114,7 +120,7 @@ defmodule Recurse.Gateway.Personal.Handler do
           "badgeKinds" => Policy.child_badge_kinds()
         })
       else
-        {:error, :not_found} -> Common.not_found(conn)
+        {:error, reason} when reason in @common_errors -> Common.send_common_error(conn, reason)
         :not_found -> Common.not_found(conn)
         {:ok, %{role: _other}} -> Common.json(conn, 422, %{"error" => "member_not_a_child"})
         {:error, _} -> Common.json(conn, 422, %{"error" => "pairing_create_failed"})
@@ -195,10 +201,14 @@ defmodule Recurse.Gateway.Personal.Handler do
       )
       when is_map(body) do
     Common.gate(conn, @pair_child, "/v1/personal/pairings/finalize", fn conn, ctx ->
-      with {:ok, household, _parent} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, parent} <- Common.resolve_parent_member(conn, ctx),
+           :ok <- require_runtime_running(),
            {:ok, challenge} <- fetch_household_challenge(household.household_id, challenge_id),
-           {:ok, badge_kinds, badge_ref} <- extract_and_validate_child_badge(body),
-           {:ok, paired_ref} <- extract_paired_record_ref(body, challenge.device_key_id),
+           :ok <- require_challenge_claimed(challenge),
+           {:ok, badge_kinds, badge_ref} <-
+             extract_and_admit_child_badge(body, household, challenge, parent, ctx),
+           {:ok, paired_ref} <-
+             extract_and_admit_paired_record(body, household, challenge, badge_ref, parent, ctx),
            {:ok, device} <-
              Store.finalize_pairing(household.household_id, challenge_id, %{
                device_key_id: challenge.device_key_id,
@@ -215,8 +225,8 @@ defmodule Recurse.Gateway.Personal.Handler do
           "badgeKinds" => device.badge_kinds
         })
       else
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
 
         {:error, :invalid_child_badge_kinds} ->
           Common.json(conn, 422, %{
@@ -239,19 +249,25 @@ defmodule Recurse.Gateway.Personal.Handler do
   @spec revoke_device(Plug.Conn.t()) :: Plug.Conn.t()
   def revoke_device(%Plug.Conn{path_params: %{"device_key_id" => device_key_id}} = conn) do
     Common.gate(conn, @pair_child, "/v1/personal/devices/revoke", fn conn, ctx ->
-      with {:ok, household, _parent} <- Common.resolve_household_member(conn, ctx),
-           revocation_ref =
-             Map.get(conn.body_params || %{}, "revocationRef") ||
-               Ref.evidence(:crypto.strong_rand_bytes(32)),
+      with {:ok, household, parent} <- Common.resolve_parent_member(conn, ctx),
+           :ok <- require_runtime_running(),
+           {:ok, existing} <- fetch_household_child_device(household.household_id, device_key_id),
+           {:ok, revocation_ref} <-
+             resolve_revocation_ref(conn.body_params || %{}, household, existing, parent, ctx),
            {:ok, device} <-
              Store.revoke_child_device(household.household_id, device_key_id, revocation_ref) do
         Common.json(conn, 200, %{
           "deviceKeyId" => device.device_key_id,
           "revocationRef" => device.revocation_ref,
-          "tokensRevoked" => true
+          "deviceKeyRevoked" => true,
+          "tokensRevoked" => false
         })
       else
-        {:error, :not_found} -> Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
+
+        {:error, reason} when is_atom(reason) ->
+          Common.json(conn, 422, %{"error" => Atom.to_string(reason)})
       end
     end)
   end
@@ -359,7 +375,7 @@ defmodule Recurse.Gateway.Personal.Handler do
     updates =
       []
       |> maybe_put_setting(:custody_mode, body["custodyMode"], ["client-e2ee", "gateway-managed"])
-      |> maybe_put_setting(:recovery_mode, body["recoveryMode"], ["self_only", "r5e_assisted"])
+      |> maybe_put_recovery_mode(body["recoveryMode"], household)
       |> maybe_put_threshold(body["threshold"], household.threshold)
       |> maybe_put_quiet(quiet)
 
@@ -369,12 +385,26 @@ defmodule Recurse.Gateway.Personal.Handler do
     end
   end
 
-  defp maybe_put_setting({:error, _} = err, _k, _v, _allowed), do: err
   defp maybe_put_setting(acc, _k, nil, _allowed), do: acc
 
   defp maybe_put_setting(acc, k, v, allowed) do
     if v in allowed, do: Keyword.put(acc, k, v), else: {:error, "invalid_#{k}"}
   end
+
+  defp maybe_put_recovery_mode({:error, _} = err, _v, _hh), do: err
+  defp maybe_put_recovery_mode(acc, nil, _hh), do: acc
+
+  defp maybe_put_recovery_mode(_acc, "self_only", %{
+         threshold: threshold,
+         recovery_mode: "r5e_assisted"
+       })
+       when is_integer(threshold) and threshold >= 2,
+       do: {:error, :co_sign_required}
+
+  defp maybe_put_recovery_mode(acc, v, _hh) when v in ["self_only", "r5e_assisted"],
+    do: Keyword.put(acc, :recovery_mode, v)
+
+  defp maybe_put_recovery_mode(_acc, _v, _hh), do: {:error, "invalid_recovery_mode"}
 
   defp maybe_put_threshold({:error, _} = err, _t, _current), do: err
   defp maybe_put_threshold(acc, nil, _current), do: acc
@@ -432,6 +462,23 @@ defmodule Recurse.Gateway.Personal.Handler do
     }
   end
 
+  defp require_runtime_running do
+    if Runtime.running?(), do: :ok, else: {:error, :evidence_runtime_unavailable}
+  end
+
+  defp require_challenge_claimed(%{state: "device_claimed", device_key_id: id})
+       when is_binary(id),
+       do: :ok
+
+  defp require_challenge_claimed(_), do: {:error, :invalid_pairing_state}
+
+  defp fetch_household_child_device(household_id, device_key_id) do
+    case Store.get_child_device(device_key_id) do
+      {:ok, %{household_id: ^household_id} = device} -> {:ok, device}
+      _ -> {:error, :not_found}
+    end
+  end
+
   defp fetch_household_challenge(household_id, challenge_id) do
     case Store.get_pairing_challenge(challenge_id) do
       {:ok, %{household_id: ^household_id} = challenge} -> {:ok, challenge}
@@ -439,50 +486,136 @@ defmodule Recurse.Gateway.Personal.Handler do
     end
   end
 
-  defp extract_and_validate_child_badge(%{"badgeEnvelope" => envelope}) when is_map(envelope) do
-    case Envelope.open(envelope) do
-      {:ok, %{ref: ref, evidence: %{"kind" => "Badge", "body" => %{"kinds" => kinds}}}} ->
-        with :ok <- Policy.validate_child_badge_kinds(kinds) do
-          {:ok, kinds, ref}
-        end
+  defp extract_and_admit_child_badge(%{"badgeEnvelope" => envelope}, _hh, _ch, _parent, _ctx)
+       when is_map(envelope) do
+    with {:ok, %{ref: ref, evidence: %{"kind" => "Badge", "body" => %{"kinds" => kinds}}}} <-
+           Envelope.open(envelope),
+         :ok <- Policy.validate_child_badge_kinds(kinds),
+         {:ok, _entry} <- Ledger.verify_admitted_ref(ref) do
+      {:ok, kinds, ref}
+    else
+      {:error, reason}
+      when reason in [
+             :invalid_child_badge_kinds,
+             :evidence_runtime_unavailable,
+             :evidence_record_not_found
+           ] ->
+        {:error, reason}
 
       _ ->
         {:error, :invalid_badge_envelope}
     end
   end
 
-  defp extract_and_validate_child_badge(%{"badgeKinds" => kinds} = body) do
-    with :ok <- Policy.validate_child_badge_kinds(kinds) do
-      badge_ref =
-        case body["badgeRef"] do
-          ref when is_binary(ref) -> ref
-          _ -> Ref.evidence(:crypto.strong_rand_bytes(32))
-        end
-
+  defp extract_and_admit_child_badge(
+         %{"badgeKinds" => kinds} = body,
+         household,
+         challenge,
+         parent,
+         ctx
+       ) do
+    with :ok <- Policy.validate_child_badge_kinds(kinds),
+         {:ok, badge_ref} <-
+           resolve_badge_ref(body["badgeRef"], kinds, household, challenge, parent, ctx) do
       {:ok, kinds, badge_ref}
     end
   end
 
-  defp extract_and_validate_child_badge(_body), do: {:error, :invalid_child_badge_kinds}
+  defp extract_and_admit_child_badge(_body, _hh, _ch, _parent, _ctx),
+    do: {:error, :invalid_child_badge_kinds}
 
-  defp extract_paired_record_ref(%{"childDevicePairedEnvelope" => envelope}, expected_key_id)
+  defp resolve_badge_ref(ref, _kinds, _hh, _ch, _parent, _ctx)
+       when is_binary(ref) and ref != "" do
+    with {:ok, _entry} <- Ledger.verify_admitted_ref(ref) do
+      {:ok, ref}
+    end
+  end
+
+  defp resolve_badge_ref(_nil, kinds, household, challenge, parent, ctx) do
+    Ledger.record_observation(
+      "personal.child_device.badge_issued",
+      Common.actor_urn(ctx, parent),
+      %{
+        "householdId" => household.household_id,
+        "childMemberId" => challenge.child_member_id,
+        "deviceKeyId" => challenge.device_key_id,
+        "badgeKinds" => kinds
+      }
+    )
+  end
+
+  defp extract_and_admit_paired_record(
+         %{"childDevicePairedEnvelope" => envelope},
+         _hh,
+         challenge,
+         _badge_ref,
+         _parent,
+         _ctx
+       )
        when is_map(envelope) do
     with {:ok, %{ref: ref, evidence: ev}} <- Envelope.open(envelope),
          true <- ev["apiVersion"] == "personal.r5e.io/v1" and ev["kind"] == "ChildDevicePaired",
          true <- length(List.wrap(envelope["signatures"])) == 2,
-         true <- is_nil(expected_key_id) or get_in(ev, ["body", "deviceKeyId"]) == expected_key_id do
+         true <-
+           is_nil(challenge.device_key_id) or
+             get_in(ev, ["body", "deviceKeyId"]) == challenge.device_key_id,
+         {:ok, _entry} <- Ledger.verify_admitted_ref(ref) do
       {:ok, ref}
     else
-      _ -> {:error, :invalid_child_device_paired_envelope}
+      {:error, reason}
+      when reason in [:evidence_runtime_unavailable, :evidence_record_not_found] ->
+        {:error, reason}
+
+      _ ->
+        {:error, :invalid_child_device_paired_envelope}
     end
   end
 
-  defp extract_paired_record_ref(%{"pairedRecordRef" => ref}, _expected_key_id)
-       when is_binary(ref),
-       do: {:ok, ref}
+  defp extract_and_admit_paired_record(
+         %{"pairedRecordRef" => ref},
+         _hh,
+         _ch,
+         _badge_ref,
+         _parent,
+         _ctx
+       )
+       when is_binary(ref) and ref != "" do
+    with {:ok, _entry} <- Ledger.verify_admitted_ref(ref) do
+      {:ok, ref}
+    end
+  end
 
-  defp extract_paired_record_ref(_body, _expected_key_id),
-    do: {:ok, Ref.evidence(:crypto.strong_rand_bytes(32))}
+  defp extract_and_admit_paired_record(_body, household, challenge, badge_ref, parent, ctx) do
+    Ledger.record_observation(
+      "personal.child_device.paired",
+      Common.actor_urn(ctx, parent),
+      %{
+        "householdId" => household.household_id,
+        "childMemberId" => challenge.child_member_id,
+        "deviceKeyId" => challenge.device_key_id,
+        "badgeRef" => badge_ref
+      }
+    )
+  end
+
+  defp resolve_revocation_ref(%{"revocationRef" => ref}, _hh, _device, _parent, _ctx)
+       when is_binary(ref) and ref != "" do
+    with {:ok, _entry} <- Ledger.verify_admitted_ref(ref) do
+      {:ok, ref}
+    end
+  end
+
+  defp resolve_revocation_ref(_body, household, device, parent, ctx) do
+    Ledger.record_observation(
+      "personal.child_device.revoked",
+      Common.actor_urn(ctx, parent),
+      %{
+        "householdId" => household.household_id,
+        "childMemberId" => device.child_member_id,
+        "deviceKeyId" => device.device_key_id
+      }
+    )
+  end
 
   defp load_digest_items(household, params) do
     members = Store.list_members(household.household_id)

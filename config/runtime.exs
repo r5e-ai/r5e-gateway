@@ -740,6 +740,14 @@ config :recurse_gateway,
   # `/v1/public/evidence/:ref`) when `R5E_EVIDENCE_PUBLIC_READ` is also true.
   # Strictly off unless explicitly enabled on public dev/demo chains.
   evidence_public_chain?: env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN", false),
+  # Carry undisclosed content payloads on `/v1/public/chain` (and non-disclosed
+  # `/v1/public/evidence/:ref`). Defaults to false (records, seals, definitions,
+  # and explicitly disclosed content only). Refused at boot if personal or
+  # custody release-gate modes are enabled.
+  evidence_public_chain_include_content?:
+    env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT", false),
+  # Hard response byte ceiling for `/v1/public/chain` (default 4 MiB).
+  evidence_public_chain_max_bytes: env_int.("R5E_EVIDENCE_PUBLIC_CHAIN_MAX_BYTES", "4194304"),
   evidence_policy_required?: env_bool.("R5E_EVIDENCE_POLICY_REQUIRED", false),
   evidence_seal_interval_ms: env_int.("R5E_EVIDENCE_SEAL_INTERVAL_MS", "60000"),
   evidence_max_body_bytes: env_int.("R5E_EVIDENCE_MAX_BODY_BYTES", "268435456")
@@ -814,8 +822,10 @@ config :recurse_gateway, upstream_zdr_routes: upstream_zdr_routes
 # `custody.r5e.io/v1/ReleaseGranted` covering the target scope (while preserving
 # self-scoped `ReadOwnPayload` and `WorkloadTerms` routine-debug carveouts).
 # ---------------------------------------------------------------------------
+custody_require_release_grant? = env_bool.("R5E_CUSTODY_REQUIRE_RELEASE_GRANT", false)
+
 config :recurse_gateway,
-  custody_require_release_grant?: env_bool.("R5E_CUSTODY_REQUIRE_RELEASE_GRANT", false)
+  custody_require_release_grant?: custody_require_release_grant?
 
 # ---------------------------------------------------------------------------
 # Personal household, E2EE key-wrap store, pairing & recovery surface —
@@ -823,5 +833,16 @@ config :recurse_gateway,
 #
 # When false, all `/v1/personal/*` routes return 404 ERR_NOT_FOUND.
 # ---------------------------------------------------------------------------
+personal_enabled? = env_bool.("R5E_PERSONAL_ENABLED", false)
+
 config :recurse_gateway,
-  personal_enabled?: env_bool.("R5E_PERSONAL_ENABLED", false)
+  personal_enabled?: personal_enabled?
+
+# Fail closed at boot if full-content public chain export is combined with
+# private household or custody-gated modes.
+if env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT", false) and
+     (personal_enabled? or custody_require_release_grant?) do
+  raise ArgumentError,
+        "R5E_EVIDENCE_PUBLIC_CHAIN_INCLUDE_CONTENT=true cannot be enabled alongside " <>
+          "R5E_PERSONAL_ENABLED=true or R5E_CUSTODY_REQUIRE_RELEASE_GRANT=true"
+end

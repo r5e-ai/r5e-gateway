@@ -5,30 +5,41 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   assisted recovery requests (`/v1/personal/recovery/requests*`,
   `/v1/personal/recovery/disable-assisted`).
 
-  Guarantees:
-    * Server stores ONLY client-encrypted recovery envelopes locked by the
-      parent's own sign-in / WebAuthn-PRF factor before reaching r5e.
-    * Completion evaluates signing-authority rotation (`authorityRotated` +
-      optional `rootsChangedRef`) and recovery-envelope release
-      (`envelopeReleased` + `envelopeStatus: "released" | "absent_not_enrolled" | "absent_deleted"`)
-      **independently** at completion time — NEVER returning
-      `envelopeReleased: true` if the envelope was deleted before or during the
-      cooling-off window, omitting `rootsChangedRef` when signing authority did
-      not rotate, and returning `409 nothing_to_recover` when neither occurred.
+  Security invariants:
+    * All recovery routes require an authenticated `owner` or `parent` member.
+    * `GET /v1/personal/recovery-envelope` returns enrollment metadata/status
+      ONLY — never releasing the raw encrypted envelope before a recovery
+      request completes after the cooling-off window.
+    * `POST /v1/personal/recovery/requests/:request_id/complete` is strictly
+      bound to the initiating parent's `member_id` / `authSubject`.
+    * `POST /v1/personal/recovery/disable-assisted` requires a distinct
+      two-parent co-sign (`coSignRef`) on `threshold >= 2` households.
+    * Every returned `rootsChangedRef` and `recoveryCompletedRef` is a real
+      admitted record in `evidence_records` (`503` if runtime is unavailable),
+      and `authorityRotated: true` is returned ONLY after real member key
+      rotation succeeds in the database and is recorded on the ledger.
   """
 
-  alias Recurse.Gateway.Personal.Common
-  alias Recurse.Provenance.Ref
+  alias Recurse.Gateway.Personal.{Common, Ledger}
+  alias Recurse.Gateway.Provenance.Runtime
+  alias Recurse.Provenance.Key
   alias Recurse.Providers.Personal, as: Store
 
   @recover ~s(Recurse::Action::"RecoverHousehold")
   @default_cooling_off_seconds 86_400
+  @max_cooling_off_seconds 604_800
+  @common_errors [
+    :not_found,
+    :ambiguous_household,
+    :parent_role_required,
+    :evidence_runtime_unavailable
+  ]
 
   @doc "`PUT /v1/personal/recovery-envelope`"
   @spec put_envelope(Plug.Conn.t()) :: Plug.Conn.t()
   def put_envelope(%Plug.Conn{body_params: body} = conn) when is_map(body) do
     Common.gate(conn, @recover, "/v1/personal/recovery-envelope", fn conn, ctx ->
-      with {:ok, household, member} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, member} <- Common.resolve_parent_member(conn, ctx),
            :ok <- require_assisted_mode(household),
            {:ok, attrs} <- parse_envelope_attrs(body),
            {:ok, stored} <-
@@ -39,8 +50,8 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
           "updatedAt" => DateTime.to_iso8601(stored.updated_at)
         })
       else
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
 
         {:error, :recovery_mode_self_only} ->
           Common.json(conn, 409, %{"error" => "recovery_mode_self_only"})
@@ -53,17 +64,22 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
 
   def put_envelope(conn), do: Common.bad_request(conn, "expected JSON body")
 
-  @doc "`GET /v1/personal/recovery-envelope`"
+  @doc """
+  `GET /v1/personal/recovery-envelope`
+
+  Returns enrollment metadata/status ONLY (never raw ciphertext/nonce/kdfParams)
+  so callers cannot bypass the cooling-off window.
+  """
   @spec get_envelope(Plug.Conn.t()) :: Plug.Conn.t()
   def get_envelope(conn) do
     Common.gate(conn, @recover, "/v1/personal/recovery-envelope", fn conn, ctx ->
-      with {:ok, household, member} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, member} <- Common.resolve_parent_member(conn, ctx),
            :ok <- require_assisted_mode(household),
            {:present, env} <- Store.envelope_state(household.household_id, member.member_id) do
-        Common.json(conn, 200, render_envelope(env))
+        Common.json(conn, 200, render_envelope_metadata(env))
       else
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
 
         {:error, :recovery_mode_self_only} ->
           Common.json(conn, 404, %{"error" => "recovery_envelope_not_found"})
@@ -87,7 +103,7 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   @spec delete_envelope(Plug.Conn.t()) :: Plug.Conn.t()
   def delete_envelope(conn) do
     Common.gate(conn, @recover, "/v1/personal/recovery-envelope", fn conn, ctx ->
-      case Common.resolve_household_member(conn, ctx) do
+      case Common.resolve_parent_member(conn, ctx) do
         {:ok, household, member} ->
           {:ok, res} = Store.delete_recovery_envelope(household.household_id, member.member_id)
 
@@ -96,8 +112,8 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
             "envelopeStatus" => res.envelope_status
           })
 
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
       end
     end)
   end
@@ -106,16 +122,15 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   @spec create_request(Plug.Conn.t()) :: Plug.Conn.t()
   def create_request(%Plug.Conn{body_params: body} = conn) when is_map(body) do
     Common.gate(conn, @recover, "/v1/personal/recovery/requests", fn conn, ctx ->
-      with {:ok, household, member} <- Common.resolve_household_member(conn, ctx),
+      rotate_authority = Map.get(body, "rotateAuthority", true) != false
+
+      with {:ok, household, member} <- Common.resolve_parent_member(conn, ctx),
            :ok <- require_assisted_mode(household),
-           true <-
-             (is_map(body["newRootPublicKey"]) and is_map(body["newWorkingPublicKey"])) ||
-               {:error, :missing_keys},
+           :ok <- validate_recovery_keys(body, rotate_authority),
            {:ok, new_x25519} <- decode_optional_x25519(body["newX25519PublicKey"]),
            cooling_off = resolve_cooling_off_seconds(body),
-           unlock_at = DateTime.add(DateTime.utc_now(), cooling_off, :second),
+           unlock_at = DateTime.add(now_utc(), cooling_off, :second),
            request_id = Common.random_id("rec_", 12),
-           rotate_authority = Map.get(body, "rotateAuthority", true) != false,
            {:ok, req} <-
              Store.create_recovery_request(%{
                request_id: request_id,
@@ -133,11 +148,14 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
           "unlockAt" => DateTime.to_iso8601(req.unlock_at)
         })
       else
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
 
         {:error, :recovery_mode_self_only} ->
           Common.json(conn, 404, %{"error" => "recovery_not_enabled"})
+
+        {:error, :invalid_public_key} ->
+          Common.json(conn, 422, %{"error" => "invalid_public_key"})
 
         {:error, reason} ->
           Common.bad_request(conn, "invalid recovery request: #{inspect(reason)}")
@@ -151,9 +169,20 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   @spec cancel_request(Plug.Conn.t()) :: Plug.Conn.t()
   def cancel_request(%Plug.Conn{path_params: %{"request_id" => request_id}} = conn) do
     Common.gate(conn, @recover, "/v1/personal/recovery/requests/cancel", fn conn, ctx ->
-      with {:ok, household, member} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, member} <- Common.resolve_parent_member(conn, ctx),
+           :ok <- require_runtime_running(),
            {:ok, req} <- Store.get_recovery_request(household.household_id, request_id),
-           rec_ref = Ref.evidence(:crypto.strong_rand_bytes(32)),
+           true <- req.state == "pending_window" || {:error, :not_pending},
+           {:ok, rec_ref} <-
+             Ledger.record_observation(
+               "personal.recovery.cancelled",
+               Common.actor_urn(ctx, member),
+               %{
+                 "householdId" => household.household_id,
+                 "requestId" => req.request_id,
+                 "cancelledByMemberId" => member.member_id
+               }
+             ),
            {:ok, _cancelled} <-
              Store.cancel_recovery_request(
                household.household_id,
@@ -171,9 +200,10 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
           "recoveryCompletedRef" => rec_ref
         })
       else
-        {:error, :not_found} -> Common.not_found(conn)
+        {:error, reason} when reason in @common_errors -> Common.send_common_error(conn, reason)
         :not_found -> Common.not_found(conn)
         {:error, :not_pending} -> Common.json(conn, 409, %{"error" => "request_not_pending"})
+        {:error, reason} -> Common.json(conn, 503, %{"error" => Atom.to_string(reason)})
       end
     end)
   end
@@ -182,18 +212,23 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   @spec complete_request(Plug.Conn.t()) :: Plug.Conn.t()
   def complete_request(%Plug.Conn{path_params: %{"request_id" => request_id}} = conn) do
     Common.gate(conn, @recover, "/v1/personal/recovery/requests/complete", fn conn, ctx ->
-      now = DateTime.utc_now()
+      now = now_utc()
 
-      with {:ok, household, _member} <- Common.resolve_household_member(conn, ctx),
+      with {:ok, household, member} <- Common.resolve_parent_member(conn, ctx),
+           :ok <- require_runtime_running(),
            {:ok, req} <- Store.get_recovery_request(household.household_id, request_id),
+           :ok <- verify_recovery_initiator(req, member),
            :ok <- check_completable(req, now) do
-        finalize_honest_completion(conn, household, req)
+        finalize_honest_completion(conn, household, member, req, ctx)
       else
-        {:error, :not_found} ->
-          Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
 
         :not_found ->
           Common.not_found(conn)
+
+        {:error, :recovery_initiator_mismatch} ->
+          Common.json(conn, 403, %{"error" => "recovery_initiator_mismatch"})
 
         {:error, :request_cancelled} ->
           Common.json(conn, 409, %{"error" => "request_cancelled"})
@@ -214,10 +249,23 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   @spec disable_assisted(Plug.Conn.t()) :: Plug.Conn.t()
   def disable_assisted(conn) do
     Common.gate(conn, @recover, "/v1/personal/recovery/disable-assisted", fn conn, ctx ->
-      with {:ok, household, _member} <- Common.resolve_household_member(conn, ctx),
-           {:ok, res} <- Store.disable_assisted_recovery(household.household_id) do
-        rec_ref = Ref.evidence(:crypto.strong_rand_bytes(32))
+      body = if is_map(conn.body_params), do: conn.body_params, else: %{}
+      co_sign_ref = body["coSignRef"]
 
+      with {:ok, household, member} <- Common.resolve_parent_member(conn, ctx),
+           :ok <- require_runtime_running(),
+           :ok <- check_disable_assisted_cosign(household, co_sign_ref),
+           {:ok, rec_ref} <-
+             Ledger.record_observation(
+               "personal.recovery.assisted_disabled",
+               Common.actor_urn(ctx, member),
+               %{
+                 "householdId" => household.household_id,
+                 "memberId" => member.member_id
+               }
+             ),
+           {:ok, res} <- Store.disable_assisted_recovery(household.household_id),
+           :ok <- consume_disable_cosign(household, co_sign_ref, rec_ref) do
         Common.json(conn, 200, %{
           "recoveryMode" => "self_only",
           "envelopeDeleted" => res.envelopes_deleted > 0,
@@ -226,26 +274,23 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
           "recoveryCompletedRef" => rec_ref
         })
       else
-        {:error, :not_found} -> Common.not_found(conn)
+        {:error, reason} when reason in @common_errors ->
+          Common.send_common_error(conn, reason)
+
+        {:error, :co_sign_required} ->
+          Common.json(conn, 409, %{"error" => "co_sign_required"})
+
+        {:error, reason} ->
+          Common.json(conn, 503, %{"error" => Atom.to_string(reason)})
       end
     end)
   end
-
-  defp cancelled_envelope_status(household_id, member_id) do
-    case Store.envelope_state(household_id, member_id) do
-      :absent_deleted -> "absent_deleted"
-      _ -> "absent_not_enrolled"
-    end
-  end
-
-  defp disabled_envelope_status(count) when count > 0, do: "absent_deleted"
-  defp disabled_envelope_status(_count), do: "absent_not_enrolled"
 
   # ---------------------------------------------------------------------------
   # Honest independent completion evaluation
   # ---------------------------------------------------------------------------
 
-  defp finalize_honest_completion(conn, household, req) do
+  defp finalize_honest_completion(conn, household, member, req, ctx) do
     {envelope_released?, envelope_status, envelope_payload} =
       case Store.envelope_state(household.household_id, req.member_id) do
         {:present, env} -> {true, "released", render_envelope(env)}
@@ -253,35 +298,77 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
         :absent_not_enrolled -> {false, "absent_not_enrolled", nil}
       end
 
-    authority_rotated? = req.rotate_authority == true
+    actor = Common.actor_urn(ctx, member)
 
-    roots_changed_ref =
-      if authority_rotated?, do: Ref.evidence(:crypto.strong_rand_bytes(32)), else: nil
-
-    rec_ref = Ref.evidence(:crypto.strong_rand_bytes(32))
-
-    if not authority_rotated? and not envelope_released? do
-      _ = Store.mark_recovery_completed(household.household_id, req.request_id, nil, rec_ref)
-
-      Common.json(conn, 409, %{
-        "error" => "nothing_to_recover",
-        "outcome" => "no-action-envelope-absent",
-        "authorityRotated" => false,
-        "rootsChangedRef" => nil,
-        "envelopeReleased" => false,
-        "envelopeStatus" => envelope_status,
-        "recoveryEnvelope" => nil,
-        "recoveryCompletedRef" => rec_ref
-      })
+    if req.rotate_authority != true and not envelope_released? do
+      complete_nothing_to_recover(conn, household, req, envelope_status, actor)
     else
-      {:ok, _} =
-        Store.mark_recovery_completed(
-          household.household_id,
-          req.request_id,
-          roots_changed_ref,
-          rec_ref
-        )
+      complete_real_recovery(
+        conn,
+        household,
+        member,
+        req,
+        {envelope_released?, envelope_status, envelope_payload},
+        actor
+      )
+    end
+  end
 
+  defp complete_nothing_to_recover(conn, household, req, envelope_status, actor) do
+    case Ledger.record_observation("personal.recovery.completed", actor, %{
+           "householdId" => household.household_id,
+           "requestId" => req.request_id,
+           "outcome" => "no-action-envelope-absent",
+           "authorityRotated" => false,
+           "envelopeReleased" => false,
+           "envelopeStatus" => envelope_status
+         }) do
+      {:ok, rec_ref} ->
+        _ = Store.mark_recovery_completed(household.household_id, req.request_id, nil, rec_ref)
+
+        Common.json(conn, 409, %{
+          "error" => "nothing_to_recover",
+          "outcome" => "no-action-envelope-absent",
+          "authorityRotated" => false,
+          "rootsChangedRef" => nil,
+          "envelopeReleased" => false,
+          "envelopeStatus" => envelope_status,
+          "recoveryEnvelope" => nil,
+          "recoveryCompletedRef" => rec_ref
+        })
+
+      {:error, reason} ->
+        Common.json(conn, 503, %{"error" => Atom.to_string(reason)})
+    end
+  end
+
+  defp complete_real_recovery(
+         conn,
+         household,
+         member,
+         req,
+         {envelope_released?, envelope_status, envelope_payload},
+         actor
+       ) do
+    with {:ok, authority_rotated?, roots_changed_ref} <-
+           perform_authority_rotation(household, member, req, actor),
+         {:ok, rec_ref} <-
+           Ledger.record_observation("personal.recovery.completed", actor, %{
+             "householdId" => household.household_id,
+             "requestId" => req.request_id,
+             "outcome" => "completed",
+             "authorityRotated" => authority_rotated?,
+             "rootsChangedRef" => roots_changed_ref,
+             "envelopeReleased" => envelope_released?,
+             "envelopeStatus" => envelope_status
+           }),
+         {:ok, _} <-
+           Store.mark_recovery_completed(
+             household.household_id,
+             req.request_id,
+             roots_changed_ref,
+             rec_ref
+           ) do
       Common.json(conn, 200, %{
         "state" => "completed",
         "outcome" => "completed",
@@ -292,8 +379,120 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
         "recoveryEnvelope" => envelope_payload,
         "recoveryCompletedRef" => rec_ref
       })
+    else
+      {:error, :invalid_public_key} ->
+        Common.json(conn, 422, %{"error" => "invalid_public_key"})
+
+      {:error, reason} when reason in @common_errors ->
+        Common.send_common_error(conn, reason)
+
+      {:error, reason} ->
+        Common.json(conn, 503, %{"error" => Atom.to_string(reason)})
     end
   end
+
+  defp perform_authority_rotation(_household, _member, %{rotate_authority: false}, _actor),
+    do: {:ok, false, nil}
+
+  defp perform_authority_rotation(household, member, req, actor) do
+    with {:ok, new_root_id} <- extract_public_key_id(req.new_root_public_key),
+         {:ok, new_working_id} <- extract_public_key_id(req.new_working_public_key),
+         {:ok, _rotated} <-
+           Store.rotate_member_keys(
+             household.household_id,
+             member.member_id,
+             new_root_id,
+             new_working_id
+           ),
+         {:ok, roots_ref} <-
+           Ledger.record_observation("personal.recovery.authority_rotated", actor, %{
+             "householdId" => household.household_id,
+             "memberId" => member.member_id,
+             "requestId" => req.request_id,
+             "previousRootKeyId" => member.root_key_id,
+             "newRootKeyId" => new_root_id,
+             "newWorkingKeyId" => new_working_id
+           }) do
+      {:ok, true, roots_ref}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  defp require_runtime_running do
+    if Runtime.running?(), do: :ok, else: {:error, :evidence_runtime_unavailable}
+  end
+
+  defp verify_recovery_initiator(%{member_id: req_member_id}, %{member_id: caller_member_id})
+       when req_member_id == caller_member_id,
+       do: :ok
+
+  defp verify_recovery_initiator(_, _), do: {:error, :recovery_initiator_mismatch}
+
+  defp check_disable_assisted_cosign(%{threshold: threshold, household_id: hh_id}, co_sign_ref)
+       when threshold >= 2 do
+    if Store.approved_cosign?(hh_id, "household", hh_id, co_sign_ref) do
+      :ok
+    else
+      {:error, :co_sign_required}
+    end
+  end
+
+  defp check_disable_assisted_cosign(_household, _co_sign_ref), do: :ok
+
+  defp consume_disable_cosign(%{threshold: threshold, household_id: hh_id}, co_sign_ref, rec_ref)
+       when threshold >= 2 and is_binary(co_sign_ref) do
+    case Store.mark_proposal_executed(hh_id, co_sign_ref, rec_ref) do
+      {:ok, :executed} -> :ok
+      {:error, :proposal_not_approved} -> {:error, :co_sign_required}
+    end
+  end
+
+  defp consume_disable_cosign(_household, _co_sign_ref, _rec_ref), do: :ok
+
+  defp validate_recovery_keys(
+         %{"newRootPublicKey" => root_key, "newWorkingPublicKey" => working_key},
+         true
+       )
+       when is_map(root_key) and is_map(working_key) do
+    with {:ok, _} <- extract_public_key_id(root_key),
+         {:ok, _} <- extract_public_key_id(working_key) do
+      :ok
+    end
+  end
+
+  defp validate_recovery_keys(
+         %{"newRootPublicKey" => root_key, "newWorkingPublicKey" => working_key},
+         false
+       )
+       when is_map(root_key) and is_map(working_key),
+       do: :ok
+
+  defp validate_recovery_keys(_, _), do: {:error, :missing_keys}
+
+  defp extract_public_key_id(%{"algorithm" => alg, "bytes" => b64})
+       when alg in ["ed25519", "es256"] and is_binary(b64) do
+    with {:ok, raw} <- Base.decode64(b64),
+         {:ok, key_id} <- Key.id(alg, raw) do
+      {:ok, key_id}
+    else
+      _ -> {:error, :invalid_public_key}
+    end
+  end
+
+  defp extract_public_key_id(_), do: {:error, :invalid_public_key}
+
+  defp cancelled_envelope_status(household_id, member_id) do
+    case Store.envelope_state(household_id, member_id) do
+      :absent_deleted -> "absent_deleted"
+      _ -> "absent_not_enrolled"
+    end
+  end
+
+  defp disabled_envelope_status(count) when count > 0, do: "absent_deleted"
+  defp disabled_envelope_status(_count), do: "absent_not_enrolled"
 
   defp check_completable(%{state: "cancelled"}, _now), do: {:error, :request_cancelled}
   defp check_completable(%{state: "completed"}, _now), do: {:error, :request_already_completed}
@@ -341,6 +540,18 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
 
   defp parse_envelope_attrs(_), do: {:error, :missing_or_invalid_fields}
 
+  defp render_envelope_metadata(env) do
+    %{
+      "enrolled" => true,
+      "envelopeStatus" => "enrolled",
+      "recoveryX25519KeyId" => env.recovery_x25519_key_id,
+      "recoveryX25519PublicKeyBase64" => Base.encode64(env.recovery_x25519_pub_key),
+      "envelopeAlg" => env.envelope_alg,
+      "kdfKind" => env.kdf_kind,
+      "updatedAt" => DateTime.to_iso8601(env.updated_at)
+    }
+  end
+
   defp render_envelope(env) do
     %{
       "recoveryX25519KeyId" => env.recovery_x25519_key_id,
@@ -366,7 +577,15 @@ defmodule Recurse.Gateway.Personal.RecoveryHandler do
   defp decode_optional_x25519(nil), do: {:ok, nil}
   defp decode_optional_x25519(b64), do: decode_len(b64, 32..32)
 
-  @max_cooling_off_seconds 604_800
+  defp now_utc do
+    offset_s = Application.get_env(:recurse_gateway, :personal_recovery_clock_offset_seconds, 0)
+
+    if is_integer(offset_s) and offset_s != 0 do
+      DateTime.add(DateTime.utc_now(), offset_s, :second)
+    else
+      DateTime.utc_now()
+    end
+  end
 
   defp resolve_cooling_off_seconds(body) do
     floor_s =
