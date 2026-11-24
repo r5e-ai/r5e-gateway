@@ -36,6 +36,8 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
   require Logger
 
+  alias Recurse.Gateway.Personal.Policy, as: PersonalPolicy
+
   alias Recurse.Gateway.Provenance.{
     Carried,
     Claim,
@@ -147,6 +149,7 @@ defmodule Recurse.Gateway.Provenance.Admission do
 
     with {:ok, blobs} <- blobs(request["blobs"]),
          {:ok, opened} <- open_all(offered),
+         :ok <- PersonalPolicy.check_admission_batch(opened, request["authority"]),
          {:ok, keys} <- keys(info, request, opened),
          :ok <- each(opened, &signed(&1, keys)),
          :ok <- each(opened, &admissible(&1, info)),
@@ -391,7 +394,20 @@ defmodule Recurse.Gateway.Provenance.Admission do
   defp session_owned(_no_session, _info, _caller), do: :ok
 
   # The earliest record in the session that the gateway itself signed.
+  # Uses `session_anchor/3` (SQL `LIMIT 1` over `(session, captured_at)`) when
+  # available so long sessions never load and decode every record on every batch.
   defp anchor(%{store: {module, handle}, key_id: gateway}, session) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :session_anchor, 3) do
+      case module.session_anchor(handle, session, gateway) do
+        {:ok, entry} -> entry.evidence
+        _ -> nil
+      end
+    else
+      anchor_from_session_scan(module, handle, gateway, session)
+    end
+  end
+
+  defp anchor_from_session_scan(module, handle, gateway, session) do
     case module.by_session(handle, session) do
       {:ok, entries} ->
         entries

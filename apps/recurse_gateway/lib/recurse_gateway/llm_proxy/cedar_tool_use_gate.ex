@@ -137,6 +137,8 @@ defmodule Recurse.Gateway.LlmProxy.CedarToolUseGate do
           required(:started_at) => DateTime.t(),
           required(:bundle) => PolicyBundleRef.t(),
           optional(:parallel_tool_call_index) => non_neg_integer() | nil,
+          optional(:upstream_route_id) => String.t(),
+          optional(:upstream_zdr_pinned) => boolean(),
           optional(:args_inline_threshold_bytes) => pos_integer(),
           optional(:cache) => keyword()
         }
@@ -287,6 +289,8 @@ defmodule Recurse.Gateway.LlmProxy.CedarToolUseGate do
       "estimated_completion_tokens" => context.estimated_completion_tokens,
       "cedar_bundle_hash" => Base.encode16(context.cedar_bundle_hash, case: :lower),
       "upstream_domain" => context.upstream_domain,
+      "upstream_route_id" => Map.get(context, :upstream_route_id, ""),
+      "upstream_zdr_pinned" => Map.get(context, :upstream_zdr_pinned, false) == true,
       "transport" => Atom.to_string(context.transport),
       "started_at" => DateTime.to_iso8601(context.started_at),
       "principal_kind" => Atom.to_string(context.principal.kind),

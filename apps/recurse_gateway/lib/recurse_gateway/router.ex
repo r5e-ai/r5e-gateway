@@ -399,6 +399,135 @@ defmodule Recurse.Gateway.Router do
     &Recurse.Gateway.Evidence.ApiHandler.dispose/1
   )
 
+  # ---------------------------------------------------------------------------
+  # Opt-in Personal Household, E2EE Key-Wrap Store, Pairing, Recovery & Erasure
+  # (`R5E_PERSONAL_ENABLED=true`, default false -> 404 ERR_NOT_FOUND).
+  # ---------------------------------------------------------------------------
+
+  dual_auth_post(
+    "/v1/personal/households",
+    &Recurse.Gateway.Personal.Handler.create_household/1
+  )
+
+  dual_auth_patch(
+    "/v1/personal/settings",
+    &Recurse.Gateway.Personal.Handler.update_settings/1
+  )
+
+  dual_auth_get(
+    "/v1/personal/digests",
+    &Recurse.Gateway.Personal.Handler.digests/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/pairings",
+    &Recurse.Gateway.Personal.Handler.create_pairing/1
+  )
+
+  post "/v1/personal/pairings/:challenge_id/device-claim" do
+    Recurse.Gateway.Personal.Handler.device_claim(conn)
+  end
+
+  dual_auth_post(
+    "/v1/personal/pairings/:challenge_id/finalize",
+    &Recurse.Gateway.Personal.Handler.finalize_pairing/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/devices/:device_key_id/revoke",
+    &Recurse.Gateway.Personal.Handler.revoke_device/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/recipient-keys",
+    &Recurse.Gateway.Personal.E2eeHandler.register_recipient_key/1
+  )
+
+  dual_auth_put(
+    "/v1/personal/key-wraps",
+    &Recurse.Gateway.Personal.E2eeHandler.put_key_wraps/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/key-wraps",
+    &Recurse.Gateway.Personal.E2eeHandler.put_key_wraps/1
+  )
+
+  dual_auth_get(
+    "/v1/personal/key-wraps",
+    &Recurse.Gateway.Personal.E2eeHandler.get_key_wraps/1
+  )
+
+  dual_auth_delete(
+    "/v1/personal/key-wraps",
+    &Recurse.Gateway.Personal.E2eeHandler.delete_key_wraps/1
+  )
+
+  dual_auth_put(
+    "/v1/personal/blobs/:bytes_ref",
+    &Recurse.Gateway.Personal.E2eeHandler.put_blob/1
+  )
+
+  dual_auth_get(
+    "/v1/personal/blobs/:bytes_ref",
+    &Recurse.Gateway.Personal.E2eeHandler.get_blob/1
+  )
+
+  dual_auth_delete(
+    "/v1/personal/blobs/:bytes_ref",
+    &Recurse.Gateway.Personal.E2eeHandler.delete_blob/1
+  )
+
+  dual_auth_put(
+    "/v1/personal/recovery-envelope",
+    &Recurse.Gateway.Personal.RecoveryHandler.put_envelope/1
+  )
+
+  dual_auth_get(
+    "/v1/personal/recovery-envelope",
+    &Recurse.Gateway.Personal.RecoveryHandler.get_envelope/1
+  )
+
+  dual_auth_delete(
+    "/v1/personal/recovery-envelope",
+    &Recurse.Gateway.Personal.RecoveryHandler.delete_envelope/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/recovery/requests",
+    &Recurse.Gateway.Personal.RecoveryHandler.create_request/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/recovery/requests/:request_id/cancel",
+    &Recurse.Gateway.Personal.RecoveryHandler.cancel_request/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/recovery/requests/:request_id/complete",
+    &Recurse.Gateway.Personal.RecoveryHandler.complete_request/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/recovery/disable-assisted",
+    &Recurse.Gateway.Personal.RecoveryHandler.disable_assisted/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/erasures/proposals",
+    &Recurse.Gateway.Personal.ErasureHandler.create_proposal/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/erasures/proposals/:proposal_id/approve",
+    &Recurse.Gateway.Personal.ErasureHandler.approve_proposal/1
+  )
+
+  dual_auth_post(
+    "/v1/personal/erasures",
+    &Recurse.Gateway.Personal.ErasureHandler.execute_erasure/1
+  )
+
   dual_auth_get(
     "/v1/audit/payload",
     &Recurse.Gateway.AuditPlane.PayloadBroker.handle/1
@@ -475,8 +604,13 @@ defmodule Recurse.Gateway.Router do
     Recurse.Gateway.Evidence.ClaimHandler.grants(conn)
   end
 
-  # No login: only what was provided to the public, and only when the
-  # deployment has switched public reading on.
+  # No login: only what was provided to the public (or the bounded chain when
+  # `R5E_EVIDENCE_PUBLIC_CHAIN` is also enabled), and only when the deployment
+  # has switched public reading on.
+  get "/v1/public/chain" do
+    Recurse.Gateway.Evidence.ApiHandler.public_chain(conn)
+  end
+
   get "/v1/public/evidence/:ref" do
     Recurse.Gateway.Evidence.ApiHandler.public(conn)
   end

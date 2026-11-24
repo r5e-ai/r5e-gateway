@@ -90,6 +90,7 @@ defmodule Recurse.Gateway.LlmProxy.StreamingProxy do
   alias Recurse.Gateway.LlmProxy.ParserDrift
   alias Recurse.Gateway.LlmProxy.PrincipalExtractor
   alias Recurse.Gateway.LlmProxy.RequestKind
+  alias Recurse.Gateway.LlmProxy.ZdrRoutes
   alias Recurse.Providers.Schemas.LlmProviderConfig
 
   require Logger
@@ -1400,6 +1401,12 @@ defmodule Recurse.Gateway.LlmProxy.StreamingProxy do
     threshold =
       Recurse.Gateway.LlmProxy.CedarToolUseGate.resolve_args_inline_threshold(cfg.metadata)
 
+    zdr_ctx =
+      case ZdrRoutes.cedar_context_for_config(cfg) do
+        {:ok, ctx} -> ctx
+        {:error, _reason, _details} -> %{upstream_route_id: "", upstream_zdr_pinned: false}
+      end
+
     base = %{
       # Sub-3.7-followon — real principal from JWT (or :anonymous
       # fallback). The CedarToolUseGate sees the principal_id +
@@ -1417,6 +1424,8 @@ defmodule Recurse.Gateway.LlmProxy.StreamingProxy do
       response_so_far_hash: <<0::256>>,
       cedar_bundle_hash: bundle.canonical_hash,
       upstream_domain: cfg.upstream_host,
+      upstream_route_id: zdr_ctx.upstream_route_id,
+      upstream_zdr_pinned: zdr_ctx.upstream_zdr_pinned,
       transport: :https_sse,
       started_at: DateTime.utc_now(),
       bundle: bundle,

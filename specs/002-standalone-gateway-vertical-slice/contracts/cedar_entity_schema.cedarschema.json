@@ -40,6 +40,8 @@
               "estimated_completion_tokens": {"type": "Long", "required": true},
               "cedar_bundle_hash": {"type": "String", "required": true, "$comment": "hex of bundle canonical_hash captured at call-start"},
               "upstream_domain": {"type": "String", "required": true},
+              "upstream_route_id": {"type": "String", "required": false},
+              "upstream_zdr_pinned": {"type": "Boolean", "required": false},
               "transport": {"type": "String", "required": true, "$comment": "one of: wss | https_sse"},
               "started_at": {"type": "String", "required": true, "$comment": "ISO 8601 UTC timestamp"},
               "principal_kind": {"type": "String", "required": true, "$comment": "one of: obo_human | service_account | autonomous"},
@@ -164,7 +166,9 @@
               "client_ip": {"type": "String", "required": true},
               "streaming": {"type": "Boolean", "required": true},
               "max_tokens": {"type": "Long", "required": false},
-              "model": {"type": "String", "required": true}
+              "model": {"type": "String", "required": true},
+              "upstream_route_id": {"type": "String", "required": false},
+              "upstream_zdr_pinned": {"type": "Boolean", "required": false}
             }
           }
         }
@@ -492,6 +496,102 @@
         "appliesTo": {
           "principalTypes": ["Principal::Human"],
           "resourceTypes": ["Resource::ConsoleSurface"]
+        }
+      },
+      "Action::ReadHouseholdEvidence": {
+        "$comment": "Personal household parent/owner scoped evidence and digest reads.",
+        "appliesTo": {
+          "principalTypes": ["Principal::Human"],
+          "resourceTypes": ["Resource::AuditEndpoint"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "tenant_id": {"type": "String", "required": true},
+              "correlation_id": {"type": "String", "required": true},
+              "timestamp": {"type": "Long", "required": true},
+              "client_ip": {"type": "String", "required": true}
+            }
+          }
+        }
+      },
+      "Action::ReadHouseholdPayload": {
+        "$comment": "Personal household parent/owner encrypted payload and E2EE blob reads.",
+        "appliesTo": {
+          "principalTypes": ["Principal::Human"],
+          "resourceTypes": ["Resource::AuditEndpoint"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "tenant_id": {"type": "String", "required": true},
+              "correlation_id": {"type": "String", "required": true},
+              "timestamp": {"type": "Long", "required": true},
+              "client_ip": {"type": "String", "required": true}
+            }
+          }
+        }
+      },
+      "Action::ManageHousehold": {
+        "$comment": "Personal household creation, settings, co-sign erasure proposals, and household erasures.",
+        "appliesTo": {
+          "principalTypes": ["Principal::Human"],
+          "resourceTypes": ["Resource::AuditEndpoint"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "tenant_id": {"type": "String", "required": true},
+              "correlation_id": {"type": "String", "required": true},
+              "timestamp": {"type": "Long", "required": true},
+              "client_ip": {"type": "String", "required": true}
+            }
+          }
+        }
+      },
+      "Action::ManagePersonalE2EE": {
+        "$comment": "Personal E2EE recipient key registration and mutable key-wrap / ciphertext blob CRUD.",
+        "appliesTo": {
+          "principalTypes": ["Principal::Human", "Principal::ServiceAccount"],
+          "resourceTypes": ["Resource::AuditEndpoint"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "tenant_id": {"type": "String", "required": true},
+              "correlation_id": {"type": "String", "required": true},
+              "timestamp": {"type": "Long", "required": true},
+              "client_ip": {"type": "String", "required": true}
+            }
+          }
+        }
+      },
+      "Action::PairChildDevice": {
+        "$comment": "Parent-authorized bilateral QR child-device pairing and revocation.",
+        "appliesTo": {
+          "principalTypes": ["Principal::Human"],
+          "resourceTypes": ["Resource::AuditEndpoint"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "tenant_id": {"type": "String", "required": true},
+              "correlation_id": {"type": "String", "required": true},
+              "timestamp": {"type": "Long", "required": true},
+              "client_ip": {"type": "String", "required": true}
+            }
+          }
+        }
+      },
+      "Action::RecoverHousehold": {
+        "$comment": "Parent-locked recovery envelope management and D19 assisted recovery requests.",
+        "appliesTo": {
+          "principalTypes": ["Principal::Human"],
+          "resourceTypes": ["Resource::AuditEndpoint"],
+          "context": {
+            "type": "Record",
+            "attributes": {
+              "tenant_id": {"type": "String", "required": true},
+              "correlation_id": {"type": "String", "required": true},
+              "timestamp": {"type": "Long", "required": true},
+              "client_ip": {"type": "String", "required": true}
+            }
+          }
         }
       }
     }

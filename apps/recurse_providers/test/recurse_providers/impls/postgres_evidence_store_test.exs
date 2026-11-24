@@ -765,4 +765,60 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStoreTest do
     assert length(stream_entries) == 2
     assert ref4 in Enum.map(stream_entries, & &1.ref)
   end
+
+  test "session_anchor/3 returns the earliest record signed by the given issuer with LIMIT 1",
+       ctx do
+    deployment = "anchor-#{System.unique_integer([:positive])}"
+    gw_stream = "urn:r5e:stream:#{deployment}:sessions"
+    wk_stream = "urn:r5e:stream:#{deployment}:workload"
+    session = "urn:r5e:session:tenant:abc1234567890def.anchor1"
+    workload_signer = Key.generate("es256")
+    t0 = ~U[2026-11-24 00:00:01.000000Z]
+    t1 = ~U[2026-11-24 00:00:02.000000Z]
+    t2 = ~U[2026-11-24 00:00:03.000000Z]
+
+    put_row = fn signer, stream, seq, prev, captured_at ->
+      evidence =
+        Recurse.Provenance.Evidence.new(
+          kind_path: "provenance.r5e.io/v2/ToolCall",
+          schema_ref: Ref.bytes("schema:ToolCall"),
+          profile_ref: Profile.ref(ctx.profile),
+          issuer: signer.key_id,
+          actor: "urn:r5e:principal:tenant:alice",
+          session: session,
+          stream: stream,
+          seq: seq,
+          previous: prev,
+          captured_at: captured_at,
+          body: %{"tool" => "echo"}
+        )
+
+      {:ok, signed} = Recurse.Provenance.Envelope.sign(evidence, signer)
+
+      :ok =
+        Store.append(Repo, %{
+          ref: signed.ref,
+          stream: stream,
+          seq: seq,
+          kind_path: "provenance.r5e.io/v2/ToolCall",
+          envelope: signed.envelope,
+          evidence: evidence
+        })
+
+      signed.ref
+    end
+
+    # Earlier workload-signed record must be skipped for gateway issuer
+    _wk_ref = put_row.(workload_signer, wk_stream, 1, nil, t0)
+    # Earliest gateway-signed record is the anchor
+    gw_anchor = put_row.(ctx.signer, gw_stream, 1, nil, t1)
+    # Later gateway-signed record must not win over gw_anchor
+    _gw_later = put_row.(ctx.signer, gw_stream, 2, gw_anchor, t2)
+
+    assert {:ok, %{ref: ^gw_anchor}} = Store.session_anchor(Repo, session, ctx.signer.key_id)
+    assert :error = Store.session_anchor(Repo, session, "key:es256:nonexistent")
+
+    assert :error =
+             Store.session_anchor(Repo, "urn:r5e:session:tenant:missing", ctx.signer.key_id)
+  end
 end

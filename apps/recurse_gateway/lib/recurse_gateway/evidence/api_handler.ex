@@ -97,7 +97,7 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
   """
 
   alias Recurse.Gateway.AuditPlane.Authz
-  alias Recurse.Gateway.Evidence.TailSocket
+  alias Recurse.Gateway.Evidence.{ReleaseGate, TailSocket}
   alias Recurse.Gateway.Provenance.{Admission, Carried, Disclosing, Enrolment, Retention, Runtime}
   alias Recurse.Gateway.Provenance.SessionName
   alias Recurse.Gateway.ProviderRegistry
@@ -435,9 +435,13 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
          {:ok, entry} <- fetch_record(index, ref, scope),
          true <- bytes_ref in Exporter.content_refs([entry]),
          content_scope = Evidence.content_scope(entry.evidence),
+         :ok <- ReleaseGate.authorize(index, content_scope, scope, record_ref: ref),
          {:ok, bytes} <- readable(index, bytes_ref, content_scope) do
       download(conn, bytes_ref, bytes)
     else
+      {:error, :release_grant_required} ->
+        json(conn, 403, %{"error" => "release_grant_required"})
+
       {:error, :key_service_unavailable} ->
         json(conn, 503, %{"error" => "ERR_UNAVAILABLE"})
 
@@ -502,13 +506,22 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       with :ok <- content_allowed(conn, content?, "/v1/evidence/export", scope),
            {:ok, session} <- named(ctx, id, index, scope),
            :ok <- session_exportable?(index, session, scope),
+           :ok <- export_release_allowed(index, session, content?, scope),
            {:ok, %{"records" => [_ | _]} = bundle} <-
              Exporter.session(index, session, content: content?) do
         json(conn, 200, carry_for_scope(bundle, scope))
       else
-        {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
-        {:many, sessions} -> several(conn, sessions)
-        _ -> not_found(conn)
+        {:error, :release_grant_required} ->
+          json(conn, 403, %{"error" => "release_grant_required"})
+
+        {:forbidden, error} ->
+          Authz.dispatch_gate_error(conn, error)
+
+        {:many, sessions} ->
+          several(conn, sessions)
+
+        _ ->
+          not_found(conn)
       end
     end)
   end
@@ -658,7 +671,12 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
     do: json(conn, 409, Map.put(about, "error", Atom.to_string(reason)))
 
   defp submit_answer(conn, {:error, reason})
-       when reason in [:not_next_in_stream, :stream_fork_refused, :gateway_has_no_endorsement],
+       when reason in [
+              :not_next_in_stream,
+              :stream_fork_refused,
+              :gateway_has_no_endorsement,
+              :co_sign_required
+            ],
        do: json(conn, 409, %{"error" => Atom.to_string(reason)})
 
   defp submit_answer(conn, {:error, reason}) when is_atom(reason),
@@ -782,6 +800,52 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
         {:forbidden, error} -> Authz.dispatch_gate_error(conn, error)
       end
     end)
+  end
+
+  @doc """
+  `GET /v1/public/chain`: bounded export bundle of the deployment's chain,
+  with no login, when both `R5E_EVIDENCE_PUBLIC_READ` and
+  `R5E_EVIDENCE_PUBLIC_CHAIN` are enabled. Answers `404 {"error": "not_found"}`
+  otherwise so private deployments never expose chain data.
+  """
+  @spec public_chain(Plug.Conn.t()) :: Plug.Conn.t()
+  def public_chain(conn) do
+    if Disclosing.public_chain?() do
+      serve_public_chain(Plug.Conn.fetch_query_params(conn))
+    else
+      json(conn, 404, %{"error" => "not_found"})
+    end
+  end
+
+  defp serve_public_chain(conn) do
+    with {:ok, limit} <- parse_public_chain_limit(conn.query_params["limit"]),
+         {:ok, text} <- Disclosing.public_chain_bundle(limit) do
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.put_resp_header("cache-control", "public, max-age=5")
+      |> Plug.Conn.send_resp(200, text)
+    else
+      {:error, :invalid_limit} ->
+        bad_request(conn, "limit must be a positive integer (max 500)")
+
+      {:error, :busy} ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "2")
+        |> json(503, %{"error" => "busy"})
+
+      {:error, :not_public} ->
+        json(conn, 404, %{"error" => "not_found"})
+    end
+  end
+
+  defp parse_public_chain_limit(nil), do: {:ok, 250}
+  defp parse_public_chain_limit(""), do: {:ok, 250}
+
+  defp parse_public_chain_limit(raw) when is_binary(raw) do
+    case Integer.parse(raw) do
+      {n, ""} when n >= 1 -> {:ok, min(n, 500)}
+      _ -> {:error, :invalid_limit}
+    end
   end
 
   @doc """
@@ -1055,6 +1119,11 @@ defmodule Recurse.Gateway.Evidence.ApiHandler do
       error -> {:forbidden, error}
     end
   end
+
+  defp export_release_allowed(_index, _session, false, _scope), do: :ok
+
+  defp export_release_allowed(index, session, true, scope),
+    do: ReleaseGate.authorize(index, session, scope)
 
   # The deployment's store, when the caller belongs to the deployment's tenant.
   defp index_for(%IdentityContext{tenant_id: tenant}) do

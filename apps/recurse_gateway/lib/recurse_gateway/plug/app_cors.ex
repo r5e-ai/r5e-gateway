@@ -36,6 +36,9 @@ defmodule Recurse.Gateway.Plug.AppCors do
                            ~w(x-recurse-correlation-id x-r5e-content-ref content-disposition),
                            ", "
                          )
+  @public_allow_methods ~w(GET OPTIONS)
+  @public_allow_methods_header "GET, OPTIONS"
+  @public_allow_headers_header "accept, cache-control, if-none-match"
   @max_age "600"
 
   @impl Plug
@@ -45,10 +48,15 @@ defmodule Recurse.Gateway.Plug.AppCors do
   @impl Plug
   @spec call(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
   def call(%Conn{request_path: path} = conn, _opts) do
-    if String.starts_with?(path, "/v1/") do
-      handle_cors(conn, allowed_origins())
-    else
-      conn
+    cond do
+      String.starts_with?(path, "/v1/public/") ->
+        handle_public_cors(conn)
+
+      String.starts_with?(path, "/v1/") ->
+        handle_cors(conn, allowed_origins())
+
+      true ->
+        conn
     end
   end
 
@@ -85,6 +93,44 @@ defmodule Recurse.Gateway.Plug.AppCors do
   end
 
   def origin_allowed?(_conn, _origin), do: false
+
+  defp handle_public_cors(conn) do
+    if Application.get_env(:recurse_gateway, :evidence_public_read?, false) == true do
+      dispatch_public_cors(conn)
+    else
+      conn
+    end
+  end
+
+  defp dispatch_public_cors(%Conn{method: "OPTIONS"} = conn) do
+    if public_preflight_allowed?(conn) do
+      conn
+      |> Conn.put_resp_header("access-control-allow-origin", "*")
+      |> Conn.put_resp_header("access-control-allow-methods", @public_allow_methods_header)
+      |> Conn.put_resp_header("access-control-allow-headers", @public_allow_headers_header)
+      |> Conn.put_resp_header("access-control-max-age", @max_age)
+      |> Conn.send_resp(204, "")
+      |> Conn.halt()
+    else
+      conn
+      |> Conn.send_resp(204, "")
+      |> Conn.halt()
+    end
+  end
+
+  defp dispatch_public_cors(%Conn{method: "GET"} = conn) do
+    Conn.put_resp_header(conn, "access-control-allow-origin", "*")
+  end
+
+  defp dispatch_public_cors(conn), do: conn
+
+  defp public_preflight_allowed?(conn) do
+    case Conn.get_req_header(conn, "access-control-request-method") do
+      [] -> true
+      [method] -> String.upcase(String.trim(method)) in @public_allow_methods
+      _ -> false
+    end
+  end
 
   defp handle_cors(conn, []), do: conn
 
