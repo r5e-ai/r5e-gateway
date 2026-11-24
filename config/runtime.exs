@@ -736,6 +736,10 @@ config :recurse_gateway,
   evidence_start_chain?: env_bool.("R5E_EVIDENCE_START_CHAIN", false),
   # Serve what was provided to the public with no login. Off unless set.
   evidence_public_read?: env_bool.("R5E_EVIDENCE_PUBLIC_READ", false),
+  # Serve the full bounded chain on `/v1/public/chain` (and any record on
+  # `/v1/public/evidence/:ref`) when `R5E_EVIDENCE_PUBLIC_READ` is also true.
+  # Strictly off unless explicitly enabled on public dev/demo chains.
+  evidence_public_chain?: env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN", false),
   evidence_policy_required?: env_bool.("R5E_EVIDENCE_POLICY_REQUIRED", false),
   evidence_seal_interval_ms: env_int.("R5E_EVIDENCE_SEAL_INTERVAL_MS", "60000"),
   evidence_max_body_bytes: env_int.("R5E_EVIDENCE_MAX_BODY_BYTES", "268435456")
@@ -781,3 +785,43 @@ evidence_auto_hold_kinds =
   |> Enum.uniq()
 
 config :recurse_gateway, evidence_auto_hold_kinds: evidence_auto_hold_kinds
+
+# ---------------------------------------------------------------------------
+# Structured route-bound ZDR upstream routes — R5E_UPSTREAM_ZDR_ROUTES.
+#
+# JSON array (or `{"routes": [...], "failClosedOnNonZdrFallback": true}`) of
+# contracted upstream routes (`routeId`, `endpointUrl`, `providerCredentialRef`,
+# `projectRef`, `zdrContracted`, `zdrEvidenceRef`, `fallbackRouteId`,
+# `failClosedOnNonZdrFallback`). Raises on malformed JSON at boot rather than
+# silently failing open. Defaults to `[]` when unset.
+# ---------------------------------------------------------------------------
+upstream_zdr_routes =
+  case env.("R5E_UPSTREAM_ZDR_ROUTES") do
+    nil ->
+      []
+
+    raw ->
+      Recurse.Gateway.LlmProxy.ZdrRoutes.parse_env!(raw)
+  end
+
+config :recurse_gateway, upstream_zdr_routes: upstream_zdr_routes
+
+# ---------------------------------------------------------------------------
+# Custody release gate — R5E_CUSTODY_REQUIRE_RELEASE_GRANT (default false).
+#
+# When true, direct operator content reads (`GET /v1/evidence/records/:ref/content/:bytes_ref`)
+# and `POST /v1/evidence/export` with `content: true` require a verified admitted
+# `custody.r5e.io/v1/ReleaseGranted` covering the target scope (while preserving
+# self-scoped `ReadOwnPayload` and `WorkloadTerms` routine-debug carveouts).
+# ---------------------------------------------------------------------------
+config :recurse_gateway,
+  custody_require_release_grant?: env_bool.("R5E_CUSTODY_REQUIRE_RELEASE_GRANT", false)
+
+# ---------------------------------------------------------------------------
+# Personal household, E2EE key-wrap store, pairing & recovery surface —
+# R5E_PERSONAL_ENABLED (default false).
+#
+# When false, all `/v1/personal/*` routes return 404 ERR_NOT_FOUND.
+# ---------------------------------------------------------------------------
+config :recurse_gateway,
+  personal_enabled?: env_bool.("R5E_PERSONAL_ENABLED", false)

@@ -243,6 +243,28 @@ defmodule Recurse.Providers.Impls.PostgresEvidenceStore do
   end
 
   @doc """
+  Return the earliest record in `session` signed by `issuer` (`LIMIT 1`),
+  using the `(session, captured_at)` index so long sessions never decode every
+  row just to verify the session anchor.
+  """
+  @spec session_anchor(term(), String.t(), String.t()) :: {:ok, map()} | :error | {:error, term()}
+  def session_anchor(handle, session, issuer)
+      when is_binary(session) and is_binary(issuer) do
+    row =
+      from(r in "evidence_records",
+        where: r.session == ^session and r.issuer == ^issuer,
+        order_by: [asc: r.captured_at, asc: r.stream, asc: r.seq],
+        limit: 1,
+        select: ^fields()
+      )
+      |> repo(handle).one()
+
+    entry(row)
+  rescue
+    error -> {:error, error}
+  end
+
+  @doc """
   Fetch a session's records only when each record belongs to `principal`
   (record `actor` matches `principal` or `session` starts with `session_prefix`),
   enforced directly in SQL.

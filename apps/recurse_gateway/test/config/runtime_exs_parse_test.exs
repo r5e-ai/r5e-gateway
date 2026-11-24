@@ -101,4 +101,20 @@ defmodule Recurse.Gateway.Config.RuntimeExsParseTest do
     assert source =~
              ~s|config :recurse_gateway, evidence_auto_hold_kinds: evidence_auto_hold_kinds|
   end
+
+  test "R5E_UPSTREAM_ZDR_ROUTES, R5E_CUSTODY_REQUIRE_RELEASE_GRANT, and R5E_PERSONAL_ENABLED are wired with safe defaults" do
+    source = File.read!(@runtime_exs)
+
+    assert source =~ ~s|env.("R5E_UPSTREAM_ZDR_ROUTES")|
+    assert source =~ ~s|ZdrRoutes.parse_env!(raw)|
+    assert source =~ ~s|config :recurse_gateway, upstream_zdr_routes: upstream_zdr_routes|
+
+    assert source =~
+             ~s|custody_require_release_grant?: env_bool.("R5E_CUSTODY_REQUIRE_RELEASE_GRANT", false)|
+
+    assert source =~ ~s|personal_enabled?: env_bool.("R5E_PERSONAL_ENABLED", false)|
+
+    assert source =~
+             ~s|evidence_public_chain?: env_bool.("R5E_EVIDENCE_PUBLIC_CHAIN", false)|
+  end
 end

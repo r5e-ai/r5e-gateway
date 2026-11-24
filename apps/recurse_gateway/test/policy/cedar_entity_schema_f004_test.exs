@@ -110,11 +110,22 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
   # downloading their own recorded payloads.
   @self_scoped_actions ~w(Action::ReadOwnEvidence Action::ReadOwnPayload)
 
+  # Personal household & E2EE (6): opt-in behind R5E_PERSONAL_ENABLED.
+  @personal_actions ~w(
+    Action::ReadHouseholdEvidence
+    Action::ReadHouseholdPayload
+    Action::ManageHousehold
+    Action::ManagePersonalE2EE
+    Action::PairChildDevice
+    Action::RecoverHousehold
+  )
+
   @all_actions @f002_actions ++
                  @f004_new_actions ++
                  @mcp_actions ++
                  @authority_actions ++
-                 @retention_actions ++ @workload_actions ++ @self_scoped_actions
+                 @retention_actions ++
+                 @workload_actions ++ @self_scoped_actions ++ @personal_actions
 
   defp load_schema do
     @schema_path
@@ -205,16 +216,16 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
     end
   end
 
-  describe "structural coverage — actions (31 total: 4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 1 self-scoped)" do
-    test "schema declares exactly 31 actions" do
+  describe "structural coverage — actions (38 total: 4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 2 self-scoped + 6 personal)" do
+    test "schema declares exactly 38 actions" do
       %{"Recurse" => %{"actions" => actions}} = load_schema()
 
-      assert map_size(actions) == 32,
-             "Expected 32 actions (4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 2 self-scoped); got #{map_size(actions)}.\n" <>
+      assert map_size(actions) == 38,
+             "Expected 38 actions (4 F002 + 20 F004 + 1 F7 + 1 authority + 2 retention + 2 workload + 2 self-scoped + 6 personal); got #{map_size(actions)}.\n" <>
                "Declared: #{inspect(Enum.sort(Map.keys(actions)))}"
     end
 
-    test "all 32 expected actions are present" do
+    test "all 38 expected actions are present" do
       %{"Recurse" => %{"actions" => actions}} = load_schema()
 
       missing =
@@ -276,7 +287,7 @@ defmodule RecurseGateway.Policy.CedarEntitySchemaF004Test do
   end
 
   describe "schema source-of-truth guard" do
-    @sha256_pin "3730733249aec85c3b0acd6e272c5fa9d21d0ea1f53636534ed076764379e01b"
+    @sha256_pin "32d9a0a505ef4648ed24f32aa66268fd36207c697b1fe82f5abcc491e6b9f8a6"
 
     test "schema file SHA-256 matches the captured F004 pin" do
       actual =

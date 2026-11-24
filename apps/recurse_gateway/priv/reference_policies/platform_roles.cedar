@@ -118,3 +118,14 @@ permit (
   resource
 )
 when { principal.recurse_role == "system" };
+
+// Personal household & solo-developer roles (opt-in behind R5E_PERSONAL_ENABLED).
+permit(principal, action == Recurse::Action::"ReadHouseholdEvidence", resource) when { principal has recurse_role && (principal.recurse_role == "owner" || principal.recurse_role == "parent" || principal.recurse_role == "solo_owner") };
+permit(principal, action == Recurse::Action::"ReadHouseholdPayload", resource) when { principal has recurse_role && (principal.recurse_role == "owner" || principal.recurse_role == "parent" || principal.recurse_role == "solo_owner") };
+permit(principal, action == Recurse::Action::"ManageHousehold", resource) when { principal has recurse_role && (principal.recurse_role == "owner" || principal.recurse_role == "parent" || principal.recurse_role == "solo_owner") };
+permit(principal, action == Recurse::Action::"ManagePersonalE2EE", resource) when { principal has recurse_role && (principal.recurse_role == "owner" || principal.recurse_role == "parent" || principal.recurse_role == "solo_owner" || principal.recurse_role == "child") };
+permit(principal, action == Recurse::Action::"PairChildDevice", resource) when { principal has recurse_role && (principal.recurse_role == "owner" || principal.recurse_role == "parent") };
+permit(principal, action == Recurse::Action::"RecoverHousehold", resource) when { principal has recurse_role && (principal.recurse_role == "owner" || principal.recurse_role == "parent" || principal.recurse_role == "solo_owner") };
+permit(principal, action == Recurse::Action::"ReadOwnEvidence", resource) when { principal has recurse_role && (principal.recurse_role == "child" || principal.recurse_role == "owner" || principal.recurse_role == "solo_owner") };
+permit(principal, action == Recurse::Action::"ReadOwnPayload", resource) when { principal has recurse_role && (principal.recurse_role == "child" || principal.recurse_role == "owner" || principal.recurse_role == "solo_owner") };
+forbid(principal, action, resource) when { principal has recurse_role && principal.recurse_role == "child" && (action == Recurse::Action::"ManageHousehold" || action == Recurse::Action::"PairChildDevice" || action == Recurse::Action::"RecoverHousehold" || action == Recurse::Action::"ReadHouseholdEvidence" || action == Recurse::Action::"ReadHouseholdPayload") };

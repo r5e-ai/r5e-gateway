@@ -83,6 +83,10 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
   @building 4
   @kept_ms 300_000
   @kept_bytes 1_048_576
+  @chain_default_limit 250
+  @chain_max_limit 500
+  @chain_kept_ms 5_000
+  @chain_kept_bytes 10_485_760
 
   @type error ::
           :malformed_request
@@ -482,21 +486,58 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
   def public_reading?,
     do: Application.get_env(:recurse_gateway, :evidence_public_read?, false) == true
 
+  @doc "Whether this deployment serves its full chain to the public without a login."
+  @spec public_chain?() :: boolean()
+  def public_chain?,
+    do:
+      public_reading?() and
+        Application.get_env(:recurse_gateway, :evidence_public_chain?, false) == true
+
   @doc """
-  A record that was provided to the public, as the text of a bundle. It
-  carries the content that was provided with that record and lists the
-  rest as withheld. `:not_public` for anything else, whether or not it
-  exists. `:busy` when too many are being built at once; ask again.
+  A record that was provided to the public (or any record on the chain when
+  `R5E_EVIDENCE_PUBLIC_CHAIN` is also enabled), as the text of a bundle. It
+  carries the content that was provided with that record and lists the rest
+  as withheld (or all carried content when full public chain mode is active).
+  `:not_public` for anything else, whether or not it exists. `:busy` when too
+  many are being built at once; ask again.
   """
   @spec public_bundle(String.t()) :: {:ok, binary()} | {:error, :not_public | :busy}
   def public_bundle(ref) do
-    if is_binary(ref) and public_reading?() and public?(ref) do
-      now = System.monotonic_time(:millisecond)
+    cond do
+      not is_binary(ref) or not public_reading?() ->
+        {:error, :not_public}
 
-      case :ets.lookup(@table, {:bundle, ref}) do
-        [{_key, text, until}] when until > now -> {:ok, text}
-        _ -> build(ref, now)
-      end
+      public?(ref) ->
+        cached_or_build({:bundle, ref}, @kept_ms, @kept_bytes, fn ->
+          assemble_record(ref, provided_with(ref))
+        end)
+
+      public_chain?() and Ref.valid?(ref, :evidence) ->
+        cached_or_build({:chain_record, ref}, @chain_kept_ms, @kept_bytes, fn ->
+          assemble_record(ref, true)
+        end)
+
+      true ->
+        {:error, :not_public}
+    end
+  end
+
+  @doc """
+  A bounded offline-verifiable bundle of this deployment's chain (up to
+  `limit`, default `250`, max `500`), including carried content payloads and
+  deployment chain/authority/definition records. Returns `:not_public` unless
+  both `R5E_EVIDENCE_PUBLIC_READ` and `R5E_EVIDENCE_PUBLIC_CHAIN` are true,
+  and `:busy` when `@building` concurrent public builds are already in flight.
+  """
+  @spec public_chain_bundle(pos_integer()) :: {:ok, binary()} | {:error, :not_public | :busy}
+  def public_chain_bundle(limit \\ @chain_default_limit)
+      when is_integer(limit) and limit >= 1 do
+    if public_chain?() do
+      bounded = min(limit, @chain_max_limit)
+
+      cached_or_build({:chain, bounded}, @chain_kept_ms, @chain_kept_bytes, fn ->
+        assemble_chain(bounded)
+      end)
     else
       {:error, :not_public}
     end
@@ -504,30 +545,72 @@ defmodule Recurse.Gateway.Provenance.Disclosing do
 
   # Building reads the database and may ask the key service to open
   # content, so only a few run at once.
-  defp build(ref, now) do
+  defp cached_or_build(cache_key, ttl_ms, max_bytes, builder) do
+    if :ets.whereis(@table) == :undefined do
+      {:error, :not_public}
+    else
+      now = System.monotonic_time(:millisecond)
+
+      case :ets.lookup(@table, cache_key) do
+        [{_key, text, until}] when until > now -> {:ok, text}
+        _ -> build_with_slot(cache_key, ttl_ms, max_bytes, now, builder)
+      end
+    end
+  end
+
+  defp build_with_slot(cache_key, ttl_ms, max_bytes, now, builder) do
     if :ets.update_counter(@table, :building, 1) > @building do
       :ets.update_counter(@table, :building, -1)
       {:error, :busy}
     else
       try do
-        assemble(ref, now)
+        run_and_cache(cache_key, ttl_ms, max_bytes, now, builder)
       after
         :ets.update_counter(@table, :building, -1)
       end
     end
   end
 
-  defp assemble(ref, now) do
+  defp run_and_cache(cache_key, ttl_ms, max_bytes, now, builder) do
+    case builder.() do
+      {:ok, text} ->
+        if byte_size(text) <= max_bytes,
+          do: :ets.insert(@table, {cache_key, text, now + ttl_ms})
+
+        {:ok, text}
+
+      other ->
+        other
+    end
+  end
+
+  defp assemble_record(ref, content_opt) do
     with %{store: {module, handle} = store} <- Runtime.info(),
          {:ok, entry} <- module.fetch(handle, ref),
          {:ok, bundle} <-
-           Exporter.bundle(store, [entry], %{"record" => ref}, content: provided_with(ref)) do
-      text = JSON.encode!(Carried.carry(bundle, retention: false, security: false))
+           Exporter.bundle(store, [entry], %{"record" => ref}, content: content_opt) do
+      {:ok, JSON.encode!(Carried.carry(bundle, retention: false, security: false))}
+    else
+      _ -> {:error, :not_public}
+    end
+  end
 
-      if byte_size(text) <= @kept_bytes,
-        do: :ets.insert(@table, {{:bundle, ref}, text, now + @kept_ms})
-
-      {:ok, text}
+  defp assemble_chain(limit) do
+    with %{store: {module, handle} = store, deployment: deployment} <- Runtime.info(),
+         prefix = "urn:r5e:stream:#{deployment}:",
+         {:ok, listed} <- module.list(handle, %{stream_prefix: prefix, limit: limit}),
+         entries =
+           Enum.reject(listed, fn entry ->
+             entry.evidence["kind"] in ["EpochSeal", "Checkpoint"]
+           end),
+         {:ok, bundle} <-
+           Exporter.bundle(
+             store,
+             entries,
+             %{"chain" => deployment, "limit" => limit},
+             content: true
+           ) do
+      {:ok, JSON.encode!(Carried.carry(bundle, retention: false, security: false))}
     else
       _ -> {:error, :not_public}
     end

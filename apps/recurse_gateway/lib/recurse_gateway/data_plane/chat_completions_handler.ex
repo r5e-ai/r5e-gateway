@@ -80,6 +80,7 @@ defmodule Recurse.Gateway.DataPlane.ChatCompletionsHandler do
 
   alias Recurse.Gateway.Attestation.EnvelopeBuilder
   alias Recurse.Gateway.DataPlane.SseProxy
+  alias Recurse.Gateway.LlmProxy.ZdrRoutes
   alias Recurse.Gateway.Policy.Active
   alias Recurse.Gateway.Policy.Evaluator
   alias Recurse.Gateway.ProviderRegistry
@@ -105,13 +106,23 @@ defmodule Recurse.Gateway.DataPlane.ChatCompletionsHandler do
   def handle(%Plug.Conn{assigns: %{identity_ctx: %IdentityContext{} = ctx}} = conn) do
     with {:ok, request_body} <- read_body(conn),
          :ok <- validate_request(request_body),
+         {:ok, zdr_ctx} <- resolve_zdr_route(conn),
          {:ok, %Active{bundle: bundle_ref}} <- Active.current(),
-         policy_result <- evaluate_policy(bundle_ref, ctx, request_body),
+         policy_result <- evaluate_policy(bundle_ref, ctx, request_body, zdr_ctx),
          {:ok, conn_final} <- dispatch(conn, ctx, request_body, bundle_ref, policy_result) do
       conn_final
     else
       {:error, :invalid_request, details} ->
         send_validation_error(conn, details)
+
+      {:error, :non_zdr_fallback_refused, _details} ->
+        send_service_unavailable(conn, "non_zdr_fallback_refused")
+
+      {:error, :fallback_route_not_found, _details} ->
+        send_service_unavailable(conn, "fallback_route_not_found")
+
+      {:error, :no_fallback_route, _details} ->
+        send_service_unavailable(conn, "no_fallback_route")
 
       {:error, :not_loaded} ->
         # Fail-closed per Constitution Principle III. No loader has
@@ -215,14 +226,57 @@ defmodule Recurse.Gateway.DataPlane.ChatCompletionsHandler do
   # Policy evaluation
   # ---------------------------------------------------------------------------
 
-  defp evaluate_policy(bundle_ref, ctx, request_body) do
+  defp resolve_zdr_route(conn) do
+    case extract_zdr_route_id(conn) do
+      nil ->
+        {:ok, %{upstream_route_id: "", upstream_zdr_pinned: false}}
+
+      id ->
+        select_zdr_route(id, primary_route_available?(conn))
+    end
+  end
+
+  defp extract_zdr_route_id(conn) do
+    case Plug.Conn.get_req_header(conn, "x-r5e-upstream-route") do
+      [id | _] when is_binary(id) and id != "" -> id
+      _ -> default_configured_route_id()
+    end
+  end
+
+  defp default_configured_route_id do
+    case ZdrRoutes.configured_routes() do
+      [first | _] -> first.route_id
+      [] -> nil
+    end
+  end
+
+  defp primary_route_available?(conn) do
+    not match?(["true" | _], Plug.Conn.get_req_header(conn, "x-r5e-upstream-fallback"))
+  end
+
+  defp select_zdr_route(id, primary_available?) do
+    case ZdrRoutes.select_route(id, primary_available?: primary_available?) do
+      {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}} ->
+        {:ok, %{upstream_route_id: selected_id, upstream_zdr_pinned: pinned?}}
+
+      {:error, :route_not_found, _} ->
+        {:ok, %{upstream_route_id: id, upstream_zdr_pinned: false}}
+
+      {:error, reason, details} ->
+        {:error, reason, details}
+    end
+  end
+
+  defp evaluate_policy(bundle_ref, ctx, request_body, zdr_ctx) do
     model = Map.get(request_body, "model", "unknown")
 
     # Cedar rejects `null` / `nil` context values; filter before building.
     context =
       %{
         "streaming" => truthy?(Map.get(request_body, "stream")),
-        "model" => model
+        "model" => model,
+        "upstream_route_id" => zdr_ctx.upstream_route_id,
+        "upstream_zdr_pinned" => zdr_ctx.upstream_zdr_pinned
       }
       |> maybe_put_string("max_tokens", Map.get(request_body, "max_tokens"))
 
